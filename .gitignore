@@ -1,0 +1,40 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Virtual environment
+.venv/
+venv/
+env/
+
+# Secrets
+.env
+.env.*
+.streamlit/secrets.toml
+secrets.toml
+*.key
+*.pem
+
+# IDE
+.idea/
+.vscode/
+*.iml
+
+# Logs / cache
+*.log
+.cache/
+cache/
+tmp/
+temp/
+
+# OS
+Thumbs.db
+desktop.ini
+.DS_Store
+
+# Build
+build/
+dist/
+*.egg-info/

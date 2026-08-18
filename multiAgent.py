@@ -12,18 +12,17 @@ import hashlib
 import copy
 import unicodedata
 import yaml
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass
 from collections import OrderedDict, Counter
 from pypdf import PdfReader
 from datetime import datetime
 import streamlit as st
 from openai import OpenAI
-import pandas as pd
 from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 
 # ==========================================
-# 0. CẤU HÌNH PIPELINE V3.1 — SCALABLE LONG DOCUMENT
+# 0. CẤU HÌNH WEB PIPELINE V3.4 — SENIOR-HYBRID / VALIDATION-EXPANDED / SCALABLE LONG DOCUMENT
 # ==========================================
 # Agent 1: chia tài liệu nguyên văn thành các semantic chunk nhỏ, có context ở biên.
 AGENT1_CHUNK_TARGET_CHARS = 12000
@@ -56,6 +55,51 @@ API_AGENT2_MAX_RECURSION_DEPTH = 6
 API_AGENT2_API_RETRIES = 1
 API_ENDPOINT_HINT_LIMIT = 8
 
+# Web Rule Matrix schema — single source of truth for prompt + validator + renderer.
+WEB_TEST_DESIGN_VERSION = "3.4"
+WEB_RULE_FIELDS = frozenset({
+    "rule_id", "target", "category", "feature_group", "feature_name",
+    "rule_type", "rule_name", "test_objective", "test_condition",
+    "expected_result", "source_requirement", "applied_qa_rule", "generation_reason",
+})
+WEB_ALLOWED_CATEGORIES = frozenset({
+    "UI", "VALIDATION", "ACTION", "DATA_GRID", "BUSINESS_FLOW", "EXCEPTION",
+})
+WEB_ALLOWED_RULE_TYPES = frozenset({"EXPLICIT", "DERIVED"})
+
+WEB_ALLOWED_FEATURE_GROUPS = frozenset({
+    "PRECONDITION_PERMISSION", "GENERAL_UI", "FILTER", "DATA_GRID", "FUNCTION",
+})
+WEB_FEATURE_GROUP_ORDER = {
+    "PRECONDITION_PERMISSION": 1,
+    "GENERAL_UI": 2,
+    "FILTER": 3,
+    "DATA_GRID": 4,
+    "FUNCTION": 5,
+}
+WEB_FEATURE_GROUP_TITLES = {
+    "PRECONDITION_PERMISSION": "1. KIỂM TRA TIỀN ĐIỀU KIỆN - PHÂN QUYỀN",
+    "GENERAL_UI": "2. KIỂM TRA GIAO DIỆN CHUNG",
+    "FILTER": "3. KIỂM TRA BỘ LỌC",
+    "DATA_GRID": "4. KIỂM TRA LƯỚI DỮ LIỆU",
+    "FUNCTION": "5. KIỂM TRA CHỨC NĂNG",
+}
+WEB_CATEGORY_ORDER = {
+    "UI": 1,
+    "VALIDATION": 2,
+    "ACTION": 3,
+    "DATA_GRID": 4,
+    "BUSINESS_FLOW": 5,
+    "EXCEPTION": 6,
+}
+WEB_TC_TITLE_MAX_CHARS = 120
+
+# Cache namespace: bump when deterministic pipeline semantics change.
+WEB_AGENT1_CACHE_NAMESPACE = "web-agent1-v3.4-senior-hybrid-validation-r1"
+WEB_AGENT2_CACHE_NAMESPACE = "web-agent2-v3.4-senior-hybrid-validation-r1"
+API_AGENT1_CACHE_NAMESPACE = "api-agent1-v3.2-r2"
+API_AGENT2_CACHE_NAMESPACE = "api-agent2-v3.2-r2"
+
 # ==========================================
 # 1. CẤU HÌNH TRANG STREAMLIT & SIDEBAR
 # ==========================================
@@ -87,11 +131,6 @@ with st.sidebar:
 
     st.divider()
     st.markdown("### 🔄 Trạng thái Tiến trình")
-    if "step_ui" not in st.session_state:
-        st.session_state.step_ui = 1
-    if "step_api" not in st.session_state:
-        st.session_state.step_api = 1
-
     if st.button("🔴 Reset/Chạy lại từ đầu", key="sidebar_reset_btn"):
         st.session_state.clear()
         st.rerun()
@@ -115,24 +154,42 @@ def log_error(msg: str, exc: Exception = None):
     return err_msg
 
 def extract_text_from_file(uploaded_file) -> str:
+    """Read Streamlit UploadedFile without consuming its cursor; support PDF and text-like files."""
     if uploaded_file is None:
         return ""
-    file_bytes = uploaded_file.read()
-    filename = uploaded_file.name.lower()
-    
+
+    if hasattr(uploaded_file, "getvalue"):
+        file_bytes = uploaded_file.getvalue()
+    else:
+        current_pos = None
+        try:
+            current_pos = uploaded_file.tell()
+        except Exception:
+            pass
+        file_bytes = uploaded_file.read()
+        if current_pos is not None:
+            try:
+                uploaded_file.seek(current_pos)
+            except Exception:
+                pass
+
+    filename = str(getattr(uploaded_file, "name", "")).lower()
     if filename.endswith(".pdf"):
         reader = PdfReader(io.BytesIO(file_bytes))
-        full_pdf_text = []
-        for idx, page in enumerate(reader.pages):
-            page_text = page.extract_text()
-            if page_text:
-                full_pdf_text.append(f"--- TRANG {idx+1} ---\n{page_text}")
-        return "\n\n".join(full_pdf_text)
-    else:
+        pages = []
+        for idx, page in enumerate(reader.pages, start=1):
+            page_text = page.extract_text() or ""
+            if page_text.strip():
+                pages.append(f"--- TRANG {idx} ---\n{page_text}")
+        return "\n\n".join(pages)
+
+    for encoding in ("utf-8", "utf-8-sig", "latin-1"):
         try:
-            return file_bytes.decode("utf-8")
+            return file_bytes.decode(encoding)
         except UnicodeDecodeError:
-            return file_bytes.decode("latin-1")
+            continue
+    return file_bytes.decode("utf-8", errors="replace")
+
 
 def _log_response_summary(agent_name: str, elapsed: float, result: str, chunk_count: int, finish_reason: str | None, reasoning_chunk_count: int = 0):
     """Log chẩn đoán đầy đủ cho request Qwen mà không dump toàn bộ output ra console."""
@@ -143,75 +200,6 @@ def _log_response_summary(agent_name: str, elapsed: float, result: str, chunk_co
         f"OutputChars={len(result):,} | "
         f"FinishReason={finish_reason or 'UNKNOWN'}"
     )
-
-
-def call_qwen_agent(prompt: str, api_key: str, base_url: str, model: str, max_tokens: int = 16384) -> tuple[bool, str]:
-    """Generic Qwen caller cho API/flow cũ. Có log finish_reason + kích thước output."""
-    client = OpenAI(
-        api_key=api_key,
-        base_url=base_url,
-        timeout=3600.0
-    )
-    start_time = time.time()
-    log_info(
-        f"[QWEN_AGENT] 🚀 Request | Model={model} | MaxTokens={max_tokens} | "
-        f"PromptChars={len(prompt):,}"
-    )
-
-    try:
-        response = client.chat.completions.create(
-            model=model,
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.1,
-            max_tokens=max_tokens,
-            stream=True
-        )
-
-        full_response = []
-        chunk_count = 0
-        reasoning_chunk_count = 0
-        finish_reason = None
-        last_log_time = time.time()
-
-        for chunk in response:
-            if not chunk.choices:
-                continue
-
-            choice = chunk.choices[0]
-            delta = choice.delta
-
-            if getattr(delta, "reasoning_content", None):
-                reasoning_chunk_count += 1
-
-            if delta and delta.content:
-                full_response.append(delta.content)
-                chunk_count += 1
-
-            if choice.finish_reason:
-                finish_reason = choice.finish_reason
-
-            now = time.time()
-            if now - last_log_time >= 10:
-                elapsed = int(now - start_time)
-                log_info(
-                    f"[QWEN_AGENT] ⏳ Streaming | Elapsed={elapsed}s | "
-                    f"ContentChunks={chunk_count} | ReasoningChunks={reasoning_chunk_count}"
-                )
-                last_log_time = now
-
-        elapsed_total = time.time() - start_time
-        result = "".join(full_response)
-        _log_response_summary("QWEN_AGENT", elapsed_total, result, chunk_count, finish_reason, reasoning_chunk_count)
-        return True, result
-
-    except Exception as e:
-        elapsed_total = time.time() - start_time
-        err_details = log_error(
-            f"[QWEN_AGENT] ❌ Request failed after {elapsed_total:.2f}s | "
-            f"Model={model} | MaxTokens={max_tokens}",
-            e
-        )
-        return False, err_details
 
 
 @dataclass
@@ -369,33 +357,6 @@ def call_qwen_max_agent_detailed(
         )
 
 
-def call_qwen_max_agent(
-    content: str,
-    api_key: str,
-    base_url: str,
-    model: str,
-    prompt_template: str,
-    max_tokens: int = QWEN_MAX_OUTPUT_TOKENS,
-) -> tuple[bool, str]:
-    """Compatibility wrapper cho các flow cũ.
-
-    Với finish_reason=length trả False + partial raw output để UI có thể debug,
-    tuyệt đối không coi JSON truncate là response thành công.
-    """
-    result = call_qwen_max_agent_detailed(
-        content=content,
-        api_key=api_key,
-        base_url=base_url,
-        model=model,
-        prompt_template=prompt_template,
-        max_tokens=max_tokens,
-        agent_name="QWEN_MAX_AGENT",
-    )
-    if result.complete:
-        return True, result.text
-    return False, result.text or (result.error or "Qwen request failed")
-
-
 def extract_json_from_model_response(raw_text: str) -> tuple[bool, dict | list | None, str]:
     """Parse JSON root an toàn từ model response.
 
@@ -456,64 +417,80 @@ def extract_json_from_model_response(raw_text: str) -> tuple[bool, dict | list |
 
 
 def validate_rule_matrix_schema(data, strict: bool = False) -> tuple[bool, str]:
-    """Kiểm tra schema Rule Matrix.
-
-    strict=False: đủ cho chunk output.
-    strict=True: dùng cho Final Rule Matrix sau merge/renumber.
-    """
+    """Validate Web Rule Matrix using the centralized Web schema constants."""
     if not isinstance(data, dict):
         return False, f"Root phải là object, nhận {type(data).__name__}"
+
+    version = data.get("test_design_version")
+    if strict and version != WEB_TEST_DESIGN_VERSION:
+        return False, f"test_design_version không hợp lệ: {version!r}; expected={WEB_TEST_DESIGN_VERSION!r}"
 
     screens = data.get("screens")
     if not isinstance(screens, list):
         return False, "Thiếu field 'screens' hoặc 'screens' không phải array"
 
-    required_rule_fields = {
-        "rule_id", "target", "category", "rule_type", "rule_name",
-        "test_objective", "source_requirement", "applied_qa_rule", "generation_reason"
-    }
-    allowed_categories = {"UI", "VALIDATION", "ACTION", "GRID", "POPUP", "BUSINESS_FLOW", "EXCEPTION"}
-    allowed_rule_types = {"EXPLICIT", "DERIVED"}
-
     total_rules = 0
     rule_ids = set()
 
-    for idx, screen in enumerate(screens, start=1):
+    for sidx, screen in enumerate(screens):
         if not isinstance(screen, dict):
-            return False, f"screens[{idx-1}] phải là object"
+            return False, f"screens[{sidx}] phải là object"
 
         screen_name = screen.get("screen_name")
         if strict and (not isinstance(screen_name, str) or not screen_name.strip()):
-            return False, f"screens[{idx-1}].screen_name rỗng/không hợp lệ"
+            return False, f"screens[{sidx}].screen_name rỗng/không hợp lệ"
 
-        if not isinstance(screen.get("test_rules"), list):
-            return False, f"screens[{idx-1}] thiếu 'test_rules' hoặc không phải array"
+        rules = screen.get("test_rules")
+        if not isinstance(rules, list):
+            return False, f"screens[{sidx}] thiếu 'test_rules' hoặc không phải array"
 
-        for ridx, rule in enumerate(screen["test_rules"], start=1):
+        for ridx, rule in enumerate(rules):
             total_rules += 1
             if not isinstance(rule, dict):
-                return False, f"screens[{idx-1}].test_rules[{ridx-1}] phải là object"
+                return False, f"screens[{sidx}].test_rules[{ridx}] phải là object"
 
-            missing = sorted(required_rule_fields - set(rule.keys()))
+            missing = sorted(WEB_RULE_FIELDS - set(rule.keys()))
             if missing:
-                return False, f"Rule {idx}.{ridx} thiếu field: {', '.join(missing)}"
+                return False, f"Rule {sidx + 1}.{ridx + 1} thiếu field: {', '.join(missing)}"
 
-            if rule.get("category") not in allowed_categories:
-                return False, f"Rule {idx}.{ridx} category không hợp lệ: {rule.get('category')!r}"
-
-            if rule.get("rule_type") not in allowed_rule_types:
-                return False, f"Rule {idx}.{ridx} rule_type không hợp lệ: {rule.get('rule_type')!r}"
+            category = str(rule.get("category", "")).strip().upper()
+            feature_group = str(rule.get("feature_group", "")).strip().upper()
+            rule_type = str(rule.get("rule_type", "")).strip().upper()
+            if category not in WEB_ALLOWED_CATEGORIES:
+                return False, (
+                    f"Rule {sidx + 1}.{ridx + 1} category không hợp lệ: {rule.get('category')!r}; "
+                    f"allowed={sorted(WEB_ALLOWED_CATEGORIES)}"
+                )
+            if feature_group not in WEB_ALLOWED_FEATURE_GROUPS:
+                return False, (
+                    f"Rule {sidx + 1}.{ridx + 1} feature_group không hợp lệ: {rule.get('feature_group')!r}; "
+                    f"allowed={sorted(WEB_ALLOWED_FEATURE_GROUPS)}"
+                )
+            if not str(rule.get("feature_name", "")).strip():
+                return False, f"Rule {sidx + 1}.{ridx + 1} feature_name rỗng"
+            if rule_type not in WEB_ALLOWED_RULE_TYPES:
+                return False, (
+                    f"Rule {sidx + 1}.{ridx + 1} rule_type không hợp lệ: {rule.get('rule_type')!r}; "
+                    f"allowed={sorted(WEB_ALLOWED_RULE_TYPES)}"
+                )
 
             if not str(rule.get("source_requirement", "")).strip():
-                return False, f"Rule {idx}.{ridx} source_requirement rỗng"
+                return False, f"Rule {sidx + 1}.{ridx + 1} source_requirement rỗng"
 
-            if rule.get("rule_type") == "DERIVED" and not str(rule.get("applied_qa_rule", "")).strip():
-                return False, f"Rule {idx}.{ridx} DERIVED nhưng applied_qa_rule rỗng"
+            if not str(rule.get("expected_result", "")).strip():
+                return False, f"Rule {sidx + 1}.{ridx + 1} expected_result rỗng"
+
+            if rule_type == "DERIVED" and not str(rule.get("applied_qa_rule", "")).strip():
+                return False, f"Rule {sidx + 1}.{ridx + 1} DERIVED nhưng applied_qa_rule rỗng"
 
             if strict:
+                for field in WEB_RULE_FIELDS:
+                    if not isinstance(rule.get(field), str):
+                        return False, f"Rule {sidx + 1}.{ridx + 1}.{field} phải là string"
+
                 rule_id = str(rule.get("rule_id", "")).strip()
                 if not rule_id:
-                    return False, f"Rule {idx}.{ridx} rule_id rỗng"
+                    return False, f"Rule {sidx + 1}.{ridx + 1} rule_id rỗng"
                 if rule_id in rule_ids:
                     return False, f"Duplicate rule_id: {rule_id}"
                 rule_ids.add(rule_id)
@@ -521,72 +498,82 @@ def validate_rule_matrix_schema(data, strict: bool = False) -> tuple[bool, str]:
     return True, f"Schema OK | Screens={len(screens)} | TestRules={total_rules}"
 
 
-def python_smart_split_md(raw_text: str, base_filename: str, max_chunk_size: int = 5000) -> tuple[list[dict], str]:
-    sections = []
-    heading_pattern = re.compile(r'^(#{1,3}\s+.+)$', re.MULTILINE)
-    splits = heading_pattern.split(raw_text)
-
-    if len(splits) > 1:
-        current_title = f"{base_filename}_Part_1"
-        current_content = ""
-
-        for element in splits:
-            if heading_pattern.match(element):
-                if current_content.strip():
-                    sections.append({"title": current_title, "content": current_content.strip()})
-                current_title = re.sub(r'^[#\s]+', '', element).strip()
-                current_content = element + "\n"
-            else:
-                current_content += element
-
-        if current_content.strip():
-            sections.append({"title": current_title, "content": current_content.strip()})
-    else:
-        sections.append({"title": base_filename, "content": raw_text})
-
-    final_chunks = []
-    for sec in sections:
-        content = sec["content"]
-        title = sec["title"]
-        
-        if len(content) > max_chunk_size:
-            for i in range(0, len(content), max_chunk_size):
-                part_text = content[i:i+max_chunk_size]
-                part_title = f"{title}_Part_{i//max_chunk_size + 1}"
-                final_chunks.append({"title": part_title, "content": part_text})
-        else:
-            final_chunks.append({"title": title, "content": content})
-
-    temp_dir = tempfile.mkdtemp()
-    extracted_files = []
-    zip_filename = f"{base_filename}_MD_Parsed.zip"
-    zip_path = os.path.join(tempfile.gettempdir(), zip_filename)
-
-    with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zip_out:
-        for idx, item in enumerate(final_chunks):
-            safe_title = re.sub(r'[\\/*?:"<>|]', '_', item["title"])
-            sub_file_name = f"{idx+1:02d}_{safe_title}.md"
-            file_path = os.path.join(temp_dir, sub_file_name)
-
-            with open(file_path, "w", encoding="utf-8") as f:
-                f.write(item["content"])
-
-            zip_out.write(file_path, arcname=sub_file_name)
-
-            extracted_files.append({
-                "screen_name": item["title"],
-                "file_name": sub_file_name,
-                "file_path": file_path,
-                "content": item["content"],
-                "char_count": len(item["content"])
-            })
-
-    return extracted_files, zip_path
-
-
 # ==========================================
-# 2.1 PIPELINE V3.1 — LONG DOCUMENT BATCHING
+# 2.1 WEB PIPELINE V3.4 — LONG DOCUMENT BATCHING
 # ==========================================
+
+def _schema_failure_can_benefit_from_split(schema_diag: str | None) -> bool:
+    """Only split for structural/model-shape failures that may improve with a smaller chunk.
+
+    Semantic enum/traceability failures should fail fast instead of recursively spending tokens.
+    """
+    diag = str(schema_diag or "")
+    non_retryable_markers = (
+        "category không hợp lệ",
+        "feature_group không hợp lệ",
+        "feature_name rỗng",
+        "rule_type không hợp lệ",
+        "source_requirement rỗng",
+        "expected_result rỗng",
+        "DERIVED nhưng applied_qa_rule rỗng",
+        "source_document không hợp lệ",
+        "method không hợp lệ",
+    )
+    if any(marker in diag for marker in non_retryable_markers):
+        return False
+
+    retryable_markers = (
+        "Root phải là object",
+        "Thiếu field 'screens'",
+        "Thiếu field 'api_modules'",
+        "không phải array",
+        "phải là object",
+        "thiếu field:",
+        "thiếu endpoints array",
+        "thiếu test_rules array",
+    )
+    return any(marker in diag for marker in retryable_markers)
+
+
+def normalize_web_rule_matrix_enums(data: dict) -> dict:
+    """Canonicalize Web enum casing without changing QA/business meaning."""
+    normalized = copy.deepcopy(data)
+    for screen in normalized.get("screens", []) if isinstance(normalized, dict) else []:
+        if not isinstance(screen, dict):
+            continue
+        for rule in screen.get("test_rules", []) if isinstance(screen.get("test_rules"), list) else []:
+            if not isinstance(rule, dict):
+                continue
+            if "category" in rule:
+                rule["category"] = str(rule.get("category", "")).strip().upper()
+            if "feature_group" in rule:
+                rule["feature_group"] = str(rule.get("feature_group", "")).strip().upper()
+            if "feature_name" in rule:
+                rule["feature_name"] = str(rule.get("feature_name", "")).strip()
+            if "rule_type" in rule:
+                rule["rule_type"] = str(rule.get("rule_type", "")).strip().upper()
+    return normalized
+
+
+def normalize_api_rule_matrix_enums(data: dict) -> dict:
+    """Canonicalize API enum/method casing without changing contract content."""
+    normalized = copy.deepcopy(data)
+    for module in normalized.get("api_modules", []) if isinstance(normalized, dict) else []:
+        if not isinstance(module, dict):
+            continue
+        for endpoint in module.get("endpoints", []) if isinstance(module.get("endpoints"), list) else []:
+            if not isinstance(endpoint, dict):
+                continue
+            if "method" in endpoint:
+                endpoint["method"] = str(endpoint.get("method", "")).strip().upper()
+            for rule in endpoint.get("test_rules", []) if isinstance(endpoint.get("test_rules"), list) else []:
+                if not isinstance(rule, dict):
+                    continue
+                for field in ("category", "rule_type", "source_document"):
+                    if field in rule:
+                        rule[field] = str(rule.get(field, "")).strip().upper()
+    return normalized
+
 
 def _normalize_text(value: str) -> str:
     value = unicodedata.normalize("NFKC", str(value or ""))
@@ -654,8 +641,8 @@ def _safe_split_large_block(text: str, max_chars: int) -> list[str]:
     return parts
 
 
-def _document_to_semantic_blocks(raw_text: str, base_title: str) -> list[dict]:
-    """Tách raw document thành block theo heading / table row / paragraph, không dùng LLM."""
+def _document_to_semantic_blocks(raw_text: str, base_title: str, max_block_chars: int) -> list[dict]:
+    """Split a document into heading/table/paragraph blocks without exceeding caller max size."""
     lines = raw_text.splitlines()
     blocks = []
     paragraph = []
@@ -671,7 +658,6 @@ def _document_to_semantic_blocks(raw_text: str, base_title: str) -> list[dict]:
 
     for line in lines:
         stripped = line.strip()
-
         if not stripped:
             flush_paragraph()
             continue
@@ -682,7 +668,7 @@ def _document_to_semantic_blocks(raw_text: str, base_title: str) -> list[dict]:
             blocks.append({"title": current_title, "text": line.rstrip()})
             continue
 
-        # Markdown table: giữ từng row là block để tránh chém giữa một requirement row.
+        # Markdown table: keep each row intact so a requirement row is not cut mid-row.
         if stripped.startswith("|"):
             flush_paragraph()
             blocks.append({"title": current_title, "text": line.rstrip()})
@@ -695,13 +681,12 @@ def _document_to_semantic_blocks(raw_text: str, base_title: str) -> list[dict]:
     if not blocks and raw_text.strip():
         blocks = [{"title": base_title, "text": raw_text.strip()}]
 
-    # Nếu một block đơn vẫn quá lớn thì fallback split an toàn.
     expanded = []
     for block in blocks:
-        if len(block["text"]) <= AGENT1_CHUNK_MAX_CHARS:
+        if len(block["text"]) <= max_block_chars:
             expanded.append(block)
         else:
-            for part in _safe_split_large_block(block["text"], AGENT1_CHUNK_MAX_CHARS):
+            for part in _safe_split_large_block(block["text"], max_block_chars):
                 expanded.append({"title": block["title"], "text": part})
     return expanded
 
@@ -718,7 +703,7 @@ def split_document_semantic(
     Mỗi chunk có CURRENT SOURCE riêng + context trước/sau để giữ dependency ở biên.
     Context chỉ dùng để hiểu, prompt cấm sinh rule chỉ từ context.
     """
-    blocks = _document_to_semantic_blocks(raw_text, base_title)
+    blocks = _document_to_semantic_blocks(raw_text, base_title, max_chars)
     core_chunks = []
     current_parts = []
     current_len = 0
@@ -874,7 +859,7 @@ def process_agent1_chunk_recursive(
     """
     diagnostics = diagnostics if diagnostics is not None else []
     payload = build_agent1_chunk_payload(chunk)
-    key = _cache_key("agent1-v3.1", model, prompt_template, payload)
+    key = _cache_key(WEB_AGENT1_CACHE_NAMESPACE, model, prompt_template, payload)
 
     if cache is not None and key in cache:
         diagnostics.append({
@@ -925,9 +910,11 @@ def process_agent1_chunk_recursive(
         if not parsed_ok:
             reason_to_split = "JSON_PARSE_FAIL"
         else:
+            parsed_json = normalize_web_rule_matrix_enums(parsed_json)
             schema_ok, schema_diag = validate_rule_matrix_schema(parsed_json, strict=False)
             if not schema_ok:
                 reason_to_split = "SCHEMA_FAIL"
+                log_error(f"[{agent_name}] Schema validation failed | {schema_diag}")
             else:
                 diagnostics.append({
                     "chunk_id": chunk.get("chunk_id"),
@@ -945,7 +932,15 @@ def process_agent1_chunk_recursive(
                 return True, [parsed_json]
 
     depth = int(chunk.get("depth", 0))
-    can_split = depth < AGENT1_MAX_RECURSION_DEPTH and len(chunk.get("core_text", "")) > AGENT1_MIN_RECURSIVE_CHARS
+    split_reason_is_retryable = (
+        reason_to_split in {"MAX_TOKENS", "JSON_PARSE_FAIL"}
+        or (reason_to_split == "SCHEMA_FAIL" and _schema_failure_can_benefit_from_split(schema_diag))
+    )
+    can_split = (
+        split_reason_is_retryable
+        and depth < AGENT1_MAX_RECURSION_DEPTH
+        and len(chunk.get("core_text", "")) > AGENT1_MIN_RECURSIVE_CHARS
+    )
 
     diagnostics.append({
         "chunk_id": chunk.get("chunk_id"),
@@ -991,14 +986,19 @@ def process_agent1_chunk_recursive(
 
 
 def _rule_signature(rule: dict) -> tuple:
-    """Dedup bảo thủ: chỉ loại rule rất giống nhau do overlap/retry."""
+    """Deterministic conservative dedup for repeated OCR/chunk requirements.
+
+    Source wording is intentionally excluded: two repeated source fragments may differ in OCR
+    formatting while producing the same test objective/condition/expected result.
+    Python does not infer QA meaning; it only removes structurally equivalent generated rules.
+    """
     return (
         _normalize_text(rule.get("target")),
         _normalize_text(rule.get("category")),
         _normalize_text(rule.get("rule_type")),
-        _normalize_text(rule.get("rule_name")),
-        _normalize_text(rule.get("source_requirement")),
-        _normalize_text(rule.get("applied_qa_rule")),
+        _normalize_text(rule.get("test_objective")),
+        _normalize_text(rule.get("test_condition")),
+        _normalize_text(rule.get("expected_result")),
     )
 
 
@@ -1105,7 +1105,6 @@ def _screen_alias_equivalent(name_a: str, name_b: str) -> bool:
         return False
 
     return inter >= 4 and jaccard >= 0.85
-
 
 
 def _is_technical_screen_code(name: str) -> bool:
@@ -1225,6 +1224,16 @@ def merge_rule_matrices(matrices: list[dict]) -> tuple[dict, dict]:
 
                 if sig in seen_by_screen[canonical_key]:
                     exact_duplicates += 1
+                    # Preserve the more informative source wording when repeated OCR/chunks
+                    # generated the same semantic rule.
+                    current_rules = screens_map[canonical_key]["test_rules"]
+                    for existing in current_rules:
+                        if _rule_signature(existing) == sig:
+                            old_src = str(existing.get("source_requirement", "")).strip()
+                            new_src = str(rule.get("source_requirement", "")).strip()
+                            if len(new_src) > len(old_src):
+                                existing["source_requirement"] = new_src
+                            break
                     continue
 
                 seen_by_screen[canonical_key].add(sig)
@@ -1248,7 +1257,7 @@ def merge_rule_matrices(matrices: list[dict]) -> tuple[dict, dict]:
             rule["rule_id"] = f"{prefix}-{idx:03d}"
 
     final = {
-        "test_design_version": "3.1",
+        "test_design_version": WEB_TEST_DESIGN_VERSION,
         "screens": final_screens,
     }
 
@@ -1261,7 +1270,6 @@ def merge_rule_matrices(matrices: list[dict]) -> tuple[dict, dict]:
         "final_rules": sum(len(s.get("test_rules", [])) for s in final_screens),
     }
     return final, stats
-
 
 
 def run_agent1_document_pipeline(
@@ -1350,12 +1358,24 @@ def split_screen_rules_for_agent2(
     max_rules: int = AGENT2_BATCH_MAX_RULES,
     max_input_chars: int = AGENT2_BATCH_MAX_INPUT_CHARS,
 ) -> list[dict]:
-    """Pack rule theo count + estimated JSON chars."""
-    rules = screen.get("test_rules", [])
+    """Pack Web rules by Senior-style feature grouping, then internal QA category.
+
+    This is presentation-only deterministic ordering; Python does not infer QA meaning.
+    """
+    indexed_rules = list(enumerate(screen.get("test_rules", [])))
+    indexed_rules.sort(
+        key=lambda item: (
+            WEB_FEATURE_GROUP_ORDER.get(str(item[1].get("feature_group", "")).strip().upper(), 999),
+            _normalize_text(item[1].get("feature_name", "")),
+            WEB_CATEGORY_ORDER.get(str(item[1].get("category", "")).strip().upper(), 999),
+            item[0],
+        )
+    )
+    rules = [rule for _, rule in indexed_rules]
+
     batches = []
     current = []
     current_chars = 0
-
     for rule in rules:
         rule_chars = len(json.dumps(rule, ensure_ascii=False))
         if current and (len(current) >= max_rules or current_chars + rule_chars > max_input_chars):
@@ -1382,12 +1402,27 @@ def render_agent2_batch_recursive(
     cache: dict | None = None,
 ) -> tuple[bool, list[str]]:
     diagnostics = diagnostics if diagnostics is not None else []
-    payload = json.dumps({"test_design_version": "3.1", "screens": [batch_screen]}, ensure_ascii=False)
-    key = _cache_key("agent2-v3.1", model, prompt_template, payload)
+    payload = json.dumps(
+        {"test_design_version": WEB_TEST_DESIGN_VERSION, "screens": [batch_screen]},
+        ensure_ascii=False,
+    )
+    key = _cache_key(WEB_AGENT2_CACHE_NAMESPACE, model, prompt_template, payload)
+    rules = batch_screen.get("test_rules", [])
+    expected_count = len(rules)
 
     if cache is not None and key in cache:
-        diagnostics.append({"batch_id": batch_id, "status": "CACHE_HIT", "rules": len(batch_screen.get("test_rules", []))})
-        return True, [cache[key]]
+        cached_text = cache[key]
+        cached_count = _count_web_testcases_in_nodes(_parse_bullet_forest(cached_text))
+        if cached_count == expected_count:
+            diagnostics.append({"batch_id": batch_id, "status": "CACHE_HIT", "rules": expected_count})
+            return True, [cached_text]
+        diagnostics.append({
+            "batch_id": batch_id,
+            "status": "CACHE_INVALIDATED",
+            "rules": expected_count,
+            "rendered_testcases": cached_count,
+        })
+        cache.pop(key, None)
 
     call_result = None
     for attempt in range(AGENT2_API_RETRIES + 1):
@@ -1403,30 +1438,49 @@ def render_agent2_batch_recursive(
         if call_result.ok or call_result.finish_reason == "length":
             break
         if attempt < AGENT2_API_RETRIES:
-            log_info(f"[AGENT2/{batch_id}] 🔁 Retry API lần {attempt + 2}/{AGENT2_API_RETRIES + 1}")
+            log_info(f"[AGENT2/{batch_id}] Retry API {attempt + 2}/{AGENT2_API_RETRIES + 1}")
             time.sleep(2)
 
     assert call_result is not None
 
+    rendered_count = 0
     if call_result.complete:
-        diagnostics.append({
-            "batch_id": batch_id,
-            "status": "OK",
-            "rules": len(batch_screen.get("test_rules", [])),
-            "elapsed": round(call_result.elapsed, 2),
-            "output_chars": len(call_result.text),
-        })
-        if cache is not None:
-            cache[key] = call_result.text
-        return True, [call_result.text]
+        rendered_count = _count_web_testcases_in_nodes(_parse_bullet_forest(call_result.text))
+        if rendered_count == expected_count:
+            diagnostics.append({
+                "batch_id": batch_id,
+                "status": "OK",
+                "rules": expected_count,
+                "rendered_testcases": rendered_count,
+                "elapsed": round(call_result.elapsed, 2),
+                "output_chars": len(call_result.text),
+            })
+            if cache is not None:
+                cache[key] = call_result.text
+            return True, [call_result.text]
 
-    rules = batch_screen.get("test_rules", [])
-    can_split = call_result.finish_reason == "length" and len(rules) > 1 and depth < AGENT2_MAX_RECURSION_DEPTH
+    if call_result.finish_reason == "length":
+        failure_reason = "MAX_TOKENS"
+    elif call_result.complete:
+        failure_reason = "TC_COUNT_MISMATCH"
+        log_error(
+            f"[AGENT2/{batch_id}] Renderer count mismatch | "
+            f"Rules={expected_count} | TestCases={rendered_count}"
+        )
+    else:
+        failure_reason = call_result.error or "UNKNOWN"
+
+    can_split = (
+        len(rules) > 1
+        and depth < AGENT2_MAX_RECURSION_DEPTH
+        and (call_result.finish_reason == "length" or failure_reason == "TC_COUNT_MISMATCH")
+    )
     diagnostics.append({
         "batch_id": batch_id,
         "status": "SPLIT_RETRY" if can_split else "FAILED",
-        "reason": "MAX_TOKENS" if call_result.finish_reason == "length" else (call_result.error or "UNKNOWN"),
-        "rules": len(rules),
+        "reason": failure_reason,
+        "rules": expected_count,
+        "rendered_testcases": rendered_count,
         "output_chars": len(call_result.text),
     })
 
@@ -1434,12 +1488,14 @@ def render_agent2_batch_recursive(
         return False, []
 
     mid = max(1, len(rules) // 2)
-    children = [rules[:mid], rules[mid:]]
     outputs = []
-    for idx, child_rules in enumerate(children, start=1):
+    for idx, child_rules in enumerate((rules[:mid], rules[mid:]), start=1):
         if not child_rules:
             continue
-        child_screen = {"screen_name": batch_screen.get("screen_name", "Unnamed"), "test_rules": child_rules}
+        child_screen = {
+            "screen_name": batch_screen.get("screen_name", "Unnamed"),
+            "test_rules": child_rules,
+        }
         ok, child_outputs = render_agent2_batch_recursive(
             batch_screen=child_screen,
             api_key=api_key,
@@ -1458,7 +1514,8 @@ def render_agent2_batch_recursive(
 
 
 def _parse_bullet_forest(text: str) -> list[dict]:
-    clean = re.sub(r"^```[a-zA-Z]*\s*", "", text.strip())
+    """Parse indented bullet text. Literal \\n becomes a newline inside the same node title."""
+    clean = re.sub(r"^```[a-zA-Z]*\s*", "", str(text or "").strip())
     clean = re.sub(r"\s*```$", "", clean).strip()
     root = {"title": "__ROOT__", "children": []}
     stack = [(-1, root)]
@@ -1470,11 +1527,12 @@ def _parse_bullet_forest(text: str) -> list[dict]:
         indent = len(line) - len(line.lstrip(" "))
         level = indent // 2
         content = line.strip()
-        if content.startswith("- ") or content.startswith("* "):
+        if content.startswith(("- ", "* ")):
             content = content[2:].strip()
         if not content:
             continue
 
+        content = content.replace("\\n", "\n")
         node = {"title": content, "children": []}
         while stack and stack[-1][0] >= level:
             stack.pop()
@@ -1485,7 +1543,7 @@ def _parse_bullet_forest(text: str) -> list[dict]:
 
 
 def _merge_bullet_nodes(target_children: list[dict], incoming: list[dict], depth: int = 0):
-    """Merge cùng Screen/Category/Target ở 3 level đầu; từ testcase trở xuống luôn append."""
+    """Merge cùng Screen/FeatureGroup/FeatureName ở 3 level đầu; từ testcase trở xuống luôn append."""
     if depth >= 3:
         target_children.extend(copy.deepcopy(incoming))
         return
@@ -1510,13 +1568,16 @@ def _renumber_testcases_in_nodes(nodes: list[dict]) -> int:
             title = node.get("title", "")
             if re.match(r"^TC[_\- ]?\d+\s*[-:]", title, flags=re.IGNORECASE):
                 counter += 1
-                node["title"] = re.sub(
+                normalized_title = re.sub(
                     r"^TC[_\- ]?\d+",
                     f"TC_{counter:03d}",
                     title,
                     count=1,
                     flags=re.IGNORECASE,
                 )
+                if len(normalized_title) > WEB_TC_TITLE_MAX_CHARS:
+                    normalized_title = normalized_title[:WEB_TC_TITLE_MAX_CHARS - 1].rstrip(" -:;,.") + "…"
+                node["title"] = normalized_title
             walk(node.get("children", []))
 
     walk(nodes)
@@ -1524,11 +1585,58 @@ def _renumber_testcases_in_nodes(nodes: list[dict]) -> int:
 
 
 def _serialize_bullet_nodes(nodes: list[dict], depth: int = 0) -> list[str]:
+    """Serialize tree while keeping multiline node content on one physical tree line."""
     lines = []
     for node in nodes:
-        lines.append("  " * depth + "- " + str(node.get("title", "")).strip())
+        title = str(node.get("title", "")).replace("\r\n", "\n").replace("\r", "\n")
+        title = title.replace("\n", "\\n").strip()
+        lines.append("  " * depth + "- " + title)
         lines.extend(_serialize_bullet_nodes(node.get("children", []), depth + 1))
     return lines
+
+
+def _sort_numbered_category_nodes(nodes: list[dict]) -> None:
+    """Deterministically order numbered category siblings (1., 2., ...), recursively."""
+    def category_number(node: dict):
+        m = re.match(r"^(\d+)\.\s*", str(node.get("title", "")).strip())
+        return int(m.group(1)) if m else None
+
+    def walk(node: dict):
+        children = node.get("children", [])
+        if children:
+            numbered = [c for c in children if category_number(c) is not None]
+            if numbered:
+                unnumbered = [c for c in children if category_number(c) is None]
+                children[:] = sorted(numbered, key=category_number) + unnumbered
+            for child in children:
+                walk(child)
+
+    root = {"children": nodes}
+    walk(root)
+
+
+def _count_web_testcases_in_nodes(nodes: list[dict]) -> int:
+    pattern = re.compile(r"^TC[_\- ]?\d+\s*[-:]", flags=re.IGNORECASE)
+    total = 0
+    stack = list(nodes)
+    while stack:
+        node = stack.pop()
+        if pattern.match(str(node.get("title", ""))):
+            total += 1
+        stack.extend(node.get("children", []))
+    return total
+
+
+def _count_api_testcases_in_nodes(nodes: list[dict]) -> int:
+    pattern = re.compile(r"^TC_API[_\- ]?\d+\s*[-:]", flags=re.IGNORECASE)
+    total = 0
+    stack = list(nodes)
+    while stack:
+        node = stack.pop()
+        if pattern.match(str(node.get("title", ""))):
+            total += 1
+        stack.extend(node.get("children", []))
+    return total
 
 
 def merge_agent2_tree_outputs(outputs: list[str]) -> tuple[str, dict]:
@@ -1536,6 +1644,7 @@ def merge_agent2_tree_outputs(outputs: list[str]) -> tuple[str, dict]:
     for output in outputs:
         forest = _parse_bullet_forest(output)
         _merge_bullet_nodes(merged_nodes, forest, depth=0)
+    _sort_numbered_category_nodes(merged_nodes)
     tc_count = _renumber_testcases_in_nodes(merged_nodes)
     merged_text = "\n".join(_serialize_bullet_nodes(merged_nodes)).strip()
     return merged_text, {"agent2_leaf_outputs": len(outputs), "testcases_renumbered": tc_count}
@@ -1550,7 +1659,7 @@ def run_agent2_rule_matrix_pipeline(
     cache: dict | None = None,
     progress_callback=None,
 ) -> tuple[bool, str, dict]:
-    """Render Rule Matrix lớn theo batch, recursive split nếu chạm max_tokens."""
+    """Render Web Rule Matrix in bounded batches and enforce Rule-count == TC-count."""
     started = time.time()
     initial_batches = []
     for screen_idx, screen in enumerate(approved_screens, start=1):
@@ -1559,11 +1668,11 @@ def run_agent2_rule_matrix_pipeline(
 
     diagnostics = []
     outputs = []
+    expected_rules = sum(len(s.get("test_rules", [])) for s in approved_screens)
 
     log_info(
-        f"[AGENT2_PIPELINE] 🧩 Screens={len(approved_screens)} | "
-        f"InitialBatches={len(initial_batches)} | "
-        f"Rules={sum(len(s.get('test_rules', [])) for s in approved_screens)}"
+        f"[AGENT2_PIPELINE] Screens={len(approved_screens)} | "
+        f"InitialBatches={len(initial_batches)} | Rules={expected_rules}"
     )
 
     for idx, (batch_id, batch) in enumerate(initial_batches, start=1):
@@ -1571,7 +1680,8 @@ def run_agent2_rule_matrix_pipeline(
             progress_callback(
                 idx - 1,
                 len(initial_batches),
-                f"Agent 2 đang render batch {idx}/{len(initial_batches)} — {batch.get('screen_name')} ({len(batch.get('test_rules', []))} rules)"
+                f"Agent 2 đang render batch {idx}/{len(initial_batches)} — "
+                f"{batch.get('screen_name')} ({len(batch.get('test_rules', []))} rules)",
             )
         ok, batch_outputs = render_agent2_batch_recursive(
             batch_screen=batch,
@@ -1587,6 +1697,7 @@ def run_agent2_rule_matrix_pipeline(
             return False, "", {
                 "ok": False,
                 "initial_batches": len(initial_batches),
+                "expected_rules": expected_rules,
                 "elapsed": round(time.time() - started, 2),
                 "diagnostics": diagnostics,
             }
@@ -1595,90 +1706,78 @@ def run_agent2_rule_matrix_pipeline(
             progress_callback(idx, len(initial_batches), f"Hoàn tất batch {idx}/{len(initial_batches)}")
 
     merged_text, merge_stats = merge_agent2_tree_outputs(outputs)
+    actual_testcases = merge_stats["testcases_renumbered"]
+    count_ok = actual_testcases == expected_rules
     summary = {
-        "ok": True,
+        "ok": count_ok,
         "initial_batches": len(initial_batches),
+        "expected_rules": expected_rules,
         "elapsed": round(time.time() - started, 2),
         "merge": merge_stats,
         "diagnostics": diagnostics,
     }
+
+    if not count_ok:
+        summary["count_mismatch"] = {
+            "rules": expected_rules,
+            "testcases": actual_testcases,
+        }
+        log_error(
+            f"[AGENT2_PIPELINE] Count invariant failed | Rules={expected_rules} | TestCases={actual_testcases}"
+        )
+        return False, "", summary
+
     log_info(
-        f"[AGENT2_PIPELINE] ✅ Completed | Time={summary['elapsed']:.2f}s | "
-        f"LeafOutputs={merge_stats['agent2_leaf_outputs']} | TestCases={merge_stats['testcases_renumbered']}"
+        f"[AGENT2_PIPELINE] Completed | Time={summary['elapsed']:.2f}s | "
+        f"LeafOutputs={merge_stats['agent2_leaf_outputs']} | TestCases={actual_testcases}"
     )
     return True, merged_text, summary
 
 
 def create_xmind_from_text(tree_data: str, output_path: str, root_title: str = "Kế hoạch & Kịch bản Kiểm thử"):
+    """Create an XMind archive from the normalized bullet-tree parser."""
     try:
-        log_info(f"Tiến hành parse dữ liệu text sang cấu trúc file .xmind...")
+        forest = _parse_bullet_forest(tree_data)
+        if not forest:
+            raise ValueError("Không có node hợp lệ để tạo XMind.")
+
+        node_id_counter = [1]
+
+        def to_xmind_node(node: dict) -> dict:
+            node_id = f"node_{node_id_counter[0]}"
+            node_id_counter[0] += 1
+            return {
+                "id": node_id,
+                "title": str(node.get("title", "")),
+                "children": {
+                    "attached": [to_xmind_node(child) for child in node.get("children", [])]
+                },
+            }
+
         root_topic = {
             "id": "root_node",
             "title": root_title,
-            "children": {"attached": []}
+            "children": {"attached": [to_xmind_node(node) for node in forest]},
         }
-        
-        clean_data_str = re.sub(r'^```[a-zA-Z]*\n', '', tree_data, flags=re.MULTILINE)
-        clean_data_str = re.sub(r'\n```$', '', clean_data_str, flags=re.MULTILINE).strip()
-        
-        node_id_counter = [1]
-        lines = clean_data_str.split("\n")
-        stack = [(0, root_topic)]
-
-        for line in lines:
-            if not line.strip():
-                continue
-                
-            expanded_line = line.replace("\t", "    ")
-            indent_spaces = len(expanded_line) - len(expanded_line.lstrip(" "))
-            
-            content = expanded_line.strip()
-            
-            if content.startswith("- "):
-                content = content[2:].strip()
-            elif content.startswith("* "):
-                content = content[2:].strip()
-                
-            content = content.replace("\\n", "\n")
-
-            if not content:
-                continue
-
-            level = (indent_spaces // 2) + 1
-
-            new_node = {
-                "id": f"node_{node_id_counter[0]}",
-                "title": content,
-                "children": {"attached": []}
-            }
-            node_id_counter[0] += 1
-
-            while stack and stack[-1][0] >= level:
-                stack.pop()
-
-            parent_node = stack[-1][1]
-            parent_node["children"]["attached"].append(new_node)
-            stack.append((level, new_node))
-
         content_json = [{
             "id": "sheet_1",
             "title": "Sơ đồ Kiểm thử QA",
-            "rootTopic": root_topic
+            "rootTopic": root_topic,
         }]
-        
         manifest_json = {"file-entries": {"content.json": {}, "metadata.json": {}}}
         metadata_json = {}
 
-        with zipfile.ZipFile(output_path, 'w', zipfile.ZIP_DEFLATED) as zip_file:
-            zip_file.writestr('content.json', json.dumps(content_json, ensure_ascii=False, indent=2))
-            zip_file.writestr('manifest.json', json.dumps(manifest_json, ensure_ascii=False, indent=2))
-            zip_file.writestr('metadata.json', json.dumps(metadata_json, ensure_ascii=False, indent=2))
-            
-        log_info(f"✅ Đã đóng gói thành công file XMind tại: {output_path}")
+        with zipfile.ZipFile(output_path, "w", zipfile.ZIP_DEFLATED) as zip_file:
+            zip_file.writestr("content.json", json.dumps(content_json, ensure_ascii=False, indent=2))
+            zip_file.writestr("manifest.json", json.dumps(manifest_json, ensure_ascii=False, indent=2))
+            zip_file.writestr("metadata.json", json.dumps(metadata_json, ensure_ascii=False, indent=2))
+
+        log_info(f"[XMIND_EXPORT] Created | Nodes={node_id_counter[0] - 1} | Path={output_path}")
         return True, None
     except Exception as e:
         err_msg = log_error("Lỗi khi đóng gói file XMind", e)
         return False, err_msg
+
 
 # ==============================================================================
 # HÀM BÓC TÁCH CÂY XMIND VÀ XUẤT EXCEL CHUẨN THEO NHÁNH NHÓM (DỌC THEO TÊN MÀN HÌNH)
@@ -1706,30 +1805,9 @@ def convert_tree_to_ui_excel(tree_text: str) -> bytes:
         raise ValueError("Không có dữ liệu Test Case để xuất Excel.")
 
     # ----------------------------------------------------------
-    # 1. Parse plain-text bullet tree -> node forest
+    # 1. Parse normalized bullet tree once (shared with XMind/API exporters)
     # ----------------------------------------------------------
-    root_node = {"title": "__ROOT__", "children": []}
-    stack = [(-1, root_node)]
-
-    for raw_line in clean_text.splitlines():
-        if not raw_line.strip():
-            continue
-
-        expanded = raw_line.replace("\t", "    ")
-        indent = len(expanded) - len(expanded.lstrip(" "))
-        level = indent // 2
-        content = expanded.strip()
-        if content.startswith("- ") or content.startswith("* "):
-            content = content[2:].strip()
-        if not content:
-            continue
-
-        node = {"title": content.replace('\\n', '\n'), "children": []}
-        while stack and stack[-1][0] >= level:
-            stack.pop()
-        parent = stack[-1][1] if stack else root_node
-        parent["children"].append(node)
-        stack.append((level, node))
+    root_node = {"title": "__ROOT__", "children": _parse_bullet_forest(clean_text)}
 
     # ----------------------------------------------------------
     # 2. Helpers
@@ -1756,14 +1834,15 @@ def convert_tree_to_ui_excel(tree_text: str) -> bytes:
                 return t[len(prefix):].strip()
         return t
 
-    def extract_details(tc_node: dict) -> tuple[str, str, str]:
-        """Lấy Pre-condition / Steps / Expected ở bất kỳ độ sâu con nào."""
+    def extract_details(tc_node: dict) -> tuple[str, str, str, str]:
+        """Lấy Pre-condition / Steps / Data test / Expected ở bất kỳ độ sâu con nào."""
         pre = ""
         steps = ""
+        data_test = ""
         expected = ""
 
         def walk(node: dict):
-            nonlocal pre, steps, expected
+            nonlocal pre, steps, data_test, expected
             for child in node.get("children", []):
                 title = str(child.get("title", "")).strip()
                 low = title.lower()
@@ -1774,17 +1853,22 @@ def convert_tree_to_ui_excel(tree_text: str) -> bytes:
                 elif low.startswith(("các bước thực hiện:", "các bước:", "steps:", "step:")):
                     if not steps:
                         steps = clean_prefix(title, ["Các bước thực hiện:", "Các bước:", "Steps:", "Step:"])
+                elif low.startswith(("dữ liệu kiểm thử:", "du lieu kiem thu:", "data test:", "test data:")):
+                    if not data_test:
+                        data_test = clean_prefix(
+                            title,
+                            ["Dữ liệu kiểm thử:", "Du lieu kiem thu:", "Data test:", "Test data:"]
+                        )
                 elif low.startswith(("kết quả mong đợi:", "expected result:", "expected:", "response (kết quả mong đợi):")):
                     if not expected:
                         expected = clean_prefix(
                             title,
                             ["Kết quả mong đợi:", "Expected Result:", "Expected:", "Response (Kết quả mong đợi):"]
                         )
-
                 walk(child)
 
         walk(tc_node)
-        return pre, steps, expected
+        return pre, steps, data_test, expected
 
     def split_tc_title(title: str) -> tuple[str, str]:
         t = str(title or "").strip()
@@ -1852,19 +1936,39 @@ def convert_tree_to_ui_excel(tree_text: str) -> bytes:
     align_center = Alignment(horizontal="center", vertical="center", wrap_text=True)
     align_left = Alignment(horizontal="left", vertical="center", wrap_text=True)
 
-    headers = [
-        ("A11", "External ID", fill_header_bg),
-        ("B11", "Name", fill_pink),
-        ("C11", "PreConditions", fill_pink),
-        ("D11", "Importance", fill_pink),
-        ("E11", "Step", fill_pink),
-        ("F11", "Data test", fill_pink),
-        ("G11", "Expected Result", fill_pink),
-        ("H11", "Actual Result", fill_pink),
-        ("I11", "Lần 1", fill_blue_exec),
-        ("J11", "Lần 2", fill_blue_exec),
+    # Senior-QA-style two-row header. Administrative/execution fields stay blank until manual execution.
+    group_headers = {
+        "A11": "Test Case",
+        "E11": "Steps",
+        "I11": "Chrome",
+        "L11": "Kết quả hiện tại",
+        "M11": "Ghi chú",
+        "O11": "QC viết testcase",
+        "P11": "Sprint viết testcase",
+        "R11": "Sprint thực hiện test",
+        "V11": "Case cần Auto (Yes/No)",
+        "W11": "Case Đã Auto (Yes/No)",
+        "X11": "Smoke test (Yes/No)",
+        "Y11": "Regression test (Yes/No)",
+        "Z11": "TCs Out of date (Yes/No)",
+        "AA11": "Ngày TCs Out of date",
+    }
+    detail_headers = [
+        "ID", "Name", "PreConditions", "Importance", "Step", "Data test",
+        "Expected Result", "Actual Result", "Lần 1", "Lần 2", "Lần 3",
+        "Kết quả hiện tại", "Ghi chú", "Mã lỗi", "QC viết testcase",
+        "Sprint viết testcase", "QC thực hiện test", "Sprint thực hiện test",
+        "Người review", "Ngày review", "Nội dung review",
+        "Case cần Auto (Yes/No)", "Case Đã Auto (Yes/No)",
+        "Smoke test (Yes/No)", "Regression test (Yes/No)",
+        "TCs Out of date (Yes/No)", "Ngày TCs Out of date",
     ]
-    col_widths = {'A': 15, 'B': 52, 'C': 36, 'D': 12, 'E': 55, 'F': 20, 'G': 55, 'H': 25, 'I': 10, 'J': 10}
+    col_widths = {
+        'A': 14, 'B': 52, 'C': 38, 'D': 12, 'E': 52, 'F': 30, 'G': 58, 'H': 30,
+        'I': 10, 'J': 10, 'K': 10, 'L': 16, 'M': 28, 'N': 16, 'O': 18, 'P': 18,
+        'Q': 18, 'R': 18, 'S': 18, 'T': 16, 'U': 34, 'V': 18, 'W': 18, 'X': 16,
+        'Y': 18, 'Z': 18, 'AA': 20,
+    }
 
     used_sheet_names = set()
     exported_total = 0
@@ -1877,7 +1981,7 @@ def convert_tree_to_ui_excel(tree_text: str) -> bytes:
         ws = wb.create_sheet(title=sanitize_sheet_title(screen_name, used_sheet_names))
         ws.views.sheetView[0].showGridLines = True
 
-        # Metadata block
+        # Metadata block — inspired by the Senior workbook while keeping unknown project fields blank.
         ws['D1'] = "KỊCH BẢN KIỂM THỬ *"
         ws['D1'].font = font_title
         ws['D1'].alignment = align_center
@@ -1885,22 +1989,40 @@ def convert_tree_to_ui_excel(tree_text: str) -> bytes:
         ws['C2'].font = font_bold
         ws['D2'] = screen_name
         ws['D2'].font = font_body
+        ws['C4'] = "Mã Testcase"
+        ws['C4'].font = font_bold
+        ws['D4'] = "TC_"
+        ws['D4'].font = font_body
+        ws['B13'] = "Màn hình test"
+        ws['C13'] = "Link test:"
+        ws['B14'] = "Đường dẫn:"
 
-        for r in range(1, 5):
+        for r in (1, 2, 4):
             for col in ["C", "D"]:
                 ws[f"{col}{r}"].border = thin_border
 
-        for pos, label, fill in headers:
+        # Row 11: high-level visual groups.
+        for col_idx in range(1, 28):
+            c = ws.cell(row=11, column=col_idx)
+            c.fill = fill_header_bg
+            c.border = thin_border
+            c.alignment = align_center
+            c.font = font_bold
+        for pos, label in group_headers.items():
             ws[pos] = label
-            ws[pos].font = font_bold
-            ws[pos].alignment = align_center
-            ws[pos].border = thin_border
-            ws[pos].fill = fill
+
+        # Row 12: detailed executable/review columns.
+        for col_idx, label in enumerate(detail_headers, start=1):
+            c = ws.cell(row=12, column=col_idx, value=label)
+            c.font = font_bold
+            c.alignment = align_center
+            c.border = thin_border
+            c.fill = fill_pink if col_idx <= 8 else fill_blue_exec
 
         for col, width in col_widths.items():
             ws.column_dimensions[col].width = width
 
-        current_row = 14
+        current_row = 15
         screen_exported = 0
 
         def write_group_header(title: str, indent_level: int, strong: bool):
@@ -1910,7 +2032,7 @@ def convert_tree_to_ui_excel(tree_text: str) -> bytes:
             prefix = "  " * max(0, indent_level)
             ws.cell(row=current_row, column=2, value=f"{prefix}{title}").font = font_bold
             fill = fill_green if strong else fill_light_green
-            for col in range(1, 11):
+            for col in range(1, 28):
                 c = ws.cell(row=current_row, column=col)
                 c.fill = fill
                 c.border = thin_border
@@ -1919,22 +2041,23 @@ def convert_tree_to_ui_excel(tree_text: str) -> bytes:
         def write_tc(node: dict):
             nonlocal current_row, screen_exported, exported_total
             tc_id, tc_name = split_tc_title(node.get("title", ""))
-            pre, steps, expected = extract_details(node)
+            pre, steps, data_test, expected = extract_details(node)
 
             ws.cell(row=current_row, column=1, value=tc_id).alignment = align_center
             ws.cell(row=current_row, column=2, value=tc_name)
             ws.cell(row=current_row, column=3, value=pre)
-            ws.cell(row=current_row, column=4, value=None)
+            ws.cell(row=current_row, column=4, value=None)  # Importance: do not infer without source/company policy.
             ws.cell(row=current_row, column=5, value=steps)
-            ws.cell(row=current_row, column=6, value=None)
+            ws.cell(row=current_row, column=6, value=data_test)
             ws.cell(row=current_row, column=7, value=expected)
+            # H:AA are execution/review/automation columns and intentionally remain blank.
 
-            for col in range(1, 11):
+            for col in range(1, 28):
                 c = ws.cell(row=current_row, column=col)
                 c.font = font_body
                 c.fill = fill_white
                 c.border = thin_border
-                c.alignment = align_center if col in (1, 4, 9, 10) else align_left
+                c.alignment = align_center if col in (1, 4, 9, 10, 11, 12, 14, 22, 23, 24, 25, 26, 27) else align_left
 
             current_row += 1
             screen_exported += 1
@@ -1948,7 +2071,7 @@ def convert_tree_to_ui_excel(tree_text: str) -> bytes:
             if not has_test_cases(node):
                 return
 
-            # Node dưới screen: category ở depth 0, target/subgroup ở depth >=1
+            # Node dưới screen: Senior feature-group ở depth 0, feature_name/subgroup ở depth >=1
             write_group_header(str(node.get("title", "")).strip(), depth, strong=(depth == 0))
             for child in node.get("children", []):
                 traverse(child, depth + 1)
@@ -1956,8 +2079,8 @@ def convert_tree_to_ui_excel(tree_text: str) -> bytes:
         for child in screen.get("children", []):
             traverse(child, depth=0)
 
-        ws.freeze_panes = "A12"
-        ws.auto_filter.ref = f"A11:J{max(11, current_row - 1)}"
+        ws.freeze_panes = "A13"
+        ws.auto_filter.ref = f"A12:AA{max(12, current_row - 1)}"
         summary_rows.append((screen_name, screen_exported, ws.title))
 
     for screen in screen_nodes:
@@ -2030,6 +2153,17 @@ API_RULE_FIELDS = {
 API_ALLOWED_CATEGORIES = {
     "AUTHENTICATION", "AUTHORIZATION", "METHOD_URL", "REQUEST_VALIDATION",
     "HAPPY_PATH", "BUSINESS_RULE", "RESPONSE_VALIDATION", "INTEGRATION", "EXCEPTION"
+}
+API_CATEGORY_ORDER = {
+    "AUTHENTICATION": 1,
+    "AUTHORIZATION": 2,
+    "METHOD_URL": 3,
+    "REQUEST_VALIDATION": 4,
+    "HAPPY_PATH": 5,
+    "BUSINESS_RULE": 6,
+    "RESPONSE_VALIDATION": 7,
+    "INTEGRATION": 8,
+    "EXCEPTION": 9,
 }
 API_ALLOWED_RULE_TYPES = {"EXPLICIT", "DERIVED"}
 API_ALLOWED_SOURCE_DOCUMENTS = {"API_SPEC", "BA", "BOTH"}
@@ -2428,7 +2562,7 @@ def process_api_agent1_chunk_recursive(
 ) -> tuple[bool, list[dict]]:
     diagnostics = diagnostics if diagnostics is not None else []
     payload = build_api_agent1_chunk_payload(chunk, endpoint_index)
-    key = _cache_key("api-agent1-v3.2", model, prompt_template, payload)
+    key = _cache_key(API_AGENT1_CACHE_NAMESPACE, model, prompt_template, payload)
     if cache is not None and key in cache:
         diagnostics.append({"chunk_id": chunk.get("chunk_id"), "status": "CACHE_HIT", "chars": len(chunk.get("core_text", ""))})
         return True, [copy.deepcopy(cache[key])]
@@ -2467,9 +2601,11 @@ def process_api_agent1_chunk_recursive(
         if not parsed_ok:
             reason_to_split = "JSON_PARSE_FAIL"
         else:
+            parsed_json = normalize_api_rule_matrix_enums(parsed_json)
             schema_ok, schema_diag = validate_api_rule_matrix_schema(parsed_json, strict=False)
             if not schema_ok:
                 reason_to_split = "SCHEMA_FAIL"
+                log_error(f"[{agent_name}] Schema validation failed | {schema_diag}")
             else:
                 modules = parsed_json.get("api_modules", [])
                 rules = sum(len(ep.get("test_rules", [])) for m in modules for ep in m.get("endpoints", []))
@@ -2485,7 +2621,15 @@ def process_api_agent1_chunk_recursive(
                 return True, [parsed_json]
 
     depth = int(chunk.get("depth", 0))
-    can_split = depth < API_AGENT1_MAX_RECURSION_DEPTH and len(chunk.get("core_text", "")) > API_AGENT1_MIN_RECURSIVE_CHARS
+    split_reason_is_retryable = (
+        reason_to_split in {"MAX_TOKENS", "JSON_PARSE_FAIL"}
+        or (reason_to_split == "SCHEMA_FAIL" and _schema_failure_can_benefit_from_split(schema_diag))
+    )
+    can_split = (
+        split_reason_is_retryable
+        and depth < API_AGENT1_MAX_RECURSION_DEPTH
+        and len(chunk.get("core_text", "")) > API_AGENT1_MIN_RECURSIVE_CHARS
+    )
     diagnostics.append({
         "chunk_id": chunk.get("chunk_id"), "status": "SPLIT_RETRY" if can_split else "FAILED_LEAF",
         "reason": reason_to_split, "parse_diag": parse_diag, "schema_diag": schema_diag,
@@ -2573,11 +2717,24 @@ def run_api_agent1_document_pipeline(
 
 
 def split_api_endpoint_rules_for_agent2(module_name: str, endpoint: dict) -> list[dict]:
-    rules = endpoint.get("test_rules", [])
-    batches, current, current_chars = [], [], 0
+    indexed_rules = list(enumerate(endpoint.get("test_rules", [])))
+    indexed_rules.sort(
+        key=lambda item: (
+            API_CATEGORY_ORDER.get(str(item[1].get("category", "")).strip().upper(), 999),
+            item[0],
+        )
+    )
+    rules = [rule for _, rule in indexed_rules]
+
+    batches = []
+    current = []
+    current_chars = 0
     for rule in rules:
-        rc = len(json.dumps(rule, ensure_ascii=False))
-        if current and (len(current) >= API_AGENT2_BATCH_MAX_RULES or current_chars + rc > API_AGENT2_BATCH_MAX_INPUT_CHARS):
+        rule_chars = len(json.dumps(rule, ensure_ascii=False))
+        if current and (
+            len(current) >= API_AGENT2_BATCH_MAX_RULES
+            or current_chars + rule_chars > API_AGENT2_BATCH_MAX_INPUT_CHARS
+        ):
             batches.append({
                 "module_name": module_name,
                 "endpoint": {
@@ -2585,11 +2742,13 @@ def split_api_endpoint_rules_for_agent2(module_name: str, endpoint: dict) -> lis
                     "endpoint_path": endpoint.get("endpoint_path", "UNMAPPED"),
                     "summary": endpoint.get("summary", ""),
                     "test_rules": current,
-                }
+                },
             })
-            current, current_chars = [], 0
+            current = []
+            current_chars = 0
         current.append(rule)
-        current_chars += rc
+        current_chars += rule_chars
+
     if current:
         batches.append({
             "module_name": module_name,
@@ -2598,7 +2757,7 @@ def split_api_endpoint_rules_for_agent2(module_name: str, endpoint: dict) -> lis
                 "endpoint_path": endpoint.get("endpoint_path", "UNMAPPED"),
                 "summary": endpoint.get("summary", ""),
                 "test_rules": current,
-            }
+            },
         })
     return batches
 
@@ -2620,45 +2779,104 @@ def render_api_agent2_batch_recursive(
         "api_modules": [{
             "module_name": batch.get("module_name", "UNMAPPED"),
             "endpoints": [batch.get("endpoint", {})],
-        }]
+        }],
     }, ensure_ascii=False)
-    key = _cache_key("api-agent2-v3.2", model, prompt_template, payload)
+    key = _cache_key(API_AGENT2_CACHE_NAMESPACE, model, prompt_template, payload)
+    rules = batch.get("endpoint", {}).get("test_rules", [])
+    expected_count = len(rules)
+
     if cache is not None and key in cache:
-        diagnostics.append({"batch_id": batch_id, "status": "CACHE_HIT", "rules": len(batch.get("endpoint", {}).get("test_rules", []))})
-        return True, [cache[key]]
+        cached_text = cache[key]
+        cached_count = _count_api_testcases_in_nodes(_parse_bullet_forest(cached_text))
+        if cached_count == expected_count:
+            diagnostics.append({"batch_id": batch_id, "status": "CACHE_HIT", "rules": expected_count})
+            return True, [cached_text]
+        diagnostics.append({
+            "batch_id": batch_id,
+            "status": "CACHE_INVALIDATED",
+            "rules": expected_count,
+            "rendered_testcases": cached_count,
+        })
+        cache.pop(key, None)
 
     call_result = None
     for attempt in range(API_AGENT2_API_RETRIES + 1):
         call_result = call_qwen_max_agent_detailed(
-            content=payload, api_key=api_key, base_url=base_url, model=model,
-            prompt_template=prompt_template, max_tokens=QWEN_MAX_OUTPUT_TOKENS,
+            content=payload,
+            api_key=api_key,
+            base_url=base_url,
+            model=model,
+            prompt_template=prompt_template,
+            max_tokens=QWEN_MAX_OUTPUT_TOKENS,
             agent_name=f"API_AGENT2/{batch_id}",
         )
         if call_result.ok or call_result.finish_reason == "length":
             break
         if attempt < API_AGENT2_API_RETRIES:
+            log_info(f"[API_AGENT2/{batch_id}] Retry API {attempt + 2}/{API_AGENT2_API_RETRIES + 1}")
             time.sleep(2)
-    assert call_result is not None
-    if call_result.complete:
-        diagnostics.append({"batch_id": batch_id, "status": "OK", "rules": len(batch.get("endpoint", {}).get("test_rules", [])), "output_chars": len(call_result.text)})
-        if cache is not None:
-            cache[key] = call_result.text
-        return True, [call_result.text]
 
-    rules = batch.get("endpoint", {}).get("test_rules", [])
-    can_split = call_result.finish_reason == "length" and len(rules) > 1 and depth < API_AGENT2_MAX_RECURSION_DEPTH
-    diagnostics.append({"batch_id": batch_id, "status": "SPLIT_RETRY" if can_split else "FAILED", "reason": "MAX_TOKENS" if call_result.finish_reason == "length" else (call_result.error or "UNKNOWN"), "rules": len(rules)})
+    assert call_result is not None
+
+    rendered_count = 0
+    if call_result.complete:
+        rendered_count = _count_api_testcases_in_nodes(_parse_bullet_forest(call_result.text))
+        if rendered_count == expected_count:
+            diagnostics.append({
+                "batch_id": batch_id,
+                "status": "OK",
+                "rules": expected_count,
+                "rendered_testcases": rendered_count,
+                "elapsed": round(call_result.elapsed, 2),
+                "output_chars": len(call_result.text),
+            })
+            if cache is not None:
+                cache[key] = call_result.text
+            return True, [call_result.text]
+
+    if call_result.finish_reason == "length":
+        failure_reason = "MAX_TOKENS"
+    elif call_result.complete:
+        failure_reason = "TC_COUNT_MISMATCH"
+        log_error(
+            f"[API_AGENT2/{batch_id}] Renderer count mismatch | "
+            f"Rules={expected_count} | TestCases={rendered_count}"
+        )
+    else:
+        failure_reason = call_result.error or "UNKNOWN"
+
+    can_split = (
+        len(rules) > 1
+        and depth < API_AGENT2_MAX_RECURSION_DEPTH
+        and (call_result.finish_reason == "length" or failure_reason == "TC_COUNT_MISMATCH")
+    )
+    diagnostics.append({
+        "batch_id": batch_id,
+        "status": "SPLIT_RETRY" if can_split else "FAILED",
+        "reason": failure_reason,
+        "rules": expected_count,
+        "rendered_testcases": rendered_count,
+    })
     if not can_split:
         return False, []
-    mid = max(1, len(rules)//2)
+
+    mid = max(1, len(rules) // 2)
     outputs = []
-    for idx, child_rules in enumerate([rules[:mid], rules[mid:]], start=1):
+    for idx, child_rules in enumerate((rules[:mid], rules[mid:]), start=1):
         if not child_rules:
             continue
         child = copy.deepcopy(batch)
         child["endpoint"]["test_rules"] = child_rules
         ok, child_outputs = render_api_agent2_batch_recursive(
-            child, api_key, base_url, model, prompt_template, f"{batch_id}.{idx}", depth+1, diagnostics, cache
+            child,
+            api_key,
+            base_url,
+            model,
+            prompt_template,
+            f"{batch_id}.{idx}",
+            depth + 1,
+            diagnostics,
+            cache,
         )
         if not ok:
             return False, []
@@ -2685,9 +2903,11 @@ def merge_api_agent2_tree_outputs(outputs: list[str]) -> tuple[str, dict]:
     for output in outputs:
         forest = _parse_bullet_forest(output)
         _merge_bullet_nodes(merged_nodes, forest, depth=0)
+    _sort_numbered_category_nodes(merged_nodes)
     tc_count = _renumber_api_testcases_in_nodes(merged_nodes)
     return "\n".join(_serialize_bullet_nodes(merged_nodes)).strip(), {
-        "agent2_leaf_outputs": len(outputs), "testcases_renumbered": tc_count
+        "agent2_leaf_outputs": len(outputs),
+        "testcases_renumbered": tc_count,
     }
 
 
@@ -2704,32 +2924,89 @@ def run_api_agent2_rule_matrix_pipeline(
     initial_batches = []
     for midx, module in enumerate(approved_modules, start=1):
         for eidx, endpoint in enumerate(module.get("endpoints", []), start=1):
-            for bidx, batch in enumerate(split_api_endpoint_rules_for_agent2(module.get("module_name", "UNMAPPED"), endpoint), start=1):
+            batches = split_api_endpoint_rules_for_agent2(module.get("module_name", "UNMAPPED"), endpoint)
+            for bidx, batch in enumerate(batches, start=1):
                 initial_batches.append((f"M{midx:02d}E{eidx:03d}B{bidx:02d}", batch))
-    diagnostics, outputs = [], []
-    total_rules = sum(len(ep.get("test_rules", [])) for m in approved_modules for ep in m.get("endpoints", []))
-    log_info(f"[API_AGENT2_PIPELINE] 🧩 Modules={len(approved_modules)} | Batches={len(initial_batches)} | Rules={total_rules}")
+
+    diagnostics = []
+    outputs = []
+    total_rules = sum(
+        len(ep.get("test_rules", []))
+        for module in approved_modules
+        for ep in module.get("endpoints", [])
+    )
+    log_info(
+        f"[API_AGENT2_PIPELINE] Modules={len(approved_modules)} | "
+        f"Batches={len(initial_batches)} | Rules={total_rules}"
+    )
+
     for idx, (batch_id, batch) in enumerate(initial_batches, start=1):
         if progress_callback:
             ep = batch.get("endpoint", {})
-            progress_callback(idx-1, len(initial_batches), f"API Agent 2 batch {idx}/{len(initial_batches)} — {ep.get('method')} {ep.get('endpoint_path')} ({len(ep.get('test_rules', []))} rules)")
+            progress_callback(
+                idx - 1,
+                len(initial_batches),
+                f"API Agent 2 batch {idx}/{len(initial_batches)} — "
+                f"{ep.get('method')} {ep.get('endpoint_path')} "
+                f"({len(ep.get('test_rules', []))} rules)",
+            )
         ok, batch_outputs = render_api_agent2_batch_recursive(
-            batch, api_key, base_url, model, prompt_template, batch_id, diagnostics=diagnostics, cache=cache
+            batch,
+            api_key,
+            base_url,
+            model,
+            prompt_template,
+            batch_id,
+            diagnostics=diagnostics,
+            cache=cache,
         )
         if not ok:
-            return False, "", {"ok": False, "initial_batches": len(initial_batches), "elapsed": round(time.time()-started,2), "diagnostics": diagnostics}
+            return False, "", {
+                "ok": False,
+                "initial_batches": len(initial_batches),
+                "expected_rules": total_rules,
+                "elapsed": round(time.time() - started, 2),
+                "diagnostics": diagnostics,
+            }
         outputs.extend(batch_outputs)
         if progress_callback:
             progress_callback(idx, len(initial_batches), f"Hoàn tất API batch {idx}/{len(initial_batches)}")
+
     merged_text, merge_stats = merge_api_agent2_tree_outputs(outputs)
-    summary = {"ok": True, "initial_batches": len(initial_batches), "elapsed": round(time.time()-started,2), "merge": merge_stats, "diagnostics": diagnostics}
-    log_info(f"[API_AGENT2_PIPELINE] ✅ Completed | Time={summary['elapsed']:.2f}s | TestCases={merge_stats['testcases_renumbered']}")
+    actual_testcases = merge_stats["testcases_renumbered"]
+    count_ok = actual_testcases == total_rules
+    summary = {
+        "ok": count_ok,
+        "initial_batches": len(initial_batches),
+        "expected_rules": total_rules,
+        "elapsed": round(time.time() - started, 2),
+        "merge": merge_stats,
+        "diagnostics": diagnostics,
+    }
+    if not count_ok:
+        summary["count_mismatch"] = {"rules": total_rules, "testcases": actual_testcases}
+        log_error(
+            f"[API_AGENT2_PIPELINE] Count invariant failed | Rules={total_rules} | TestCases={actual_testcases}"
+        )
+        return False, "", summary
+
+    log_info(
+        f"[API_AGENT2_PIPELINE] Completed | Time={summary['elapsed']:.2f}s | "
+        f"TestCases={actual_testcases}"
+    )
     return True, merged_text, summary
 
 
 def convert_tree_to_api_excel(tree_text: str) -> bytes:
-    """Excel API hỗ trợ nhiều Module/Endpoint; không bỏ các top-level module phía sau."""
+    """Export all API Module/Endpoint testcases and enforce TreeTC == ExcelTC."""
     forest = _parse_bullet_forest(tree_text)
+    if not forest:
+        raise ValueError("Không có dữ liệu API Test Case để xuất Excel.")
+
+    expected_total = _count_api_testcases_in_nodes(forest)
+    if expected_total <= 0:
+        raise ValueError("Không tìm thấy Test Case API hợp lệ (TC_API_...).")
+
     wb = Workbook()
     ws = wb.active
     ws.title = "API Test Execution"
@@ -2742,8 +3019,10 @@ def convert_tree_to_api_excel(tree_text: str) -> bytes:
     fill_pink = PatternFill(start_color="F8BBD0", fill_type="solid")
     fill_blue_exec = PatternFill(start_color="90CAF9", fill_type="solid")
     thin_border = Border(
-        left=Side(style='thin', color='B0BEC5'), right=Side(style='thin', color='B0BEC5'),
-        top=Side(style='thin', color='B0BEC5'), bottom=Side(style='thin', color='B0BEC5')
+        left=Side(style="thin", color="B0BEC5"),
+        right=Side(style="thin", color="B0BEC5"),
+        top=Side(style="thin", color="B0BEC5"),
+        bottom=Side(style="thin", color="B0BEC5"),
     )
     font_title = Font(name="Segoe UI", size=11, bold=True)
     font_bold = Font(name="Segoe UI", size=10, bold=True)
@@ -2751,523 +3030,613 @@ def convert_tree_to_api_excel(tree_text: str) -> bytes:
     align_center = Alignment(horizontal="center", vertical="center", wrap_text=True)
     align_left = Alignment(horizontal="left", vertical="center", wrap_text=True)
 
-    ws['D1'] = "KỊCH BẢN KIỂM THỬ API *"
-    ws['D1'].font = font_title
-    ws['D1'].alignment = align_center
-    ws['C2'] = "Phạm vi"
-    ws['C2'].font = font_bold
-    ws['D2'] = " / ".join([n.get("title", "") for n in forest[:3]]) if forest else "API Testing"
-    for r in range(1, 5):
-        for col in ["C", "D"]:
-            ws[f"{col}{r}"].border = thin_border
+    ws["D1"] = "KỊCH BẢN KIỂM THỬ API *"
+    ws["D1"].font = font_title
+    ws["D1"].alignment = align_center
+    ws["C2"] = "Phạm vi"
+    ws["C2"].font = font_bold
+    ws["D2"] = " / ".join([n.get("title", "") for n in forest[:3]]) if forest else "API Testing"
+    for row in range(1, 5):
+        for col in ("C", "D"):
+            ws[f"{col}{row}"].border = thin_border
 
     headers = [
-        ("A11", "External ID", fill_header_bg), ("B11", "Name", fill_pink),
-        ("C11", "PreConditions", fill_pink), ("D11", "Importance", fill_pink),
-        ("E11", "Step", fill_pink), ("F11", "Data test", fill_pink),
-        ("G11", "Expected Result", fill_pink), ("H11", "Actual Result", fill_pink),
-        ("I11", "Lần 1", fill_blue_exec), ("J11", "Lần 2", fill_blue_exec),
+        ("A11", "External ID", fill_header_bg),
+        ("B11", "Name", fill_pink),
+        ("C11", "PreConditions", fill_pink),
+        ("D11", "Importance", fill_pink),
+        ("E11", "Step", fill_pink),
+        ("F11", "Data test", fill_pink),
+        ("G11", "Expected Result", fill_pink),
+        ("H11", "Actual Result", fill_pink),
+        ("I11", "Lần 1", fill_blue_exec),
+        ("J11", "Lần 2", fill_blue_exec),
     ]
-    for pos, val, fill in headers:
-        ws[pos] = val; ws[pos].font = font_bold; ws[pos].alignment = align_center; ws[pos].border = thin_border; ws[pos].fill = fill
+    for pos, value, fill in headers:
+        ws[pos] = value
+        ws[pos].font = font_bold
+        ws[pos].alignment = align_center
+        ws[pos].border = thin_border
+        ws[pos].fill = fill
 
     current_row = 14
+    exported_total = 0
 
     def clean_prefix(value, prefixes):
         t = str(value).strip()
-        for p in prefixes:
-            if t.lower().startswith(p.lower()):
-                return t[len(p):].strip()
+        for prefix in prefixes:
+            if t.lower().startswith(prefix.lower()):
+                return t[len(prefix):].strip()
         return t
 
     def extract_details(node):
-        pre = step = exp = ""
+        pre = step = expected = ""
         for child in node.get("children", []):
-            title = child.get("title", "")
+            title = str(child.get("title", ""))
             low = title.lower()
             if "pre-condition" in low or "precondition" in low or "tiền điều kiện" in low:
-                pre = clean_prefix(title, ["Pre-condition:", "Precondition:", "Tiền điều kiện:"])
+                pre = pre or clean_prefix(title, ["Pre-condition:", "Precondition:", "Tiền điều kiện:"])
             elif "steps & data test" in low or low.startswith("steps") or "các bước" in low:
-                step = clean_prefix(title, ["Steps & Data test:", "Steps:", "Các bước thực hiện:"])
+                step = step or clean_prefix(title, ["Steps & Data test:", "Steps:", "Các bước thực hiện:"])
             elif "response" in low or "kết quả mong đợi" in low or "expected" in low:
-                exp = clean_prefix(title, ["Response (Kết quả mong đợi):", "Kết quả mong đợi:", "Expected Result:"])
-            sp, ss, se = extract_details(child)
-            pre = pre or sp; step = step or ss; exp = exp or se
-        return pre, step, exp
+                expected = expected or clean_prefix(
+                    title,
+                    ["Response (Kết quả mong đợi):", "Kết quả mong đợi:", "Expected Result:"],
+                )
+            child_pre, child_step, child_expected = extract_details(child)
+            pre = pre or child_pre
+            step = step or child_step
+            expected = expected or child_expected
+        return pre, step, expected
 
     def is_tc(node):
         return bool(re.match(r"^TC_API[_\- ]?\d+", str(node.get("title", "")), flags=re.IGNORECASE))
 
     def has_tc(node):
-        return is_tc(node) or any(has_tc(c) for c in node.get("children", []))
+        return is_tc(node) or any(has_tc(child) for child in node.get("children", []))
 
     def write_group(title, level):
         nonlocal current_row
-        ws.cell(row=current_row, column=2, value=("  " * max(0, level-1)) + title).font = font_bold
+        ws.cell(row=current_row, column=2, value=("  " * max(0, level - 1)) + title).font = font_bold
         for col in range(1, 11):
-            c = ws.cell(row=current_row, column=col)
-            c.fill = fill_green if level <= 2 else fill_light_green
-            c.border = thin_border
+            cell = ws.cell(row=current_row, column=col)
+            cell.fill = fill_green if level <= 2 else fill_light_green
+            cell.border = thin_border
         current_row += 1
 
     def walk(node, level=1):
-        nonlocal current_row
+        nonlocal current_row, exported_total
         if is_tc(node):
-            full = node.get("title", "")
+            full = str(node.get("title", ""))
             parts = full.split(" - ", 1)
             tc_id = parts[0].strip()
             tc_name = parts[1].strip() if len(parts) > 1 else full
-            pre, step, exp = extract_details(node)
+            pre, step, expected = extract_details(node)
+
             ws.cell(row=current_row, column=1, value=tc_id).alignment = align_center
             ws.cell(row=current_row, column=2, value=tc_name)
             ws.cell(row=current_row, column=3, value=pre)
             ws.cell(row=current_row, column=4, value=None)
             ws.cell(row=current_row, column=5, value=step)
             ws.cell(row=current_row, column=6, value=None)
-            ws.cell(row=current_row, column=7, value=exp)
+            ws.cell(row=current_row, column=7, value=expected)
             for col in range(1, 11):
-                c = ws.cell(row=current_row, column=col); c.font = font_body; c.fill = fill_white; c.border = thin_border
-                if col not in [1,4]: c.alignment = align_left
+                cell = ws.cell(row=current_row, column=col)
+                cell.font = font_body
+                cell.fill = fill_white
+                cell.border = thin_border
+                cell.alignment = align_center if col in (1, 4, 9, 10) else align_left
             current_row += 1
+            exported_total += 1
             return
+
         if has_tc(node):
             write_group(str(node.get("title", "")), level)
             for child in node.get("children", []):
-                walk(child, level+1)
+                walk(child, level + 1)
 
     for root in forest:
         walk(root, 1)
 
-    for col, width in {'A':18,'B':48,'C':34,'D':12,'E':52,'F':18,'G':52,'H':20,'I':10,'J':10}.items():
+    if exported_total != expected_total:
+        raise ValueError(
+            f"API Excel export không đầy đủ: Tree có {expected_total} testcase nhưng Excel ghi {exported_total}."
+        )
+
+    for col, width in {
+        "A": 18, "B": 48, "C": 34, "D": 12, "E": 52,
+        "F": 18, "G": 52, "H": 20, "I": 10, "J": 10,
+    }.items():
         ws.column_dimensions[col].width = width
-    output = io.BytesIO(); wb.save(output); output.seek(0)
+
+    ws.freeze_panes = "A12"
+    ws.auto_filter.ref = f"A11:J{max(11, current_row - 1)}"
+    log_info(f"[API_EXCEL_EXPORT] TreeTC={expected_total} | ExcelTC={exported_total}")
+
+    output = io.BytesIO()
+    wb.save(output)
+    output.seek(0)
     return output.getvalue()
 
 
-# ==========================================
-# 3. KHAI BÁO PROMPTS WEB/APP
-# ==========================================
-# ==============================================================================
-# 1. PROMPT DÀNH CHO BÓC TÁCH MỘT BƯỚC (DÙNG TRỰC TIẾP PROMPT_WEB_UI CHUẨN)
-# ==============================================================================
-# QA TEST DESIGN PIPELINE — PROMPT PACK v1
-# Mục tiêu:
-# Agent 1 = QA Brain: đọc Spec + áp dụng QA Test Design Rules -> Test Design / Rule Matrix
-# Agent 2 = Renderer: chỉ biến Rule Matrix thành Test Case/XMind, không suy luận thêm
-# Web = Renderer cuối nếu cần, không tự nghĩ Business Rule
-
-
 # ============================================================
-# 1. PROMPT AGENT 1 — EXTRACT + APPLY QA RULES
-# ============================================================
-
-# NEW 2 — QA TEST DESIGN PIPELINE v2
-
-# ============================================================
-# 1. AGENT 1 — QA BRAIN
-# ============================================================
-
-# ============================================================
-# ============================================================
-# WEB PROMPT PACK — OPTIMIZED B
-#
-# Multi-Agent flow:
-#   WEB_AGENT1_QA_BRAIN -> Rule Matrix JSON
-#   WEB_AGENT2_XMIND_RENDERER -> XMind plain-text tree
-#
-# Legacy / 1-Click flow:
-#   WEB_DIRECT_TESTCASE_AGENT -> XMind plain-text tree trực tiếp
-# ============================================================
-
-
-# ============================================================
-# 1. AGENT 1 — WEB_AGENT1_QA_BRAIN
-# SRS CHUNK -> COMPACT RULE MATRIX
+# ENGLISH PROMPTS — RECOMMENDED CLEAN VERSION
+# Prompt instructions: ENGLISH
+# Generated Rule Matrix / Test Cases: VIETNAMESE
+# PROMPT_WEB_UI intentionally removed.
+# Normalized: grid ownership, traceable TC title, parser-safe multiline steps.
 # ============================================================
 
 PROMPT_AGENT1_EXTRACT_RULE_MATRIX = """
-Bạn là WEB_AGENT1_QA_BRAIN — Senior QA Test Design Lead cho hệ thống Banking / Enterprise.
+You are WEB_AGENT1_QA_BRAIN — a Senior QA Test Design Lead for Banking / Enterprise systems.
 
-NHIỆM VỤ DUY NHẤT:
-Đọc CURRENT SOURCE trong chunk, xác định requirement WEB có ý nghĩa kiểm thử và tạo TEST DESIGN / RULE MATRIX.
-Bạn là Agent DUY NHẤT được phép phân tích requirement và áp dụng QA Test Design Technique.
-WEB_AGENT2_XMIND_RENDERER phía sau CHỈ render, không được bổ sung Test Rule.
+LANGUAGE REQUIREMENT — CRITICAL:
+- ALL generated Rule Matrix textual content MUST be written in VIETNAMESE.
+- Keep technical identifiers exactly as they appear in the source when needed: screen code, field name, API name, endpoint, parameter, status code, enum value, message, etc.
+- JSON keys and enum values MUST remain exactly as defined by the schema below.
+- Do NOT translate business labels, field names, messages, or source values if doing so would alter the original requirement.
+
+YOUR ONLY TASK:
+Read the CURRENT SOURCE, identify source-grounded WEB requirements, and create a TEST DESIGN / RULE MATRIX.
+You are the ONLY agent allowed to analyze requirements and apply QA Test Design Techniques.
+The downstream WEB_AGENT2_XMIND_RENDERER only renders your Rule Matrix and MUST NOT add/remove/reason about Test Rules.
+
+IMPORTANT DESIGN PRINCIPLE:
+- INTERNAL QA CLASSIFICATION and FINAL TESTER ORGANIZATION are two different dimensions.
+- `category` is the internal QA reasoning type: UI | VALIDATION | ACTION | DATA_GRID | BUSINESS_FLOW | EXCEPTION.
+- `feature_group` + `feature_name` organize the final output in a Senior-QA-style feature-oriented structure.
+- Do NOT force a rule into a different internal category merely to place it under a desired final section.
 
 ==================================================
 1. CHUNK OWNERSHIP — CRITICAL
 ==================================================
 
-Input có 3 vùng:
-1. PREVIOUS CONTEXT: chỉ dùng để hiểu requirement ở biên.
-2. CURRENT SOURCE: nguồn CHÍNH sở hữu Test Rule.
-3. NEXT CONTEXT: chỉ dùng để hiểu requirement ở biên.
+The input contains:
+1. PREVIOUS CONTEXT: only used to understand requirements near the chunk boundary.
+2. CURRENT SOURCE: the PRIMARY source that owns Test Rules.
+3. NEXT CONTEXT: only used to understand requirements near the chunk boundary.
 
-CHỈ tạo Rule khi target/action/constraint/behavior được kiểm thử có căn cứ trong CURRENT SOURCE.
-Có thể dùng PREVIOUS/NEXT CONTEXT để hoàn thiện requirement thuộc CURRENT SOURCE.
-KHÔNG tạo Rule nếu toàn bộ căn cứ chỉ nằm trong CONTEXT.
+ONLY create a Rule when the tested behavior is grounded in CURRENT SOURCE.
+You MAY use PREVIOUS/NEXT CONTEXT to complete the meaning of a requirement that belongs to CURRENT SOURCE.
+DO NOT create a Rule when all supporting evidence appears only in CONTEXT.
 
-Đây là một chunk của tài liệu lớn:
-- Coverage đầy đủ CURRENT SOURCE.
-- Không cố đánh giá coverage toàn tài liệu.
-- Không copy lại requirement đã thuộc chunk khác.
-- Nếu cùng nội dung lặp do bảng/OCR/image text, chỉ giữ một objective.
+This is one chunk of a large document:
+- Fully cover CURRENT SOURCE.
+- Do not attempt whole-document coverage from one chunk.
+- Do not repeat requirements owned by another chunk.
+- Repeated OCR/table/image text must not create duplicate Rules.
 
 ==================================================
-2. SCOPE — CHỈ TEST WEB
+2. SCOPE — WEB FUNCTIONAL TESTING ONLY
 ==================================================
 
-Requirement WEB gồm:
-- Screen/UI/Figma.
-- Field/Textbox/Numeric/Dropdown/Datepicker/Checkbox.
-- Button/Icon/Link/Action.
-- Grid/Column/Pagination.
-- Popup/Dialog/Toast.
-- Search/Filter/Reset.
-- Permission hiển thị/truy cập Web.
-- Business Flow thực hiện từ giao diện.
-- FE gọi API và FE xử lý response như một phần chức năng Web.
+WEB scope includes source-grounded requirements for:
+- screen/UI controls and static presentation;
+- textbox/numeric/dropdown/date picker/checkbox/input behavior;
+- button/icon/link/action;
+- search/filter/reset;
+- Data Grid/column/mapping/pagination;
+- popup/dialog/toast;
+- Web display/access permission when explicitly documented;
+- business flow initiated from the Web UI;
+- FE API request parameters and FE response handling as part of a Web feature.
 
 CRITICAL:
-- API được nhắc trong SRS Web KHÔNG tự động trở thành API Test Scope.
-- FE gọi API để Search/Dropdown/Hold/Confirm/Cancel/Load data... thuộc TÍNH NĂNG MÀN HÌNH.
-- Không tự sinh Authentication/HTTP Method/Header/Schema test chỉ vì tài liệu có chữ API.
-- Không lấy nội dung từ URL/“Request access” mà CURRENT SOURCE không cung cấp.
-- Không bịa API/Status/Message/DB/Permission/Timeout/Edge Case.
+- An API mentioned inside a Web SRS does NOT automatically become an API Test Scope.
+- FE API calls for Dropdown/Search/Hold/Confirm/Cancel/Load data belong to WEB FEATURE testing.
+- Do NOT create Authentication/HTTP Method/Header/Schema tests merely because an API is mentioned.
+- Do NOT retrieve/infer content from URLs or “Request access” links that are not included in CURRENT SOURCE.
+- Do NOT invent API status/message/DB/permission/timeout/edge-case behavior.
+- Do NOT add generic QA checklist cases such as responsive/zoom/tab-order/cross-browser unless CURRENT SOURCE explicitly requires them.
+
+DEFERRED FROM THE CURRENT WEB GENERATOR — DO NOT CREATE RULES FOR THESE IN THIS VERSION:
+- close tab / close browser lifecycle;
+- session-expiry lifecycle;
+- technical/audit logging of user actions or API request-response;
+- pagination Next/Previous navigation behavior inferred only from the presence of > / < controls. Keep only pagination behavior explicitly stated by source (for example page-size values/default, first/last-page visibility, disabled states, request parameters).
+These may be handled by another pipeline later.
 
 ==================================================
-3. SCREEN OWNERSHIP
+3. SCREEN OWNERSHIP & ACTIVE REQUIREMENT PRECEDENCE
 ==================================================
 
-Chỉ tạo screen khi có căn cứ rõ như:
-- section riêng “Màn hình ...”;
-- mã màn hình;
-- bảng mô tả màn hình;
-- mockup/control specification riêng.
+Only create a screen when there is clear evidence such as a dedicated screen section, screen code, screen description table, or mockup/control specification.
 
-KHÔNG tạo screen mới khi:
-- chỉ được nhắc như màn hình đích điều hướng;
-- chỉ xuất hiện trong link/reference;
-- flow chỉ nói “chuyển sang màn hình X” nhưng không đặc tả màn X;
-- cùng một màn hình được gọi bằng nhiều biến thể tên.
+SCREEN-NAME STABILITY:
+- A code such as BOND_ORDER_LIST is a technical identity, NOT the displayed screen name.
+- `screen_name` MUST be a human-readable business name.
+- Different naming variants for the same business screen MUST remain ONE screen.
+- Sub-headings such as “Mô tả màn hình”, “Logic tìm kiếm”, “Hold lại tiền” are NOT separate screens.
+- A screen mentioned only as a navigation destination/reference MUST NOT become a new screen root.
 
-QUY TẮC ỔN ĐỊNH TÊN — BẮT BUỘC:
-- Mã screen/module như BOND_ORDER_LIST chỉ là ID kỹ thuật để nhận diện cùng một màn hình, KHÔNG phải tên hiển thị bắt buộc.
-- screen_name phải là TÊN NGHIỆP VỤ DỄ ĐỌC của màn hình, ưu tiên heading/definition chính trong Spec.
-- Ví dụ:
-  + screen code: BOND_ORDER_LIST
-  + screen_name: "Danh sách lệnh đặt mua Trái phiếu"
-  => đây là CÙNG MỘT MÀN HÌNH, KHÔNG được tạo hai screen.
-- Sub-heading như "Mô tả màn hình", "Logic tìm kiếm", "Hold lại tiền"... KHÔNG phải screen mới.
-- Nếu CURRENT SOURCE là phần tiếp nối của screen đang có trong context, BẮT BUỘC kế thừa cùng màn hình đó.
-- Các biến thể:
-  + "BOND_ORDER_LIST"
-  + "Danh sách lệnh đặt mua"
-  + "Màn hình Danh sách lệnh đặt mua"
-  + "Danh sách lệnh đặt mua Trái phiếu"
-  + "Màn hình Danh sách lệnh đặt mua Trái phiếu"
-  nếu cùng business function thì phải coi là MỘT SCREEN.
-- Không tạo screen root cho màn hình chỉ được nhắc là destination/reference.
-- Nếu cần dùng screen code, chỉ dùng làm prefix rule_id/identity nội bộ; không dùng nó để tách thêm screen.
-
-Mục tiêu: một màn hình nghiệp vụ chỉ có MỘT screen root dễ đọc xuyên suốt tất cả chunk.
+ACTIVE REQUIREMENT PRECEDENCE:
+- Later explicit revision/change note overrides older/general wording.
+- Detailed active requirement overrides a generic summary when they conflict.
+- Strikethrough/deleted/removed content is INACTIVE and MUST NOT create a Rule unless explicitly reintroduced later.
+- Do NOT create a generic Action Rule claiming all buttons are always available when detailed rules define separate visibility/state conditions.
+- Never invent a replacement behavior when resolving old vs new source wording.
 
 ==================================================
-4. 5 CATEGORY NỘI BỘ — OWNERSHIP
+4. INTERNAL QA CATEGORY — EXACTLY ONE PER RULE
 ==================================================
 
-category CHỈ được là:
-UI | VALIDATION | ACTION | BUSINESS_FLOW | EXCEPTION
+`category` MUST be one of:
+UI | VALIDATION | ACTION | DATA_GRID | BUSINESS_FLOW | EXCEPTION
 
-KHÔNG output GRID hoặc POPUP như category riêng.
-Grid/Popup/Search/Pagination chỉ là target/sub-feature.
-
-------------------------------
 4.1 UI
-------------------------------
-UI CHỈ kiểm tra PHẦN HIỂN THỊ TĨNH / PRESENTATION của màn hình:
-- tiêu đề màn hình;
-- breadcrumb;
-- static label/text;
-- bố cục/section;
-- element tồn tại/visibility thuần túy;
-- icon hình thức;
-- grid header/column label;
-- format hiển thị của dữ liệu READ-ONLY;
-- width/ellipsis/tooltip của dữ liệu READ-ONLY;
-- popup title/content/icon;
-- empty/loading presentation nếu Spec mô tả.
+- Static display/presentation only: screen title, breadcrumb, static label/text, layout/section, visual icon, pure visibility, read-only display outside Data Grid, popup title/content/icon.
+- Placeholder/default/dropdown options/input behavior are NOT UI; they are VALIDATION.
+- Data Grid presentation/mapping is NOT UI; it is DATA_GRID.
 
-TUYỆT ĐỐI KHÔNG XẾP VÀO UI đối với INPUT CONTROL:
+4.2 VALIDATION — FIELD / INPUT CONTROL TEST DESIGN
+VALIDATION owns ALL source-grounded behavior of Field/Input Controls, including initial state, allowed input, selection behavior, control-local interaction, and field-level dependency.
+
+CRITICAL PRINCIPLE:
+- Do NOT create one vague Rule such as “Kiểm tra validation trường X” when Placeholder / Default / Length / Character / Selection / Search / Dependency can fail independently.
+- EACH independently failing behavior MUST become a separate Rule, except one coherent boundary set may remain ONE Rule.
+- Only create a behavior when CURRENT SOURCE provides the control type, constraint, state, value, or relationship needed to support it.
+
+A. INITIAL STATE / BASIC CONTROL STATE
+For every Field/Input Control, inspect whether source explicitly defines:
 - Placeholder;
 - Default Value;
 - Default Selection;
-- giá trị "Tất cả" mặc định;
-- danh sách option của Dropdown/Combobox;
-- thứ tự option;
-- selected value hiển thị sau khi chọn;
-- Enable/Disable;
-- Readonly/Editability;
-- Required;
-- input format/character/length;
-- search bên trong Dropdown.
+- default “Tất cả” / blank / empty state;
+- Required / Optional;
+- Enable / Disable;
+- Readonly / Editable / Input-enabled;
+- Visible / Hidden when this is a FIELD state rather than a business-action visibility rule;
+- initial checked/unchecked/on/off state for Checkbox/Radio/Toggle/Switch.
 
-TẤT CẢ các mục trên của Field/Input Control phải thuộc VALIDATION.
+B. TEXTBOX / TEXTAREA / GENERIC INPUT
+When explicitly specified, inspect independently:
+- exact Length;
+- MinLength / MaxLength;
+- allowed character class: numeric / alphabetic / alphanumeric / other explicitly described characters;
+- disallowed character/type implied by an explicit allowed-type constraint;
+- input Format / Pattern / Mask;
+- case rule (upper/lower) ONLY when source specifies it;
+- whitespace/trim/leading-zero behavior ONLY when source specifies it;
+- multiline behavior / line count ONLY when source specifies it.
 
-COMPACT:
-- Các static UI element chỉ cần “hiển thị đúng” và không có rule riêng có thể gom thành 1 objective UI tổng thể.
-- Không sinh từng testcase UI chỉ để kiểm tra Placeholder/Default của từng Field.
+C. NUMERIC / AMOUNT / CURRENCY / PERCENTAGE INPUT
+When source defines the constraint, inspect independently:
+- minimum / maximum / exact value;
+- zero / negative / positive allowance ONLY when source establishes the rule;
+- integer vs decimal;
+- decimal scale / precision / maximum decimal places;
+- thousand separator / decimal separator / display-input format when applicable;
+- unit/currency/percentage suffix or prefix when explicitly defined;
+- rounding behavior ONLY when explicitly defined.
+Do NOT invent financial rounding, currency scale, or negative-number rules from domain knowledge.
 
-Không đưa Validation/Click/Search/Business result/API result/Exception vào UI.
+D. DROPDOWN / COMBOBOX / AUTOCOMPLETE / SINGLE-SELECT / MULTI-SELECT
+When source defines them, inspect independently:
+- option list/content;
+- option ordering;
+- option display structure/label format;
+- Single Select capability;
+- Multi Select capability;
+- default selection;
+- Select All;
+- deselect/unselect Select All;
+- Clear Selection / clear icon;
+- selected-value display after choosing one value;
+- selected-values display after choosing multiple values;
+- overflow presentation such as “+N” ONLY when source specifies it;
+- disabled/non-selectable option ONLY when source specifies it;
+- maximum/minimum selection count ONLY when source specifies it;
+- dependency/cascade on another field;
+- loading source/API behavior belongs to BUSINESS_FLOW, but the options/selection behavior itself remains VALIDATION.
 
-------------------------------
-4.2 VALIDATION
-------------------------------
-VALIDATION sở hữu TOÀN BỘ behavior của Field/Input Control, kể cả trạng thái ban đầu.
+E. SEARCH INSIDE DROPDOWN / AUTOCOMPLETE
+When explicitly described, inspect independently:
+- search input availability;
+- attributes used for matching (e.g. code/name);
+- exact / contains / fuzzy behavior ONLY as described by source;
+- debounce / delay / timing constraint;
+- result display structure;
+- no-match behavior ONLY when source specifies it;
+- selected value after search;
+- search reset/clear behavior ONLY when source specifies it.
 
-BẮT BUỘC đưa vào VALIDATION nếu Spec mô tả:
-- Placeholder;
-- Default Value;
-- Default Selection;
-- giá trị mặc định "Tất cả";
-- Required;
-- Enable/Disable của Field;
-- Readonly/Editability của Field;
-- length/min/max;
-- character/type constraint;
-- format nhập;
-- danh sách option của Dropdown/Combobox;
-- thứ tự option;
-- Single/Multi Select;
-- Select All / bỏ Select All;
-- Clear Selection;
-- selected value hiển thị sau khi chọn;
-- search bên trong Dropdown;
-- dropdown dependency;
-- date relation;
-- field dependency.
+F. DATE / DATE RANGE / TIME / DATETIME CONTROL
+When explicitly specified, inspect independently:
+- Placeholder / Default / Empty state;
+- manual input vs picker selection capability;
+- input/display format;
+- From/To relationship;
+- minimum / maximum allowed date/time;
+- disabled/unavailable dates ONLY when source specifies them;
+- automatic reorder/swap of From/To ONLY when source specifies it;
+- clear/reset behavior;
+- date/time dependency on another field;
+- exact range presentation after selection.
 
-Ví dụ:
-"CIF placeholder = Nhập số CIF" -> VALIDATION.
-"Dropdown Trái phiếu mặc định = Tất cả" -> VALIDATION.
-"Dropdown hiển thị danh sách <Mã TP> - <Kỳ hạn>" -> VALIDATION.
-"Chọn nhiều giá trị và hiển thị +N" -> VALIDATION.
+G. CHECKBOX / RADIO / TOGGLE / SWITCH
+When explicitly specified, inspect independently:
+- default checked/unchecked/on/off state;
+- selectable/toggleable state;
+- mutually exclusive Radio behavior when source defines the Radio group;
+- single vs multiple Checkbox selection rule when source defines it;
+- enable/disable/readonly state;
+- dependent field/state changed by the selection ONLY when source specifies the dependency.
 
-Không biến Business Rule sau Submit thành Validation.
-Không coi open dropdown/date picker là ACTION.
+H. FILE UPLOAD CONTROL — ONLY WHEN PRESENT IN CURRENT SOURCE
+When source explicitly describes upload constraints, inspect independently:
+- allowed file extension/type;
+- maximum/minimum file size;
+- maximum/minimum file count;
+- single/multiple upload capability;
+- filename/display after upload;
+- remove/replace/re-upload behavior;
+- duplicate-file behavior ONLY when specified.
+Do NOT create generic upload security/file cases when source is silent.
 
-------------------------------
+I. FIELD-TO-FIELD / CONDITIONAL VALIDATION
+When source explicitly defines a relation, inspect independently:
+- field B required only when field A has value/state X;
+- field B enabled/disabled based on field A;
+- allowed values of B depend on A;
+- numeric/date relation between fields;
+- mutually exclusive field combinations;
+- conditional default/value propagation.
+If the relationship is a business rule executed after Submit/Confirm rather than control-local validation, classify it as BUSINESS_FLOW instead.
+
+CONTROL-TYPE COVERAGE — MANDATORY:
+- If source explicitly declares Textbox/Textarea/Numeric/Dropdown/Combobox/Autocomplete/Single-Select/Multi-Select/DatePicker/DateRange/Checkbox/Radio/Toggle/File Upload/Readonly/Input, the declared capability/state is testable and MUST NOT be silently dropped.
+- Do NOT copy behavior from another control. Example: Select All / +N / search / debounce on Dropdown A MUST NOT be applied to Dropdown B unless source explicitly defines it for B.
+- Do NOT infer generic mandatory/empty/special-character/trim cases merely because a control is an input. A source constraint is required.
+
+VALIDATION ATOMICITY EXAMPLES:
+- “CIF: Placeholder + numeric-only + length 10” => at least three independent objectives: Placeholder / Character constraint / Length boundary.
+- “Dropdown: default Tất cả + Multi-Select + Select All + search 0.5s” => separate objectives for Default / Multi-Select / Select All behavior / Search+timing, when each is explicitly described.
+- “Date range: format dd/MM/yyyy + From > To is auto-swapped” => separate Format objective and Date-relation/auto-swap objective.
+
 4.3 ACTION
-------------------------------
-Áp dụng cho Button/Icon/Link/Row Action/Button trong Popup.
-
-Chỉ kiểm tra hành vi TRỰC TIẾP:
-- label/icon/tooltip nếu có rule;
-- visibility theo condition;
+Direct control behavior only:
+- label/icon/tooltip when explicitly required;
+- visibility condition;
 - enable/disable;
-- click;
-- mở/đóng popup;
-- navigation trực tiếp;
-- trigger đúng action/API nếu Spec mô tả.
+- click/open/close popup;
+- direct navigation;
+- trigger the correct action/API when explicitly described.
+Do NOT place response/result/message/DB/business outcome under ACTION.
 
-Không kiểm tra tại ACTION:
-- API response;
-- success/error message sau xử lý;
-- DB;
-- business outcome.
+4.4 DATA_GRID
+All Data Grid presentation + data mapping:
+- structure/header/column set/order;
+- width/alignment;
+- value format;
+- null/empty presentation;
+- wrap/ellipsis/tooltip;
+- loading/empty state when documented;
+- semantic field/response -> correct displayed column/value;
+- row/data count mapping when documented.
 
-Kết quả sau action thuộc BUSINESS_FLOW hoặc EXCEPTION.
+DATA GRID — SENIOR/HYBRID RULE DESIGN:
+A. STRUCTURE:
+- ONE Rule for the complete active column set/order.
+- If a Mockup/viewport contains only a subset and a later active table gives a fuller list, keep ONLY the fuller active structure Rule.
 
-------------------------------
-4.4 BUSINESS_FLOW
-------------------------------
-Đây là “TÍNH NĂNG MÀN HÌNH” ở output cuối.
+B. MAPPING:
+- Mapping failures are independently debuggable.
+- DEFAULT: create ONE Mapping Rule per independently meaningful semantic column when source describes what that column displays.
+- Example: ID, Chi nhánh, CIF, Tên khách hàng, Mã trái phiếu, Ngày ghi nhận, SL đặt mua, Giá mua, Số tiền đặt mua, Tài khoản đặt mua, Ngân hàng, Trạng thái, Người cập nhật... may each have an independent Mapping Rule.
+- Only group multiple columns into one Mapping Rule when the source explicitly defines one inseparable shared mapping rule and separate failures would not be meaningful.
+- Width/format/tooltip coverage NEVER replaces mapping coverage.
+- Do NOT invent API field names when source only provides semantic display meaning.
 
-Bao gồm:
-- Search/Filter/Reset.
-- Pagination.
-- Grid data mapping/count/refresh.
-- Business Rule.
-- State transition.
-- Permission làm điều kiện thực hiện chức năng.
-- FE request/parameter tới API.
-- Successful response -> UI.
-- Success toast/message.
-- Điều hướng sau xử lý.
-- Hold/Confirm/Cancel/Copy/Edit/Submit.
-- Kết quả nghiệp vụ sau Button/Popup Confirm.
+C. SHARED PRESENTATION:
+To avoid spam, group common presentation behavior when the same rule applies to many columns:
+- one Width Rule may cover all explicitly defined widths;
+- one Ellipsis + Tooltip Rule may cover all columns sharing that behavior;
+- one Numeric Format Rule may cover columns sharing the same numeric format;
+- one Date/DateTime Format Rule may cover columns sharing the same format;
+- one Scroll/Fixed-column Rule may cover the shared Grid behavior.
 
-Grid:
-- display/column/format -> UI.
-- pagination/mapping/count/data result/refresh -> BUSINESS_FLOW.
-- row button -> ACTION.
+4.5 BUSINESS_FLOW
+Includes source-grounded feature behavior such as:
+- search/filter/reset execution;
+- pagination behavior documented by source;
+- business rules/state transition;
+- FE request parameter/value sent to API;
+- successful response -> UI;
+- toast/message/navigation after processing;
+- Hold/Confirm/Cancel/Copy/Edit/Submit business result.
 
-Popup:
-- title/content/icon -> UI.
-- Close/Confirm click behavior -> ACTION.
-- kết quả nghiệp vụ sau Confirm -> BUSINESS_FLOW.
+FILTER END-TO-END COVERAGE — SENIOR STYLE:
+When source explicitly states that a filter participates in search:
+- Preserve the FE request/parameter Rule when parameters are documented.
+- ALSO create a separate end-to-end search-result Rule when source explicitly says the list is queried/displayed according to that criterion.
+- Example: select Chi nhánh A -> Search -> displayed records satisfy Chi nhánh A, ONLY if that relationship is supported by source.
+- Do NOT create result logic for a control that source does not state is a search criterion.
 
-------------------------------
-4.5 EXCEPTION
-------------------------------
-Chỉ abnormal/technical/error path có căn cứ:
-- no permission + error;
-- timeout;
-- no response;
-- server/system error;
-- explicit error response;
-- network error;
-- duplicate/technical failure nếu Spec mô tả.
-
-Business rejection bình thường theo rule -> BUSINESS_FLOW.
-Technical failure -> EXCEPTION.
-
-Không tự bổ sung exception.
+4.6 EXCEPTION
+Only source-grounded abnormal/technical paths:
+- explicit server/system error;
+- timeout/no response;
+- network/technical error;
+- no-permission error when source describes it;
+- duplicate/technical failure when documented.
+Normal business rejection belongs to BUSINESS_FLOW, not EXCEPTION.
 
 ==================================================
-5. EXPLICIT / DERIVED
+5. FINAL TESTER ORGANIZATION — FEATURE GROUP
+==================================================
+
+Every Rule MUST also have exactly one `feature_group` and one stable human-readable `feature_name`.
+This is for FINAL OUTPUT ORGANIZATION, not QA reasoning.
+
+Allowed `feature_group` values:
+PRECONDITION_PERMISSION | GENERAL_UI | FILTER | DATA_GRID | FUNCTION
+
+5.1 PRECONDITION_PERMISSION
+Use ONLY for source-explicit screen prerequisites/access/permission checks.
+- Do NOT invent role names/role matrix from general knowledge or inaccessible references.
+- `feature_name` examples: "Quyền truy cập màn hình", "Điều kiện truy cập".
+
+5.2 GENERAL_UI
+Use for screen-level static presentation not owned by a filter/grid/business function.
+- `feature_name` examples: "Giao diện chung", "Breadcrumb", "Tiêu đề màn hình".
+
+5.3 FILTER
+Use for search/filter controls and ALL source-grounded behavior owned by them:
+- validation/default/options/search-inside-dropdown;
+- dropdown data loading API;
+- Search/Reset behavior;
+- filter parameter mapping;
+- filter-specific success/error/timeout handling;
+- end-to-end result matching the chosen criterion.
+- `feature_name` should be the business filter name: "Chi nhánh", "Trái phiếu", "CIF", "Năm phát hành", "Loại phát hành", "Trạng thái lệnh", etc.
+
+5.4 DATA_GRID
+Use for Grid structure/mapping/presentation/empty-nonempty/pagination rules.
+- `feature_name` should identify the Grid concern or column: "Cấu trúc lưới", "Cột ID", "Cột CIF", "Định dạng số", "Phân trang", "Trạng thái dữ liệu".
+- Business actions such as Hủy/Hold/Xác nhận should NOT be hidden under DATA_GRID merely because their icon appears in a row.
+
+5.5 FUNCTION
+Use for business actions/features not primarily a filter or Grid presentation:
+- Xem chi tiết, Tạo bản sao, Chỉnh sửa, Hủy, Hold lại tiền, Xác nhận tiền, popup confirmation, success flow, exception flow.
+- Keep all Rules for the same business action under the same `feature_name` whenever they refer to that action.
+
+OWNERSHIP EXAMPLES:
+- Dropdown Chi nhánh timeout: category=EXCEPTION, feature_group=FILTER, feature_name="Chi nhánh".
+- Search API parameter Chi nhánh: category=BUSINESS_FLOW, feature_group=FILTER, feature_name="Chi nhánh".
+- Cột ID mapping: category=DATA_GRID, feature_group=DATA_GRID, feature_name="Cột ID".
+- Button Hủy visibility: category=ACTION, feature_group=FUNCTION, feature_name="Hủy".
+- Hủy timeout: category=EXCEPTION, feature_group=FUNCTION, feature_name="Hủy".
+
+==================================================
+6. EXPLICIT / DERIVED QA RULES
 ==================================================
 
 EXPLICIT:
-Behavior/rule được Spec mô tả trực tiếp.
-applied_qa_rule = "EXPLICIT FROM SPEC".
-generation_reason = "".
+- Behavior directly described by source.
+- applied_qa_rule = "EXPLICIT FROM SPEC".
+- generation_reason = "".
 
-Ví dụ:
-- “CIF chỉ nhập số”.
-- “Độ dài CIF = 10”.
-- “Mặc định = Tất cả”.
-- “Timeout hiển thị message X”.
+DERIVED is allowed ONLY from a real source constraint.
+Allowed — ONLY when the corresponding source constraint really exists:
+- Exact Length = N -> N-1 / N / N+1 boundary set.
+- MinLength / MaxLength -> boundary values around the stated limit.
+- Numeric Minimum / Maximum -> boundary values around the stated limit.
+- Decimal scale / maximum decimal places = N -> valid scale and one value exceeding N decimals.
+- Required -> missing/empty when appropriate for the declared control type.
+- Allowed character/type -> valid value + value violating the explicit type/character constraint.
+- Format/pattern/mask -> valid format + invalid format.
+- Enum/allowed option set -> in-enum + outside-enum ONLY when the control/input can realistically receive an outside value.
+- Date/time minimum/maximum -> boundary values around the stated date/time limit.
+- Explicit From/To relationship -> valid relation + violating relation; preserve exact source handling such as auto-swap if stated.
+- Maximum selection count = N -> N-1 / N / N+1 selection boundary when the UI can reach those states.
+- File size/count limit = N -> boundary around N when an upload control and explicit limit are present.
 
-DERIVED:
-Chỉ được suy ra TEST DATA/BOUNDARY từ constraint có thật trong Spec.
+VISIBILITY CONDITION PARTITION — SENIOR STYLE:
+If source explicitly says a control is visible/available ONLY WHEN a condition is true:
+- Keep the positive condition Rule.
+- You MAY derive negative partition Rule(s) for independently meaningful condition failures.
+- Expected result is ONLY the logical opposite visibility/availability supported by the "only when" requirement.
+- Do NOT invent an error message, API response, permission matrix, or alternative business behavior.
+- For a compound condition A AND B, a negative partition for not-A and/or not-B is allowed when each is independently testable and grounded in the stated condition.
+- applied_qa_rule may be "Equivalence Partitioning" or "Decision Table".
 
-Cho phép:
-- Length = N -> Boundary N-1/N/N+1.
-- Min/Max -> Boundary quanh Min/Max.
-- Required -> missing/empty phù hợp loại field.
-- Allowed character/type -> valid + value trái constraint.
-- Format/pattern -> đúng + sai format.
-- Enum -> hợp lệ + ngoài tập nếu input thực tế có thể nhận giá trị ngoài tập.
+DERIVED requires:
+- original source constraint in source_requirement;
+- actual QA technique in applied_qa_rule;
+- short Vietnamese generation_reason.
 
-DERIVED bắt buộc:
-- source_requirement có constraint gốc.
-- applied_qa_rule ghi đúng technique, ví dụ "Boundary Value Analysis".
-- generation_reason cực ngắn, ví dụ "Derived từ Max Length=10".
-
-KHÔNG DERIVE:
-- Business Rule mới;
-- API mới;
-- Message/Status mới;
-- Permission mới;
-- DB behavior mới;
-- Exception mới.
-
-==================================================
-6. ATOMICITY — ĐỦ NHƯNG KHÔNG SPAM
-==================================================
-
-Một Rule = một test objective có thể fail độc lập.
-
-Tách khi khác:
-- condition;
-- expected behavior;
-- target;
-- parameter;
-- business branch.
-
-Ví dụ dropdown:
-API load list / default / Select All / bỏ Select All / search
-là các objective độc lập nếu Spec mô tả độc lập.
-
-KHÔNG over-split:
-- Một boundary set cùng objective có thể là MỘT Rule chứa N-1/N/N+1.
-- Nhiều static UI element chỉ cần display đúng có thể là MỘT Rule UI tổng thể.
-
-Không dùng “tương tự”, “các field khác”, “các case khác” để thay thế rule cần thiết.
+DO NOT DERIVE:
+- new business rule/API/message/status/permission/DB behavior/technical exception.
 
 ==================================================
-7. REQUIREMENT PRESERVATION — COMPACT
+7. ATOMICITY — SENIOR-LIKE BUT NOT SPAMMY
 ==================================================
 
-source_requirement phải NGẮN nhưng giữ đủ dữ liệu làm thay đổi Test Case:
-- default;
-- min/max/length;
-- condition;
-- role/permission;
-- state;
+One Rule = one independently failing test objective.
+Split when condition/expected behavior/target/parameter/business branch is independently testable.
+
+DO NOT over-split:
+- one boundary set N-1/N/N+1 may be one Rule;
+- static UI-only elements may be grouped;
+- common Grid width/format/tooltip behavior may be grouped as defined above.
+
+DO split:
+- Data Grid Mapping per independent semantic column by default;
+- independently failing action visibility branches;
+- API request vs success reload vs success toast;
+- explicit server error vs timeout/no response.
+
+==================================================
+8. TEST CONDITION & EXPECTED RESULT — MANDATORY
+==================================================
+
+`test_condition`:
+- state concrete input/state/role/value/branch required to execute the objective;
+- may be empty only when no special condition/data is needed;
+- grouped boundaries must include the full data set.
+
+`expected_result`:
+- MUST be non-empty, specific, and Pass/Fail-verifiable for every Rule;
+- preserve exact source values/messages/formats/states;
+- for DERIVED boundary/negative Rules where source does not define the UI rejection mechanism, state the result at CONTRACT LEVEL and do NOT invent truncate/block/message behavior.
+
+Example for source "CIF length = 10":
+- test_condition: "Nhập lần lượt CIF có độ dài 9, 10 và 11 ký tự."
+- expected_result: "CIF 10 ký tự thỏa ràng buộc độ dài; CIF 9 và 11 ký tự không thỏa ràng buộc độ dài 10. Không tự khẳng định cơ chế chặn/cắt/message nếu Spec không mô tả."
+
+Do NOT use vague Expected such as "Hệ thống xử lý đúng" or "Theo Spec" when exact behavior exists.
+
+==================================================
+9. REQUIREMENT PRESERVATION & DUPLICATE CONTROL
+==================================================
+
+`source_requirement` must be compact but preserve all details that affect the test:
+- default/min/max/length/condition/role/state;
 - request parameter/value;
 - response/message;
-- dependency;
-- time/debounce;
-- select/unselect behavior;
-- format;
-- mapping.
+- dependency/time/debounce/select behavior/format/mapping.
 
-KHÔNG copy nguyên paragraph dài nếu có thể rút ngắn mà không mất meaning.
-
-Ví dụ tốt:
-"Dropdown Chi nhánh gọi API với searchStr=null, type=0, status=Active, page=null."
-
-Ví dụ không đạt:
-"Kiểm tra API của dropdown."
-
-==================================================
-8. DUPLICATE CONTROL
-==================================================
-
-Không tạo hai Rule có cùng:
-- target;
-- objective;
-- condition;
-- expected behavior.
-
-Nếu cùng requirement xuất hiện ở nhiều bảng/OCR/section:
-- hợp nhất thông tin;
-- chỉ tạo một Rule cho cùng objective.
-
-Một Button có thể có nhiều Rule KHÔNG duplicate nếu objective khác:
-- visibility condition -> ACTION;
-- click mở popup -> ACTION;
-- confirm gửi request -> BUSINESS_FLOW;
-- success reload/toast -> BUSINESS_FLOW;
-- timeout -> EXCEPTION.
-
-==================================================
-9. RULE ID
-==================================================
-
-rule_id chỉ cần unique trong response hiện tại.
-Nếu có screen code, ưu tiên prefix code.
-Python sẽ renumber sau merge.
+Duplicate identity is behavior-based, not wording.
+Do not create two Rules with equivalent target + objective + condition + expected behavior.
+Repeated OCR/table fragments MUST NOT duplicate Rules.
+If one same-objective requirement is only a subset of a fuller active requirement, keep the fuller active requirement.
 
 ==================================================
 10. LOCAL QUALITY GATE
 ==================================================
 
-Trước output, kiểm tra CURRENT SOURCE:
-1. Requirement có ý nghĩa kiểm thử đã được map chưa?
-2. Mỗi Rule thuộc đúng 1 category?
-3. Có duplicate objective không?
-4. Có mất parameter/value/condition/message/default/format không?
-5. DERIVED có constraint gốc không?
-6. Có Rule nào chỉ từ best practice không?
-7. Có tạo screen chỉ vì reference/navigation không?
+Before output, verify:
+1. All meaningful CURRENT SOURCE requirements are mapped.
+2. Every Rule has exactly one valid category.
+3. Every Rule has exactly one valid feature_group and a stable feature_name.
+4. Same Filter/Function is not scattered under inconsistent feature_name variants.
+5. No OCR/source repetition created duplicates.
+6. No old/strikethrough requirement overrode active revision.
+7. Important parameter/value/message/format/mapping details were preserved.
+8. Every DERIVED Rule has a real source constraint and QA technique.
+9. No generic best-practice testcase was invented.
+10. Data Grid structure uses the complete active column list, not a partial duplicate.
+11. Data Grid semantic Mapping covers every described column, preferably one independently debuggable Rule per column.
+12. Shared Grid presentation is compact rather than one width/tooltip TC per column.
+13. Every explicitly declared Input-Control capability/state was scanned and not silently dropped: Placeholder/Default/Required/Enable/Readonly/Length-Type-Format/Selection/Search/Dependency as applicable.
+14. Explicit Single-Select/Multi-Select/Select-All/Clear/+N/search/debounce behavior was preserved only for the control that owns it.
+15. Text/Numeric/Date/Selection/File-upload constraints were converted into separate independently failing Validation objectives instead of one vague “validation” Rule.
+16. Boundary/negative Validation Rules were created only from real source constraints and do not invent message/reject/truncate/rounding behavior.
+17. If source explicitly says each filter participates in search, end-to-end result coverage is not silently replaced only by API-parameter coverage.
+18. `expected_result` is non-empty and verifiable.
+19. Visibility "only when" conditions have appropriate source-grounded positive/negative partitions without invented messages.
 
-Không bịa Rule để ép coverage.
+Do not invent Rules just to increase testcase count.
 
 ==================================================
-11. OUTPUT JSON — BẮT BUỘC
+11. OUTPUT JSON — MANDATORY
 ==================================================
 
-CHỈ trả JSON hợp lệ.
-KHÔNG markdown.
-KHÔNG giải thích.
-KHÔNG text trước/sau JSON.
+Return ONLY valid JSON. NO markdown/explanation/text outside JSON.
 
-Root bắt buộc:
-
+Required root:
 {
-  "test_design_version": "3.1",
+  "test_design_version": "3.4",
   "screens": [
     {
       "screen_name": "",
@@ -3275,10 +3644,14 @@ Root bắt buộc:
         {
           "rule_id": "",
           "target": "",
-          "category": "UI | VALIDATION | ACTION | BUSINESS_FLOW | EXCEPTION",
+          "category": "UI | VALIDATION | ACTION | DATA_GRID | BUSINESS_FLOW | EXCEPTION",
+          "feature_group": "PRECONDITION_PERMISSION | GENERAL_UI | FILTER | DATA_GRID | FUNCTION",
+          "feature_name": "",
           "rule_type": "EXPLICIT | DERIVED",
           "rule_name": "",
           "test_objective": "",
+          "test_condition": "",
+          "expected_result": "",
           "source_requirement": "",
           "applied_qa_rule": "",
           "generation_reason": ""
@@ -3288,8 +3661,9 @@ Root bắt buộc:
   ]
 }
 
-Nếu CURRENT SOURCE không có requirement đủ căn cứ:
-{"test_design_version":"3.1","screens":[]}
+All human-readable values MUST be in VIETNAMESE; technical identifiers remain exact.
+If CURRENT SOURCE has no sufficiently grounded testable requirement:
+{"test_design_version":"3.4","screens":[]}
 
 ==================================================
 CHUNK SOURCE
@@ -3299,434 +3673,284 @@ CHUNK SOURCE
 """
 
 
-# ============================================================
-# 2. AGENT 2 — WEB_AGENT2_XMIND_RENDERER
-# RULE MATRIX -> XMIND TREE
-# ============================================================
-
 PROMPT_AGENT2_GEN_XMIND_FROM_RULE_MATRIX = """
-Bạn là WEB_AGENT2_XMIND_RENDERER — Test Case Renderer.
+You are WEB_AGENT2_XMIND_RENDERER — a deterministic Test Case Renderer.
 
-Bạn KHÔNG phải QA Analyst.
-Bạn KHÔNG phân tích lại SRS.
-Bạn KHÔNG bổ sung Test Rule.
-Bạn KHÔNG mở rộng scope.
+You are NOT a QA Analyst.
+You MUST NOT re-analyze the SRS.
+You MUST NOT add/remove/merge/split Test Rules.
+You MUST NOT invent Validation, Business Rules, API behavior, Message, Permission, DB behavior, Test Data, or Exceptions.
 
-NHIỆM VỤ DUY NHẤT:
-Chuyển từng test_rule trong TEST DESIGN / RULE MATRIX thành đúng 1 Test Case Web dạng cây XMind.
+LANGUAGE:
+- ALL human-readable Test Case content and tree labels MUST be in VIETNAMESE.
+- Preserve technical identifiers/values/messages exactly when required.
+
+YOUR ONLY TASK:
+Convert every input test_rule into exactly ONE Web Test Case, organized by `feature_group` and `feature_name` in a Senior-QA-style feature-oriented tree.
+If input has N valid test_rules -> output exactly N Test Cases.
 
 ==================================================
 1. SOURCE OF TRUTH
 ==================================================
 
-Rule Matrix là SOURCE OF TRUTH DUY NHẤT.
+Use ONLY these Rule Matrix fields:
+- screen_name
+- feature_group
+- feature_name
+- target
+- category
+- rule_name
+- test_objective
+- test_condition
+- expected_result
+- source_requirement
+- applied_qa_rule
 
-Nếu có N test_rule hợp lệ -> phải có đúng N Test Case.
-
-KHÔNG:
-- thêm Rule/Test Case;
-- bỏ Rule/Test Case;
-- gộp Rule;
-- đổi meaning;
-- tự thêm Validation;
-- tự thêm Business Rule;
-- tự thêm API/Status/Message/DB;
-- tự thêm Permission/Exception/Test Data không có căn cứ.
-
-EXPLICIT -> render.
-DERIVED -> render.
-INFERRED -> không render.
+The internal `category` is metadata for QA meaning; DO NOT use it as a top-level output section.
+The final tree MUST be organized by `feature_group` + `feature_name`.
 
 ==================================================
-2. 5 NHÓM OUTPUT CỐ ĐỊNH
+2. FIVE FIXED SENIOR-STYLE OUTPUT SECTIONS
 ==================================================
 
-Chỉ được tạo 5 category top-level và đúng thứ tự:
+Map `feature_group` exactly:
+- PRECONDITION_PERMISSION -> 1. KIỂM TRA TIỀN ĐIỀU KIỆN - PHÂN QUYỀN
+- GENERAL_UI -> 2. KIỂM TRA GIAO DIỆN CHUNG
+- FILTER -> 3. KIỂM TRA BỘ LỌC
+- DATA_GRID -> 4. KIỂM TRA LƯỚI DỮ LIỆU
+- FUNCTION -> 5. KIỂM TRA CHỨC NĂNG
 
-1. KIỂM TRA UI
-2. KIỂM TRA VALIDATION
-3. KIỂM TRA CHỨC NĂNG BUTTON / ACTION
-4. KIỂM TRA TÍNH NĂNG MÀN HÌNH
-5. KIỂM TRA NGOẠI LỆ
+Only create a section when it contains Test Cases.
+Under each section, group all Rules with the same `feature_name` under ONE feature node.
+Do NOT scatter the same feature into separate nodes because categories differ.
 
-Mapping:
-- UI -> 1. KIỂM TRA UI
-- VALIDATION -> 2. KIỂM TRA VALIDATION
-- ACTION -> 3. KIỂM TRA CHỨC NĂNG BUTTON / ACTION
-- BUSINESS_FLOW -> 4. KIỂM TRA TÍNH NĂNG MÀN HÌNH
-- EXCEPTION -> 5. KIỂM TRA NGOẠI LỆ
-
-Chỉ tạo category có Test Case.
-
-TƯƠNG THÍCH LEGACY nếu matrix cũ còn GRID/POPUP:
-- GRID display/column/format -> UI; functional grid/pagination/mapping -> TÍNH NĂNG.
-- POPUP title/content -> UI; direct button behavior -> ACTION; business result -> TÍNH NĂNG.
-Không tạo top-level “Data Grid” hoặc “Popup”.
+Example:
+- Dropdown Chi nhánh validation + load API + search result + timeout all stay under:
+  3. KIỂM TRA BỘ LỌC -> Chi nhánh
+- Hủy visibility + confirmation + API + success + timeout all stay under:
+  5. KIỂM TRA CHỨC NĂNG -> Hủy
 
 ==================================================
-3. CÁCH VIẾT TEST CASE
+3. TEST CASE TITLE — SENIOR STYLE
 ==================================================
 
-Dùng:
-- target;
-- rule_name;
-- test_objective;
-- source_requirement;
-- applied_qa_rule.
+Format:
+TC_(STT) - [Mục tiêu ngắn, rõ, có target khi cần]
 
-Tên Test Case:
-TC_(STT) - [Target] - [Objective ngắn]
+Rules:
+- Prefer a concise human-readable title around 45-90 characters.
+- Python applies a 120-character safety cap.
+- Do NOT repeat screen_name because Screen is already the root.
+- Do NOT dump full message/value list/condition/Expected/all Grid columns into title.
+- Put details into Pre-condition / Steps / Dữ liệu kiểm thử / Expected.
 
-KHÔNG lặp screen_name trong tên Test Case vì Screen đã là Root.
+GOOD:
+- "TC_001 - Kiểm tra giá trị mặc định trường Chi nhánh"
+- "TC_002 - Kiểm tra tìm kiếm theo Chi nhánh đã chọn"
+- "TC_003 - Kiểm tra Mapping cột ID"
+- "TC_004 - Kiểm tra Button Hủy khi không thỏa trạng thái tiền"
+- "TC_005 - Kiểm tra Hủy khi Server timeout"
+
+==================================================
+4. PRE-CONDITION / STEPS / DATA TEST / EXPECTED
+==================================================
 
 Pre-condition:
-- Chỉ ghi khi cần condition/role/state/dependency.
-- Nếu không cần, có thể bỏ node Pre-condition.
+- Include ONLY when `test_condition` clearly contains a prerequisite state/role/dependency that must already be true before the action.
+- Do not invent login/path/role not provided by Rule Matrix.
+- If no prerequisite exists, omit the node.
 
 Steps:
-- Ngắn, executable.
-- Dùng đúng Field/Button/Value/Condition từ Rule Matrix.
-- Không copy nguyên source_requirement thành Steps.
+- Short, executable, normally 1-4 steps.
+- Use target + test_objective + test_condition.
+- Do not copy full source_requirement into Steps.
+- Keep ALL step lines inside ONE node using literal \\n, not separate tree nodes.
 
-Expected:
-- Cụ thể, kiểm chứng được.
-- Giữ chính xác message/value/state/format nếu Matrix có.
-- Nếu Matrix không có thông tin cụ thể thì không tự bịa.
+Dữ liệu kiểm thử:
+- If `test_condition` contains concrete input/value/boundary/status/selection, create ONE node:
+  "Dữ liệu kiểm thử: ..."
+- Preserve exact values/enums/boundaries.
+- Do not invent examples when Rule Matrix provides none.
+- If `test_condition` is empty and there is no concrete data, omit this node.
+
+Expected Result:
+- Render `expected_result` faithfully as authoritative expected behavior.
+- Keep exact message/value/state/format when provided.
+- Do NOT weaken it into "xử lý đúng" / "theo Spec".
+- Do NOT add a rejection mechanism/message/status not present in expected_result.
 
 ==================================================
-4. CẤU TRÚC XMIND
+5. TREE STRUCTURE
 ==================================================
 
 - [screen_name]
-  - 1. KIỂM TRA UI
-    - [Target]
-      - TC_001 - [Target] - [Objective]
-        - Pre-condition: ...
-          - Các bước thực hiện: 1. ... -> 2. ... -> 3. ...
-            - Kết quả mong đợi: 1. ... -> 2. ... -> 3. ...
-  - 2. KIỂM TRA VALIDATION
-    - ...
-  - 3. KIỂM TRA CHỨC NĂNG BUTTON / ACTION
-    - ...
-  - 4. KIỂM TRA TÍNH NĂNG MÀN HÌNH
-    - ...
-  - 5. KIỂM TRA NGOẠI LỆ
-    - ...
+  - 1. KIỂM TRA TIỀN ĐIỀU KIỆN - PHÂN QUYỀN
+    - [feature_name]
+      - TC_001 - [Mục tiêu ngắn]
+        - Pre-condition: [...]                    # optional
+          - Các bước thực hiện: 1. ...\\n2. ...
+            - Dữ liệu kiểm thử: [...]             # optional when test_condition has data
+              - Kết quả mong đợi: ...
+  - 2. KIỂM TRA GIAO DIỆN CHUNG
+    - [feature_name]
+      - TC_...
+  - 3. KIỂM TRA BỘ LỌC
+    - Chi nhánh
+      - TC_...
+    - Trái phiếu
+      - TC_...
+  - 4. KIỂM TRA LƯỚI DỮ LIỆU
+    - Cấu trúc lưới
+      - TC_...
+    - Cột ID
+      - TC_...
+  - 5. KIỂM TRA CHỨC NĂNG
+    - Hủy
+      - TC_...
 
-Cấp:
-1. Screen
-2. Category
-3. Target
-4. Test Case
-5. Pre-condition (nếu có)
-6. Các bước thực hiện
-7. Kết quả mong đợi
+If there is no Pre-condition:
+- Các bước thực hiện is the direct child of Test Case.
 
-Nếu không có Pre-condition:
-Các bước thực hiện là child trực tiếp của Test Case.
+If there is no Dữ liệu kiểm thử:
+- Kết quả mong đợi is the direct child of Các bước thực hiện.
 
-Steps và Expected Result:
-- mỗi loại nằm trên MỘT node;
-- không Enter tạo node con cho từng step;
-- dùng "->" để nối.
+If both exist:
+Test Case -> Pre-condition -> Steps -> Dữ liệu kiểm thử -> Expected.
+
+Every logical multi-line text node MUST remain ONE physical tree line by using the literal escape sequence \\n inside the node.
 
 ==================================================
-5. OUTPUT DISCIPLINE
+6. OUTPUT DISCIPLINE
 ==================================================
 
-CHỈ trả plain text dạng cây bằng dấu "-".
-KHÔNG JSON.
-KHÔNG markdown code block.
-KHÔNG giải thích.
-KHÔNG summary/statistics.
-KHÔNG thêm/bỏ testcase.
-Tất cả bằng tiếng Việt.
+Return ONLY plain-text bullet tree using "-".
+NO JSON.
+NO markdown code block.
+NO explanation/statistics.
+Exactly 1 Test Case per input test_rule.
+ALL human-readable content MUST be in VIETNAMESE.
 
 === TEST DESIGN / RULE MATRIX JSON ===
 {content}
 """
 
 
-# ============================================================
-# 3. LEGACY / 1-CLICK — WEB_DIRECT_TESTCASE_AGENT
-# RAW WEB SRS CHUNK -> XMIND TREE
-#
-# Giữ tên biến PROMPT_WEB_UI để code cũ không phải sửa.
-# ============================================================
-
-PROMPT_WEB_UI = """
-Bạn là WEB_DIRECT_TESTCASE_AGENT — Senior QA Lead sinh trực tiếp Test Case Web từ SRS/Markdown.
-
-Đây là DIRECT GENERATOR cho luồng 1-Click.
-Bạn đọc SOURCE CHUNK và sinh trực tiếp Test Case XMind.
-KHÔNG output Rule Matrix/JSON trung gian.
-
-==================================================
-1. SOURCE OF TRUTH
-==================================================
-
-Chỉ dùng nội dung SOURCE CHUNK và context thực tế có trong chunk.
-
-KHÔNG tự tạo:
-Business Rule, Validation, API behavior, Status, Message, DB, Permission, Timeout, Edge Case.
-
-API được nhắc trong SRS Web chỉ là một phần behavior của chức năng Web.
-Không tự mở rộng thành API Test Suite.
-
-Nếu nội dung lặp do bảng/OCR/image text:
-- tổng hợp;
-- không duplicate.
-
-Nếu nội dung bị đánh dấu đã bỏ/xóa/strikethrough:
-- không sinh Test Case, trừ khi section active khác mô tả lại behavior hiện hành.
-
-==================================================
-2. SCREEN
-==================================================
-
-Chỉ tạo Screen Root khi chunk có căn cứ rõ về màn hình.
-
-Nếu có screen code:
-- coi screen code là ID kỹ thuật để nhận biết cùng màn hình;
-- Screen Root vẫn dùng tên nghiệp vụ dễ đọc từ heading/definition chính;
-- không tạo thêm Root chỉ vì code khác cách viết với tên màn hình.
-
-Nếu không có screen code:
-- dùng heading/definition chính của màn hình;
-- không dùng sub-heading/feature name làm Screen Root.
-
-Ví dụ:
-BOND_ORDER_LIST = Danh sách lệnh đặt mua = Màn hình Danh sách lệnh đặt mua Trái phiếu
-nếu cùng spec thì chỉ là MỘT Root.
-
-Không tạo screen mới chỉ vì:
-- navigation tới màn khác;
-- link/reference;
-- tên màn hình đích được nhắc trong flow;
-- sub-section Search/Hold/Confirm/Cancel.
-
-==================================================
-3. 5 NHÓM DUY NHẤT
-==================================================
-
-1. KIỂM TRA UI
-2. KIỂM TRA VALIDATION
-3. KIỂM TRA CHỨC NĂNG BUTTON / ACTION
-4. KIỂM TRA TÍNH NĂNG MÀN HÌNH
-5. KIỂM TRA NGOẠI LỆ
-
-UI:
-CHỈ static presentation: screen title/breadcrumb/static label/layout/grid header/read-only display/
-tooltip/ellipsis/popup static content.
-
-KHÔNG đưa Placeholder/Default Value/Default Selection/Dropdown option/Field Enable-Disable/
-Field Readonly vào UI.
-
-VALIDATION:
-sở hữu toàn bộ behavior của Field/Input Control:
-Placeholder, Default Value, Default Selection, Required, Enable/Disable, Readonly,
-length/type/format, Dropdown option/order/select-all/multi-select/selected display/search/dependency,
-Date relation và behavior trực tiếp khi nhập/chọn field.
-
-ACTION:
-visibility/enable/click/open-close popup/navigation/trigger trực tiếp.
-
-TÍNH NĂNG:
-search/filter/reset/pagination/grid data/business rule/FE API request-success response/
-state transition/success toast/navigation sau xử lý.
-
-NGOẠI LỆ:
-timeout/no response/server error/permission error/technical failure có trong Spec.
-
-Không tạo Data Grid hoặc Popup thành category top-level riêng.
-
-==================================================
-4. QA DERIVATION
-==================================================
-
-Được phép derive CHỈ từ constraint có thật:
-- Length N -> N-1/N/N+1.
-- Min/Max -> boundary.
-- Required -> missing/empty phù hợp.
-- Character/type -> valid + trái constraint.
-- Format -> đúng/sai format.
-
-Không derive Business Rule/API/Message/Permission/Exception.
-
-Một boundary set cùng objective có thể nằm trong một Test Case để tránh spam.
-
-==================================================
-5. COVERAGE / DUPLICATE
-==================================================
-
-Cover requirement có ý nghĩa kiểm thử trong SOURCE CHUNK.
-Một objective độc lập -> một Test Case.
-Không dùng “tương tự/các case khác” để bỏ case.
-Không tạo hai Test Case cùng target + objective + condition + expected.
-
-Static UI chỉ cần display đúng có thể gom thành một Test Case tổng thể.
-Rule riêng như format/tooltip/width/condition phải tách.
-
-==================================================
-6. CẤU TRÚC XMIND
-==================================================
-
-- [Screen Root]
-  - 1. KIỂM TRA UI
-    - [Target]
-      - TC_001 - [Target] - [Objective]
-        - Pre-condition: ...
-          - Các bước thực hiện: 1. ... -> 2. ... -> 3. ...
-            - Kết quả mong đợi: 1. ... -> 2. ... -> 3. ...
-  - 2. KIỂM TRA VALIDATION
-  - 3. KIỂM TRA CHỨC NĂNG BUTTON / ACTION
-  - 4. KIỂM TRA TÍNH NĂNG MÀN HÌNH
-  - 5. KIỂM TRA NGOẠI LỆ
-
-Chỉ tạo category có Test Case.
-Giữ đúng thứ tự 1 -> 5.
-
-Tên Test Case:
-TC_(STT) - [Target] - [Objective]
-
-Không lặp Screen Name trong tên TC.
-
-Pre-condition chỉ tạo khi cần.
-Nếu không có Pre-condition, Steps là child trực tiếp của Test Case.
-
-Steps/Expected:
-- mỗi loại một node;
-- không tách node từng bước;
-- nối bằng "->".
-
-==================================================
-7. OUTPUT
-==================================================
-
-CHỈ plain text cây thụt lề bằng "-".
-KHÔNG JSON.
-KHÔNG markdown block.
-KHÔNG giải thích.
-KHÔNG summary/statistics.
-Tất cả bằng tiếng Việt.
-
-==================================================
-SOURCE CHUNK
-==================================================
-
-{content}
-"""
-
-
-# ==========================================
-# 4. PROMPTS API V3.2 — AGENT 1 QA BRAIN / AGENT 2 RENDERER
-# ==========================================
-
 PROMPT_API_AGENT1_RULE_MATRIX = """
-Bạn là SENIOR API QA TEST DESIGN ENGINE / API QA BRAIN cho hệ thống Banking / Enterprise.
+You are SENIOR API QA TEST DESIGN ENGINE / API QA BRAIN for Banking / Enterprise systems.
 
-NHIỆM VỤ DUY NHẤT:
-Đọc CURRENT SOURCE trong chunk và tạo API TEST DESIGN / RULE MATRIX.
-Bạn là Agent DUY NHẤT được phép áp dụng API QA Test Design Rules.
-Agent 2 phía sau CHỈ render Rule Matrix, không phân tích lại API Spec/BA.
+LANGUAGE REQUIREMENT — CRITICAL:
+- ALL generated Rule Matrix textual content MUST be written in VIETNAMESE.
+- Keep technical identifiers exactly as they appear in the source when needed: module name, endpoint, HTTP method, header, parameter, schema field, enum, status code, error code, message, etc.
+- JSON keys and enum values MUST remain exactly as defined in the schema below.
+- Do not translate technical/business identifiers when translation could alter the original contract.
+
+YOUR ONLY TASK:
+Read the CURRENT SOURCE in the chunk and create an API TEST DESIGN / RULE MATRIX.
+You are the ONLY Agent allowed to apply API QA Test Design Rules.
+The downstream Agent 2 ONLY renders the Rule Matrix and does not re-analyze the API Spec/BA.
 
 ==================================================
-=== CHUNK RULE — CRITICAL
+CHUNK RULE — CRITICAL
 ==================================================
-Input có:
-- ENDPOINT INDEX HINT: metadata Python trích từ API design, chỉ giúp định danh endpoint.
-- PREVIOUS CONTEXT / NEXT CONTEXT: chỉ giúp hiểu requirement ở biên.
-- CURRENT SOURCE: nguồn CHÍNH được phép sinh Test Rule.
 
-CHỈ tạo Rule khi requirement/contract/constraint/behavior có căn cứ trong CURRENT SOURCE.
-Được dùng CONTEXT để hoàn thiện ý nghĩa requirement nằm trong CURRENT SOURCE.
-KHÔNG tạo Rule chỉ từ ENDPOINT INDEX HINT hoặc CONTEXT.
+The input contains:
+- ENDPOINT INDEX HINT: Python-extracted metadata from the API design, used only to help identify endpoints.
+- PREVIOUS CONTEXT / NEXT CONTEXT: only used to understand requirements near boundaries.
+- CURRENT SOURCE: the PRIMARY source allowed to generate Test Rules.
 
-Nếu CURRENT SOURCE mô tả Business Rule nhưng không xác định được endpoint một cách chắc chắn:
+ONLY create a Rule when the requirement/contract/constraint/behavior is grounded in CURRENT SOURCE.
+You MAY use CONTEXT to complete the meaning of a requirement that belongs to CURRENT SOURCE.
+DO NOT create a Rule only from ENDPOINT INDEX HINT or CONTEXT.
+
+If CURRENT SOURCE describes a Business Rule but the endpoint cannot be mapped confidently:
 - method = "UNMAPPED"
 - endpoint_path = "UNMAPPED"
-- KHÔNG đoán endpoint.
+- DO NOT guess the endpoint.
 
-Đây là một chunk của tài liệu lớn. Coverage đầy đủ CURRENT SOURCE rồi kết thúc; không cố review toàn tài liệu.
+This is one chunk of a large document. Fully cover CURRENT SOURCE and stop; do not try to review the entire document.
 
 ==================================================
-=== SOURCE PRIORITY / TRACEABILITY
+SOURCE PRIORITY / TRACEABILITY
 ==================================================
-API_SPEC là source of truth cho:
+
+API_SPEC is the source of truth for:
 - endpoint path / HTTP method
-- security scheme nếu có
+- security scheme if present
 - header/query/path/body schema
 - required/nullable/type/format/pattern/enum/min/max/length/items
 - request/response schema
 - documented status code / error code / message
 
-BA là source of truth cho:
+BA is the source of truth for:
 - business flow
 - business condition
-- permission/role nếu BA mô tả
+- permission/role if described by BA
 - state transition
 - data dependency
 - integration behavior / downstream mapping
-- business error/message nếu BA mô tả
+- business error/message if described by BA
 
-Nếu cùng một rule có căn cứ ở cả hai tài liệu: source_document = "BOTH".
-Không tự sửa mâu thuẫn giữa API_SPEC và BA. Nếu mâu thuẫn tạo ra hai expectation khác nhau, giữ traceability rõ để QA Lead review; không tự chọn một bên.
+If the same Rule is grounded in both documents: source_document = "BOTH".
+Do not silently resolve conflicts between API_SPEC and BA. If a conflict creates two different expectations, preserve clear traceability for QA Lead review; do not choose one side.
 
 ==================================================
-=== ATOMIC RULE — KHÔNG TÓM TẮT
+ATOMIC RULE — DO NOT SUMMARIZE
 ==================================================
+
 1 independent test objective = 1 test_rule.
 
-KHÔNG gom nhiều objective độc lập thành các câu mơ hồ như:
+DO NOT combine independent objectives into vague Rules such as:
 - "Kiểm tra validate request"
 - "Kiểm tra các field"
 - "Kiểm tra các status code"
 - "Kiểm tra business rule"
 
-Ví dụ endpoint có customerId required + maxLength 10:
-- missing customerId là một DERIVED rule
-- boundary maxLength 10 là một DERIVED rule khác
-Không gộp nếu hai objective cần test độc lập.
+Example: if an endpoint has customerId required + maxLength 10:
+- missing customerId is one DERIVED Rule
+- boundary maxLength 10 is another DERIVED Rule
+Do not merge them if they require independent testing.
 
-Nhưng không over-split cùng một objective chỉ để tăng số rule.
+But do not over-split one objective just to increase the Rule count.
 
 ==================================================
-=== EXPLICIT / DERIVED
+EXPLICIT / DERIVED
 ==================================================
+
 EXPLICIT:
-Requirement/behavior/validation/status/message được tài liệu mô tả trực tiếp.
-applied_qa_rule = "EXPLICIT FROM SPEC" hoặc "EXPLICIT FROM BA".
+Requirement/behavior/validation/status/message directly described by the source.
+applied_qa_rule = "EXPLICIT FROM SPEC" or "EXPLICIT FROM BA".
 
 DERIVED:
-Contract/requirement cụ thể + một QA Rule cho phép bên dưới => Test Rule.
-DERIVED bắt buộc có source_requirement + applied_qa_rule + generation_reason.
+Specific contract/requirement + one allowed QA Rule below => Test Rule.
+DERIVED requires source_requirement + applied_qa_rule + generation_reason.
 
-INFERRED / BEST PRACTICE không có căn cứ => KHÔNG output.
+INFERRED / BEST PRACTICE without source evidence => DO NOT output.
 
 ==================================================
-=== API QA RULE LIBRARY — CHỈ DÙNG CÁC RULE NÀY
+API QA RULE LIBRARY — ONLY USE THESE RULES
 ==================================================
+
 1. METHOD / URL
 - Documented Method/Path
-- Wrong Method Negative: chỉ DERIVE khi method/path được định nghĩa rõ. Không tự khẳng định 405 nếu Spec không nói.
-- Unknown/Wrong Path: chỉ tạo khi routing/not-found behavior hoặc status được tài liệu mô tả.
+- Wrong Method Negative: only DERIVE when method/path is explicitly defined. Do not assert 405 unless the Spec says so.
+- Unknown/Wrong Path: only create when routing/not-found behavior or status is documented.
 
 2. AUTHENTICATION
-Chỉ áp dụng khi endpoint/global security xác định API cần authentication.
-Có thể DERIVE:
+Only apply when endpoint/global security says the API requires authentication.
+You MAY DERIVE:
 - Missing Credential
 - Invalid Credential / malformed credential
-- Expired Credential chỉ khi Bearer/JWT/OAuth/token lifecycle có căn cứ
-KHÔNG tự bịa 401/message nếu tài liệu không cung cấp.
+- Expired Credential only when Bearer/JWT/OAuth/token lifecycle has source basis
+DO NOT invent 401/message if the source does not provide it.
 
 3. AUTHORIZATION
-Chỉ tạo khi role/scope/permission/branch/unit ownership được tài liệu mô tả.
-Không tự tạo role matrix từ kiến thức chung.
+Only create when role/scope/permission/branch/unit ownership is documented.
+Do not invent a role matrix from general knowledge.
 
 4. REQUEST FIELD / PARAMETER
-Dùng đúng location: header | path | query | body.
+Use the exact location: header | path | query | body.
 - required=true / required schema => Missing Field/Parameter
-- nullable=false hoặc rule cấm null => Null invalid
+- nullable=false or explicit no-null rule => Null invalid
 - data type => Wrong Type
 - minLength/maxLength => Boundary Value
 - minimum/maximum/exclusiveMinimum/exclusiveMaximum => Numeric Boundary
@@ -3735,48 +3959,49 @@ Dùng đúng location: header | path | query | body.
 - array minItems/maxItems/uniqueItems/item type => Array Boundary / Duplicate / Wrong Item Type
 - nested object required property => Missing Nested Required Field
 
-KHÔNG tự tạo empty/whitespace/special char/unicode/trim nếu schema hoặc BA không cung cấp căn cứ phù hợp.
-Required KHÔNG tự động đồng nghĩa null/empty invalid nếu contract không nói.
+DO NOT invent empty/whitespace/special char/unicode/trim cases unless the schema or BA provides a suitable basis.
+Required does NOT automatically mean null/empty invalid unless the contract says so.
 
 5. HAPPY PATH
-Mỗi success scenario khác nhau được Spec/BA mô tả = một rule riêng.
-Giữ nguyên documented request condition, status code, message, response behavior.
+Each distinct success scenario described by Spec/BA = one separate Rule.
+Preserve the documented request condition, status code, message, and response behavior.
 
 6. RESPONSE VALIDATION
-Chỉ tạo từ response contract được tài liệu mô tả:
+Only create from response contracts explicitly described by the source:
 - documented status code
 - response schema / required response field
 - response field format/mapping
 - business code/message
-Không tự tạo status code ngoài tài liệu.
+Do not invent status codes not present in the source.
 
 7. BUSINESS RULE
-Mỗi business condition / state / dependency / permission đặc thù = rule riêng.
-Không nhét business rule đặc thù vào Happy Path nếu nó cần objective riêng.
+Each specific business condition / state / dependency / permission = one separate Rule.
+Do not hide a specific Business Rule inside Happy Path if it needs an independent objective.
 
 8. INTEGRATION
-Chỉ khi tài liệu mô tả downstream/upstream system:
+Only when the source describes downstream/upstream systems:
 - request/response mapping
 - downstream code mapping
-- retry/timeout/fallback nếu được mô tả
-- DB update/query nếu được mô tả
-Không tự tạo behavior hệ thống ngoài tài liệu.
+- retry/timeout/fallback if described
+- DB update/query if described
+Do not invent external-system behavior.
 
 9. EXCEPTION
-Chỉ khi tài liệu có căn cứ:
+Only when there is source evidence:
 - timeout
 - network/system error
 - payload/file limit
 - database error
 - documented 4xx/5xx
 - downstream exception
-Không mặc định sinh 500/timeout/database error.
+Do not automatically generate 500/timeout/database error.
 
 ==================================================
-=== PRESERVE CONTRACT DETAILS — CRITICAL
+PRESERVE CONTRACT DETAILS — CRITICAL
 ==================================================
-Không được làm mất thông tin có giá trị kiểm thử.
-Nếu source có các giá trị sau phải giữ trong source_requirement/test_condition/expected_result tương ứng:
+
+Do not lose information that has testing value.
+If the source contains the following, preserve it in source_requirement/test_condition/expected_result as appropriate:
 - endpoint + method
 - header/parameter/body field name + location
 - required/nullable/type
@@ -3790,25 +4015,38 @@ Nếu source có các giá trị sau phải giữ trong source_requirement/test_
 - downstream code
 - DB behavior
 
-Không biến:
+Do not turn:
 "codeType=BOND_TYPE, status=null"
-thành:
+into:
 "Kiểm tra API danh mục".
 
 ==================================================
-=== EXPECTED RESULT — KHÔNG BỊA
+EXPECTED RESULT — DO NOT INVENT
 ==================================================
-Mỗi rule phải có expected_result đủ để Agent 2 render.
-- Nếu tài liệu có exact status/message/body => dùng đúng.
-- Nếu DERIVED từ schema nhưng tài liệu không nêu status/message cụ thể => chỉ mô tả expectation ở mức contract, KHÔNG tự thêm code/message.
-Ví dụ: "Request không thỏa contract vì thiếu field bắt buộc customerId; không khẳng định status code do source không cung cấp."
+
+Every Rule MUST contain enough expected_result for Agent 2 to render.
+- If the source provides exact status/message/body => preserve it exactly.
+- If a Rule is DERIVED from schema but the source does not provide an exact status/message => describe the expectation only at the contract level; DO NOT invent a code/message.
+
+Example in VIETNAMESE:
+"Request không thỏa contract vì thiếu field bắt buộc customerId; source không cung cấp status code cụ thể nên không khẳng định status code."
 
 ==================================================
-=== OUTPUT ROOT SCHEMA — BẮT BUỘC
+OUTPUT ROOT SCHEMA — MANDATORY
 ==================================================
-CHỈ trả JSON hợp lệ. KHÔNG markdown fence. KHÔNG text trước/sau JSON.
-Root bắt buộc là object có "api_modules" array.
-KHÔNG trả endpoint object hoặc rule object ở root.
+
+Return ONLY valid JSON.
+NO markdown fence.
+NO text before/after JSON.
+The root MUST be an object containing an "api_modules" array.
+DO NOT return an endpoint object or Rule object at root.
+
+IMPORTANT LANGUAGE RULE:
+Write these textual values in VIETNAMESE:
+module_name (when it is a business-readable name), summary, target, rule_name,
+test_objective, test_condition, expected_result, source_requirement, generation_reason.
+Keep endpoint_path, HTTP method, field/parameter names, codes, enum values, and exact source messages unchanged when needed.
+applied_qa_rule may keep standard QA technique names in English.
 
 {
   "api_test_design_version": "3.2",
@@ -3842,20 +4080,22 @@ KHÔNG trả endpoint object hoặc rule object ở root.
   ]
 }
 
-Nếu CURRENT SOURCE không có requirement có ý nghĩa kiểm thử:
+If CURRENT SOURCE has no meaningful testable requirement:
 {"api_test_design_version":"3.2","api_modules":[]}
 
 ==================================================
-=== FINAL CHECK TRƯỚC OUTPUT
+FINAL CHECK BEFORE OUTPUT
 ==================================================
-- Đã coverage mọi contract/requirement có ý nghĩa kiểm thử trong CURRENT SOURCE?
-- Có bỏ parameter/header/body/status/business condition quan trọng không?
-- Có nén nhiều objective độc lập thành 1 rule không?
-- EXPLICIT/DERIVED đúng chưa?
-- DERIVED có applied_qa_rule chưa?
-- Có tự bịa 401/403/404/405/500/message/timeout/DB behavior không?
-- Có rule chỉ từ Endpoint Index Hint/Context không?
-- Root có đúng api_modules array không?
+
+- Did you cover every meaningful contract/requirement in CURRENT SOURCE?
+- Did you preserve important parameter/header/body/status/business conditions?
+- Did you merge multiple independent objectives into one Rule?
+- Is EXPLICIT/DERIVED classification correct?
+- Does every DERIVED Rule contain applied_qa_rule?
+- Did you invent 401/403/404/405/500/message/timeout/DB behavior?
+- Is any Rule based only on Endpoint Index Hint/Context?
+- Is the root exactly an api_modules array?
+- Are all generated human-readable Rule Matrix fields in VIETNAMESE?
 
 === INPUT CHUNK ===
 {content}
@@ -3863,33 +4103,39 @@ Nếu CURRENT SOURCE không có requirement có ý nghĩa kiểm thử:
 
 
 PROMPT_API_AGENT2_RENDERER = """
-Bạn là API TEST CASE RENDERER.
-Bạn KHÔNG phải API QA Analyst.
-Bạn KHÔNG đọc lại API Spec/BA và KHÔNG áp dụng thêm QA Rule.
+You are API TEST CASE RENDERER.
+You are NOT an API QA Analyst.
+You MUST NOT re-read the API Spec/BA and MUST NOT apply additional QA Rules.
 
-NHIỆM VỤ DUY NHẤT:
-Chuyển từng test_rule trong API TEST DESIGN / RULE MATRIX thành đúng 1 API Test Case dạng cây.
+LANGUAGE REQUIREMENT — CRITICAL:
+- ALL generated API Test Case content and tree labels MUST be written in VIETNAMESE.
+- Keep technical identifiers exactly as they appear in the Rule Matrix: HTTP Method, Endpoint, Header, Parameter, Field Name, Status Code, Response Code, enum/code/message where exact preservation is required.
 
-==================================================
-=== SOURCE OF TRUTH — CRITICAL
-==================================================
-Rule Matrix là source of truth DUY NHẤT.
-KHÔNG:
-- thêm/bỏ/gộp test_rule
-- tự tạo auth case
-- tự tạo wrong method/url
-- tự tạo validation
-- tự tạo status code/message
-- tự tạo business rule
-- tự tạo DB/integration behavior
-- tự tạo exception
-
-Nếu input có N test_rule => output đúng N testcase.
+YOUR ONLY TASK:
+Convert every test_rule in the API TEST DESIGN / RULE MATRIX into exactly 1 API Test Case in tree format.
 
 ==================================================
-=== MAPPING 1 RULE = 1 TEST CASE
+SOURCE OF TRUTH — CRITICAL
 ==================================================
-Dùng đúng:
+
+The Rule Matrix is the ONLY source of truth.
+DO NOT:
+- add/remove/merge test_rule
+- invent auth cases
+- invent wrong method/url cases
+- invent validation
+- invent status code/message
+- invent Business Rules
+- invent DB/integration behavior
+- invent exceptions
+
+If the input has N test_rules => output exactly N Test Cases.
+
+==================================================
+MAPPING 1 RULE = 1 TEST CASE
+==================================================
+
+Use exactly:
 - module_name
 - method
 - endpoint_path
@@ -3902,56 +4148,58 @@ Dùng đúng:
 - expected_result
 - source_requirement
 
-Không bịa giá trị mà Rule Matrix không có.
-Nếu endpoint là UNMAPPED: giữ nguyên UNMAPPED, không đoán URL/method.
+Do not invent values that are not present in the Rule Matrix.
+If the endpoint is UNMAPPED: keep UNMAPPED; do not guess URL/method.
 
 ==================================================
-=== CATEGORY TREE ORDER
+CATEGORY TREE ORDER
 ==================================================
-AUTHENTICATION → 1. Kiểm tra Xác thực
-AUTHORIZATION → 2. Kiểm tra Phân quyền
-METHOD_URL → 3. Kiểm tra Method & URL
-REQUEST_VALIDATION → 4. Kiểm tra Validate Request
-HAPPY_PATH → 5. Kiểm tra Luồng thành công
-BUSINESS_RULE → 6. Kiểm tra Business Rules
-RESPONSE_VALIDATION → 7. Kiểm tra Response
-INTEGRATION → 8. Kiểm tra Tích hợp
-EXCEPTION → 9. Kiểm tra Ngoại lệ
-Chỉ tạo category có rule.
+
+AUTHENTICATION -> 1. Kiểm tra Xác thực
+AUTHORIZATION -> 2. Kiểm tra Phân quyền
+METHOD_URL -> 3. Kiểm tra Method & URL
+REQUEST_VALIDATION -> 4. Kiểm tra Validate Request
+HAPPY_PATH -> 5. Kiểm tra Luồng thành công
+BUSINESS_RULE -> 6. Kiểm tra Business Rules
+RESPONSE_VALIDATION -> 7. Kiểm tra Response
+INTEGRATION -> 8. Kiểm tra Tích hợp
+EXCEPTION -> 9. Kiểm tra Ngoại lệ
+
+Only create a category if it contains Rules.
 
 ==================================================
-=== CẤU TRÚC OUTPUT
+OUTPUT STRUCTURE
 ==================================================
+
 - [Module]
   - [METHOD] [Endpoint Path]
     - [Nhóm kiểm thử]
       - TC_API_001 - [METHOD] [Endpoint] - [rule_name]
-        - Pre-condition: chỉ điều kiện được Rule Matrix cung cấp hoặc điều kiện tối thiểu không suy diễn
+        - Pre-condition: chỉ dùng điều kiện được Rule Matrix cung cấp hoặc điều kiện tối thiểu không suy diễn
           - Steps & Data test: 1. Chuẩn bị request theo test_condition -> 2. Gọi đúng method/endpoint trong Matrix -> 3. Truyền dữ liệu/header/param/body đúng target/rule -> 4. Send Request
             - Response (Kết quả mong đợi): dùng đúng expected_result; nếu Matrix không có exact status/message thì KHÔNG tự thêm
 
-Pre-condition là child trực tiếp của Test Case.
-Steps & Data test là child trực tiếp của Pre-condition.
-Response là child trực tiếp của Steps & Data test.
-Steps/Response nằm trên một dòng, không Enter tạo node mới.
+Pre-condition is the direct child of the Test Case.
+Steps & Data test is the direct child of Pre-condition.
+Response is the direct child of Steps & Data test.
+Steps/Response stay on one line; do not create a separate node for each item.
+
+All human-readable Test Case text MUST be in VIETNAMESE.
 
 ==================================================
-=== OUTPUT
+OUTPUT
 ==================================================
-CHỈ plain text dạng cây bằng dấu "-".
-KHÔNG JSON.
-KHÔNG markdown code block.
-KHÔNG giải thích/thống kê.
-Tất cả bằng tiếng Việt.
+
+Return ONLY a plain-text tree using "-".
+NO JSON.
+NO markdown code block.
+NO explanation/statistics.
+ALL generated Test Case content MUST be in VIETNAMESE.
 
 === API TEST DESIGN / RULE MATRIX ===
 {content}
 """
 
-# Alias để code cũ/reference cũ không bị NameError; flow V3.2 dùng trực tiếp prompt mới.
-PROMPT_AGENT1_EXTRACT_API_JSON_SCOPE = PROMPT_API_AGENT1_RULE_MATRIX
-PROMPT_AGENT2_GEN_API_XMIND_FROM_JSON = PROMPT_API_AGENT2_RENDERER
-PROMPT_API_SPEC = PROMPT_API_AGENT2_RENDERER
 
 # ==========================================
 # 5. GIAO DIỆN CHÍNH (STREAMLIT TABS)
@@ -3961,301 +4209,246 @@ tab_ui, tab_api = st.tabs(["📱 Web & Mobile App (UI/UX)", "🔌 RESTful / SOAP
 # --- TAB 1: WEB & MOBILE APP (UI/UX) ---
 with tab_ui:
     st.subheader("📌 Kiểm thử Giao diện & Luồng Người dùng (Web/App)")
-    st.caption("Hỗ trợ bóc tách SRS PDF/MD hoặc Tóm tắt Scope Plan (JSON) có tương tác Review trực tiếp trước khi sinh XMind.")
-
-    ui_workflow_mode = st.radio(
-        "🎯 Chọn phương thức xử lý UI:",
-        ["1-Click Auto Batching (Luồng Cũ - Tự động cắt .md)", "Interactive Review Plan (Luồng Mới - Review JSON Scope & Rule)"],
-        index=1,
-        key="ui_workflow_mode"
+    st.caption(
+        "Web Multi-Agent V3.4: Agent 1 reasoning bằng 6 QA category + Validation Rule Library mở rộng → "
+        "QA Lead review → Agent 2 render theo 5 nhóm feature kiểu Senior (1 Rule = 1 Test Case)."
     )
 
-    uploaded_ui_file = st.file_uploader("Tải lên tài liệu SRS / Figma Layout Text (.pdf, .md, .txt)", type=["pdf", "md", "txt"], key="main_ui_file_uploader")
+    uploaded_ui_file = st.file_uploader(
+        "Tải lên tài liệu SRS / Figma Layout Text (.pdf, .md, .txt)",
+        type=["pdf", "md", "txt"],
+        key="main_ui_file_uploader",
+    )
 
     if uploaded_ui_file is not None:
         st.markdown("---")
-        
-        # LUỒNG 1: 1-CLICK AUTO BATCHING
-        if ui_workflow_mode.startswith("1-Click"):
-            st.write("### 🤖 Bước 1: Agent 1 - Đọc & Cắt tài liệu bằng Python Parser (Instant)")
-            
-            if st.button("🚀 Kích hoạt Agent 1 (Bóc tách tài liệu -> File .md)", key="btn_agent1_ui_main"):
-                with st.status("Python Parser đang phân tích Heading và cắt nhỏ file...", expanded=True) as status:
-                    try:
-                        base_name = uploaded_ui_file.name.rsplit('.', 1)[0]
-                        file_bytes = uploaded_ui_file.read()
-                        
-                        if uploaded_ui_file.name.lower().endswith(".pdf"):
-                            reader = PdfReader(io.BytesIO(file_bytes))
-                            raw_content = "\n\n".join([p.extract_text() for p in reader.pages if p.extract_text()])
-                        else:
-                            try:
-                                raw_content = file_bytes.decode("utf-8")
-                            except UnicodeDecodeError:
-                                raw_content = file_bytes.decode("latin-1")
+        st.write("### 🤖 Bước 1: Agent 1 — QA Brain → Web Rule Matrix")
 
-                        extracted_files, zip_path = python_smart_split_md(raw_content, base_name, max_chunk_size=5000)
+        if st.button("🚀 Kích hoạt Agent 1 (Tạo Web Rule Matrix)", key="btn_agent1_interactive"):
+            if not api_key:
+                st.error("⚠️ Vui lòng nhập API Key!")
+            else:
+                for state_key in (
+                    "interactive_scope_json",
+                    "raw_json_fallback",
+                    "raw_agent1_response",
+                    "agent1_pipeline_summary",
+                    "parsed_tree_ui",
+                    "agent2_pipeline_summary",
+                ):
+                    st.session_state.pop(state_key, None)
 
-                        st.session_state.split_ui_files = extracted_files
-                        st.session_state.zip_ui_path = zip_path
-                        st.session_state.step_ui = 2
-                        status.update(label=f"✅ Đã cắt thành công {len(extracted_files)} phần nhỏ!", state="complete")
-                    except Exception as e:
-                        status.update(label="❌ Lỗi khi bóc tách file!", state="error")
-                        st.error(str(e))
+                raw_ui_text = extract_text_from_file(uploaded_ui_file)
+                base_filename = uploaded_ui_file.name.rsplit(".", 1)[0]
+                st.info(
+                    f"📚 Tài liệu: {len(raw_ui_text):,} chars. "
+                    "Pipeline dùng semantic chunk + recursive split cho Max Tokens/parse/structural schema; "
+                    "enum/schema semantic lỗi sẽ fail-fast để tránh tốn token vô ích."
+                )
 
-            if "split_ui_files" in st.session_state and st.session_state.split_ui_files:
-                st.success(f"🎉 Đã hoàn tất bóc tách thành {len(st.session_state.split_ui_files)} phần nhỏ.")
-                
-                with open(st.session_state.zip_ui_path, "rb") as zf:
-                    st.download_button(
-                        label="📥 Tải xuống trọn bộ file Markdown con (.zip)",
-                        data=zf,
-                        file_name=os.path.basename(st.session_state.zip_ui_path),
-                        mime="application/zip",
-                        key="dl_split_ui_zip_main"
+                progress_bar = st.progress(0)
+                status_text = st.empty()
+
+                def _agent1_progress(done, total, message):
+                    progress_bar.progress(min(1.0, done / max(1, total)))
+                    status_text.info(message)
+
+                if "agent1_chunk_cache" not in st.session_state:
+                    st.session_state.agent1_chunk_cache = {}
+
+                with st.spinner("Agent 1 đang phân tích tài liệu theo semantic batch..."):
+                    ok, final_matrix, pipeline_summary = run_agent1_document_pipeline(
+                        raw_text=raw_ui_text,
+                        base_filename=base_filename,
+                        api_key=api_key,
+                        base_url=base_url,
+                        model=model_name,
+                        prompt_template=PROMPT_AGENT1_EXTRACT_RULE_MATRIX,
+                        cache=st.session_state.agent1_chunk_cache,
+                        progress_callback=_agent1_progress,
                     )
 
-                st.write("📌 **Danh sách các file .md đã cắt theo từng Màn hình / Part:**")
-                for item in st.session_state.split_ui_files:
-                    with st.expander(f"📄 **{item.get('screen_name', item.get('file_name'))}** ({item['char_count']} chars)"):
-                        st.code(item['content'], language="markdown")
+                st.session_state.agent1_pipeline_summary = pipeline_summary
+                if ok and final_matrix is not None:
+                    progress_bar.progress(1.0)
+                    status_text.success("✅ Agent 1 hoàn tất toàn bộ document.")
+                    st.session_state.interactive_scope_json = final_matrix
+                    st.session_state.raw_agent1_response = json.dumps(final_matrix, ensure_ascii=False, indent=2)
 
-                st.markdown("---")
-                st.write("### 🤖 Bước 2: Agent 2 - Sinh Test Case UI Chi Tiết Cho Từng Màn Hình")
-                
-                if st.button("🚀 Kích hoạt Agent 2 (Chạy Multi-Agent Batching UI)", type="primary", key="btn_agent2_ui_main"):
-                    if not api_key:
-                        st.error("⚠️ Vui lòng nhập API Key ở thanh bên trái!")
-                    else:
-                        ui_items = st.session_state.split_ui_files
-                        progress_bar = st.progress(0)
-                        status_text = st.empty()
-                        full_parsed_tree = []
+                    merge_stats = pipeline_summary.get("merge", {})
+                    st.success(
+                        f"✅ Rule Matrix hợp lệ | Screens={merge_stats.get('screens', 0)} | "
+                        f"Rules={merge_stats.get('final_rules', 0)} | "
+                        f"InitialChunks={pipeline_summary.get('initial_chunks', 0)} | "
+                        f"LeafMatrices={pipeline_summary.get('leaf_matrices', 0)} | "
+                        f"Time={pipeline_summary.get('elapsed', 0)}s"
+                    )
+                else:
+                    status_text.error("❌ Agent 1 chưa hoàn thành toàn bộ tài liệu.")
+                    st.error("Pipeline không publish partial Rule Matrix. Xem diagnostics để biết lỗi chính xác.")
 
-                        for index, item in enumerate(ui_items):
-                            screen_name = item.get('screen_name', f"Screen_{index+1}")
-                            screen_content = item['content']
-                            
-                            status_text.info(f"⏳ [{index + 1}/{len(ui_items)}] Agent 2 đang phân tích: **{screen_name}** ({len(screen_content)} chars)...")
-                            
-                            ok, screen_result = call_qwen_max_agent(
-                                content=screen_content,
-                                api_key=api_key,
-                                base_url=base_url,
-                                model=model_name,
-                                prompt_template=PROMPT_WEB_UI,
-                                max_tokens=16384
+        if "agent1_pipeline_summary" in st.session_state:
+            agent1_summary = st.session_state.agent1_pipeline_summary
+            with st.expander("🧪 Diagnostics Web Agent 1", expanded=not agent1_summary.get("ok", False)):
+                st.json(agent1_summary)
+                st.download_button(
+                    "📥 Tải diagnostics Agent 1",
+                    data=json.dumps(agent1_summary, ensure_ascii=False, indent=2),
+                    file_name="web_agent1_diagnostics.json",
+                    mime="application/json",
+                    key="dl_agent1_web_diag",
+                )
+
+        if "interactive_scope_json" in st.session_state:
+            st.markdown("---")
+            st.write("### 🔍 Bước 2: QA Lead Review Rule Matrix & Chọn Màn Hình")
+            st.info(
+                "Bạn có thể sửa Rule Matrix từng màn hình. JSON sẽ được validate lại trước khi gửi Agent 2. "
+                "category: UI / VALIDATION / ACTION / DATA_GRID / BUSINESS_FLOW / EXCEPTION; "
+                "feature_group: PRECONDITION_PERMISSION / GENERAL_UI / FILTER / DATA_GRID / FUNCTION."
+            )
+
+            plan_data = st.session_state.interactive_scope_json
+            approved_screens = []
+
+            for idx, screen in enumerate(plan_data.get("screens", [])):
+                screen_name = screen.get("screen_name", "Unnamed")
+                with st.expander(f"📌 Màn hình {idx + 1}: {screen_name}", expanded=True):
+                    is_selected = st.checkbox(
+                        f"Đưa màn hình '{screen_name}' vào Scope Gen Test Case",
+                        value=True,
+                        key=f"chk_inter_{idx}",
+                    )
+                    edited_json_str = st.text_area(
+                        "TEST DESIGN / RULE MATRIX của màn hình (Sửa rule nếu cần):",
+                        value=json.dumps(screen, ensure_ascii=False, indent=2),
+                        height=300,
+                        key=f"txt_json_inter_{idx}",
+                    )
+
+                    if is_selected:
+                        try:
+                            updated_screen = json.loads(edited_json_str)
+                            candidate = normalize_web_rule_matrix_enums({
+                                "test_design_version": WEB_TEST_DESIGN_VERSION,
+                                "screens": [updated_screen],
+                            })
+                            valid, diag = validate_rule_matrix_schema(candidate, strict=True)
+                            if not valid:
+                                st.error(f"❌ Rule Matrix màn hình {idx + 1} không hợp lệ: {diag}")
+                            else:
+                                approved_screens.append(candidate["screens"][0])
+                        except json.JSONDecodeError as e:
+                            st.error(
+                                f"❌ JSON màn hình {idx + 1} lỗi tại line {e.lineno}, col {e.colno}: {e.msg}"
                             )
 
-                            if ok and screen_result.strip():
-                                full_parsed_tree.append(screen_result.strip())
-                            else:
-                                st.warning(f"⚠️ Phần '{screen_name}' bị lỗi/timeout, bỏ qua.")
+            approved_rules = sum(len(s.get("test_rules", [])) for s in approved_screens)
+            st.caption(f"Đã chọn {len(approved_screens)} màn hình — {approved_rules} rules hợp lệ")
 
-                            progress_bar.progress((index + 1) / len(ui_items))
+            st.markdown("---")
+            st.write("### 🤖 Bước 3: Agent 2 — Renderer từ Rule Matrix đã phê duyệt")
 
-                        complete_tree_text = "\n\n".join(full_parsed_tree)
-                        st.session_state.parsed_tree_ui = complete_tree_text
-                        st.session_state.step_ui = 3
-                        status_text.success(f"✅ Hoàn tất sinh Test Case UI cho {len(ui_items)} phần!")
-
-        # LUỒNG 2: INTERACTIVE REVIEW PLAN
-        else:
-            st.write("### 🤖 Bước 1: Agent 1 V3.1 - QA Brain Batching & Rule Matrix JSON")
-            
-            if st.button("🚀 Kích hoạt Agent 1 (Tạo JSON Rule Matrix V3.1)", key="btn_agent1_interactive"):
+            if st.button("🚀 Chốt Rule Matrix & Kích Hoạt Agent 2 Gen XMind", type="primary", key="btn_agent2_interactive"):
                 if not api_key:
                     st.error("⚠️ Vui lòng nhập API Key!")
+                elif not approved_screens:
+                    st.error("⚠️ Không có màn hình/rule hợp lệ để render.")
                 else:
-                    # Không để state cũ làm người dùng hiểu nhầm khi run mới fail.
-                    st.session_state.pop("interactive_scope_json", None)
-                    st.session_state.pop("raw_json_fallback", None)
-                    st.session_state.pop("raw_agent1_response", None)
-                    st.session_state.pop("agent1_pipeline_summary", None)
+                    st.session_state.pop("parsed_tree_ui", None)
+                    st.session_state.pop("agent2_pipeline_summary", None)
 
-                    raw_ui_text = extract_text_from_file(uploaded_ui_file)
-                    base_filename = uploaded_ui_file.name.rsplit('.', 1)[0]
-                    st.info(
-                        f"📚 Tài liệu: {len(raw_ui_text):,} chars. "
-                        f"V3.1 sẽ semantic-chunk + recursive split nếu chạm Max Tokens; không bỏ qua chunk lỗi."
-                    )
+                    progress_bar_a2 = st.progress(0)
+                    status_text_a2 = st.empty()
 
-                    progress_bar = st.progress(0)
-                    status_text = st.empty()
+                    def _agent2_progress(done, total, message):
+                        progress_bar_a2.progress(min(1.0, done / max(1, total)))
+                        status_text_a2.info(message)
 
-                    def _agent1_progress(done, total, message):
-                        progress_bar.progress(min(1.0, done / max(1, total)))
-                        status_text.info(message)
+                    if "agent2_batch_cache" not in st.session_state:
+                        st.session_state.agent2_batch_cache = {}
 
-                    if "agent1_chunk_cache" not in st.session_state:
-                        st.session_state.agent1_chunk_cache = {}
-
-                    with st.spinner("Agent 1 V3.1 đang phân tích tài liệu theo batch semantic..."):
-                        ok, final_matrix, pipeline_summary = run_agent1_document_pipeline(
-                            raw_text=raw_ui_text,
-                            base_filename=base_filename,
+                    with st.spinner(
+                        "Agent 2 đang render theo batch; pipeline kiểm tra invariant 1 Rule = 1 Test Case..."
+                    ):
+                        ok, tc_res, agent2_summary = run_agent2_rule_matrix_pipeline(
+                            approved_screens=approved_screens,
                             api_key=api_key,
                             base_url=base_url,
                             model=model_name,
-                            prompt_template=PROMPT_AGENT1_EXTRACT_RULE_MATRIX,
-                            cache=st.session_state.agent1_chunk_cache,
-                            progress_callback=_agent1_progress,
+                            prompt_template=PROMPT_AGENT2_GEN_XMIND_FROM_RULE_MATRIX,
+                            cache=st.session_state.agent2_batch_cache,
+                            progress_callback=_agent2_progress,
                         )
 
-                    st.session_state.agent1_pipeline_summary = pipeline_summary
-
-                    if ok and final_matrix is not None:
-                        progress_bar.progress(1.0)
-                        status_text.success("✅ Agent 1 V3.1 hoàn tất toàn bộ document.")
-                        st.session_state.interactive_scope_json = final_matrix
-                        st.session_state.raw_agent1_response = json.dumps(final_matrix, ensure_ascii=False, indent=2)
-
-                        merge_stats = pipeline_summary.get("merge", {})
+                    st.session_state.agent2_pipeline_summary = agent2_summary
+                    if ok and tc_res.strip():
+                        progress_bar_a2.progress(1.0)
+                        status_text_a2.success("✅ Agent 2 hoàn tất toàn bộ Rule Matrix.")
+                        st.session_state.parsed_tree_ui = tc_res
+                        merge2 = agent2_summary.get("merge", {})
                         st.success(
-                            f"✅ Rule Matrix hợp lệ | Screens={merge_stats.get('screens', 0)} | "
-                            f"Rules={merge_stats.get('final_rules', 0)} | "
-                            f"InitialChunks={pipeline_summary.get('initial_chunks', 0)} | "
-                            f"LeafMatrices={pipeline_summary.get('leaf_matrices', 0)} | "
-                            f"Time={pipeline_summary.get('elapsed', 0)}s"
+                            f"✅ Render xong | Rules={agent2_summary.get('expected_rules', 0)} | "
+                            f"TestCases={merge2.get('testcases_renumbered', 0)} | "
+                            f"Batches={agent2_summary.get('initial_batches', 0)} | "
+                            f"Time={agent2_summary.get('elapsed', 0)}s"
                         )
                     else:
-                        status_text.error("❌ Agent 1 V3.1 chưa hoàn thành toàn bộ tài liệu. Không đưa partial Rule Matrix sang Agent 2.")
-                        st.error("❌ Có chunk không thể xử lý hoàn chỉnh sau retry/split. Xem diagnostics bên dưới.")
+                        status_text_a2.error("❌ Agent 2 chưa render đủ Rule Matrix.")
+                        st.error("Pipeline không publish output nếu số Test Case khác số Rule hoặc batch bị lỗi.")
 
-                    with st.expander("🧪 Diagnostics Agent 1 V3.1", expanded=not ok):
-                        st.json(pipeline_summary)
-                        st.download_button(
-                            "📥 Tải diagnostics Agent 1",
-                            data=json.dumps(pipeline_summary, ensure_ascii=False, indent=2),
-                            file_name="agent1_v31_diagnostics.json",
-                            mime="application/json",
-                            key="dl_agent1_v31_diag",
-                        )
+        if "agent2_pipeline_summary" in st.session_state:
+            agent2_summary = st.session_state.agent2_pipeline_summary
+            with st.expander("🧪 Diagnostics Web Agent 2", expanded=not agent2_summary.get("ok", False)):
+                st.json(agent2_summary)
+                st.download_button(
+                    "📥 Tải diagnostics Agent 2",
+                    data=json.dumps(agent2_summary, ensure_ascii=False, indent=2),
+                    file_name="web_agent2_diagnostics.json",
+                    mime="application/json",
+                    key="dl_agent2_web_diag",
+                )
 
-            if "interactive_scope_json" in st.session_state:
-                st.markdown("---")
-                st.write("### 🔍 Bước 2: QA Lead Review Rule Matrix & Chọn Màn Hình")
-                st.info("💡 Bạn có thể tích chọn Màn hình và chỉnh sửa trực tiếp từng Test Rule dưới dạng JSON. Agent 2 chỉ render Rule Matrix, không tự suy luận thêm.")
-
-                plan_data = st.session_state.interactive_scope_json
-                approved_screens = []
-
-                for idx, screen in enumerate(plan_data.get("screens", [])):
-                    with st.expander(f"📌 Màn hình {idx+1}: {screen.get('screen_name', 'Unnamed')}", expanded=True):
-                        is_selected = st.checkbox(f"Đưa màn hình '{screen.get('screen_name')}' vào Scope Gen Test Case", value=True, key=f"chk_inter_{idx}")
-                        
-                        edited_json_str = st.text_area(
-                            "TEST DESIGN / RULE MATRIX của màn hình (Sửa rule nếu cần):",
-                            value=json.dumps(screen, ensure_ascii=False, indent=2),
-                            height=300,
-                            key=f"txt_json_inter_{idx}"
-                        )
-                        
-                        if is_selected:
-                            try:
-                                updated_screen_json = json.loads(edited_json_str)
-                                approved_screens.append(updated_screen_json)
-                            except json.JSONDecodeError as e:
-                                st.error(
-                                    f"❌ JSON màn hình {idx+1} lỗi tại line {e.lineno}, col {e.colno}: {e.msg}"
-                                )
-
-                st.markdown("---")
-                st.write("### 🤖 Bước 3: Agent 2 V3.1 - Batch Renderer Từ Rule Matrix Đã Phê Duyệt")
-                
-                if st.button("🚀 Chốt Rule Matrix & Kích Hoạt Agent 2 Gen XMind", type="primary", key="btn_agent2_interactive"):
-                    if not api_key:
-                        st.error("⚠️ Vui lòng nhập API Key!")
-                    elif not approved_screens:
-                        st.error("⚠️ Bạn chưa chọn Màn hình nào!")
-                    else:
-                        st.session_state.pop("parsed_tree_ui", None)
-                        st.session_state.pop("agent2_pipeline_summary", None)
-
-                        progress_bar_a2 = st.progress(0)
-                        status_text_a2 = st.empty()
-
-                        def _agent2_progress(done, total, message):
-                            progress_bar_a2.progress(min(1.0, done / max(1, total)))
-                            status_text_a2.info(message)
-
-                        if "agent2_batch_cache" not in st.session_state:
-                            st.session_state.agent2_batch_cache = {}
-
-                        with st.spinner("Agent 2 đang render Rule Matrix theo batch; tự chia nhỏ nếu chạm Max Tokens..."):
-                            ok, tc_res, agent2_summary = run_agent2_rule_matrix_pipeline(
-                                approved_screens=approved_screens,
-                                api_key=api_key,
-                                base_url=base_url,
-                                model=model_name,
-                                prompt_template=PROMPT_AGENT2_GEN_XMIND_FROM_RULE_MATRIX,
-                                cache=st.session_state.agent2_batch_cache,
-                                progress_callback=_agent2_progress,
-                            )
-
-                        st.session_state.agent2_pipeline_summary = agent2_summary
-
-                        if ok and tc_res.strip():
-                            progress_bar_a2.progress(1.0)
-                            status_text_a2.success("✅ Agent 2 hoàn tất toàn bộ Rule Matrix.")
-                            st.session_state.parsed_tree_ui = tc_res
-                            merge2 = agent2_summary.get("merge", {})
-                            st.success(
-                                f"✅ Đã render xong | Batches={agent2_summary.get('initial_batches', 0)} | "
-                                f"LeafOutputs={merge2.get('agent2_leaf_outputs', 0)} | "
-                                f"TestCases={merge2.get('testcases_renumbered', 0)} | "
-                                f"Time={agent2_summary.get('elapsed', 0)}s"
-                            )
-                        else:
-                            status_text_a2.error("❌ Agent 2 chưa render đủ toàn bộ Rule Matrix.")
-                            st.error("❌ Có batch Agent 2 bị lỗi và pipeline đã dừng để tránh xuất bộ testcase thiếu.")
-
-                        with st.expander("🧪 Diagnostics Agent 2 V3.1", expanded=not ok):
-                            st.json(agent2_summary)
-                            st.download_button(
-                                "📥 Tải diagnostics Agent 2",
-                                data=json.dumps(agent2_summary, ensure_ascii=False, indent=2),
-                                file_name="agent2_v31_diagnostics.json",
-                                mime="application/json",
-                                key="dl_agent2_v31_diag",
-                            )
-
-        # BƯỚC XUẤT FILE CHUNG CHO CẢ 2 LUỒNG UI
         if "parsed_tree_ui" in st.session_state and st.session_state.parsed_tree_ui:
             st.markdown("---")
             st.write("### 📦 Xuất Kịch Bản Kiểm Thử (XMind / Excel)")
-            
-            output_xmind_path = os.path.join(tempfile.gettempdir(), f"{uploaded_ui_file.name.rsplit('.', 1)[0]}_UI_TestCases.xmind")
-            ok_xmind, err_xmind = create_xmind_from_text(st.session_state.parsed_tree_ui, output_xmind_path, root_title="Bộ Test Case UI/UX & Web App")
-            
+
+            base_name = uploaded_ui_file.name.rsplit(".", 1)[0]
+            output_xmind_path = os.path.join(tempfile.gettempdir(), f"{base_name}_UI_TestCases.xmind")
+            ok_xmind, err_xmind = create_xmind_from_text(
+                st.session_state.parsed_tree_ui,
+                output_xmind_path,
+                root_title="Bộ Test Case UI/UX & Web App",
+            )
+
             if ok_xmind:
                 st.success("✅ Đã tạo thành công bộ Test Case cho Web/App!")
-                
                 with st.expander("🔍 Xem trước dạng Text cây thụt lề"):
                     st.code(st.session_state.parsed_tree_ui, language="text")
-                    
+
                 col_xmind, col_excel = st.columns(2)
-                
                 with col_xmind:
                     with open(output_xmind_path, "rb") as f:
                         st.download_button(
                             label="📥 Tải xuống sơ đồ UI (.XMind)",
                             data=f,
-                            file_name=f"{uploaded_ui_file.name.rsplit('.', 1)[0]}_UI_TestCases.xmind",
+                            file_name=f"{base_name}_UI_TestCases.xmind",
                             mime="application/octet-stream",
-                            key="dl_ui_main"
+                            key="dl_ui_main",
                         )
-                
+
                 with col_excel:
-                    excel_bytes = convert_tree_to_ui_excel(st.session_state.parsed_tree_ui)
-                    st.download_button(
-                        label="📊 Tải xuống bảng Excel (.XLSX)",
-                        data=excel_bytes,
-                        file_name=f"{uploaded_ui_file.name.rsplit('.', 1)[0]}_UI_TestCases.xlsx",
-                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                        key="dl_ui_excel_main"
-                    )
+                    try:
+                        excel_bytes = convert_tree_to_ui_excel(st.session_state.parsed_tree_ui)
+                        st.download_button(
+                            label="📊 Tải xuống bảng Excel (.XLSX)",
+                            data=excel_bytes,
+                            file_name=f"{base_name}_UI_TestCases.xlsx",
+                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                            key="dl_ui_excel_main",
+                        )
+                    except Exception as e:
+                        st.error(f"❌ Không thể tạo Excel: {e}")
             else:
                 st.error("❌ Không thể tạo file XMind. Chi tiết lỗi:")
                 st.code(err_xmind, language="bash")
@@ -4367,14 +4560,17 @@ with tab_api:
                         if selected:
                             try:
                                 ep_json = json.loads(edited)
-                                temp = {"api_test_design_version": "3.2", "api_modules": [{"module_name": module_name, "endpoints": [ep_json]}]}
+                                temp = normalize_api_rule_matrix_enums({
+                                    "api_test_design_version": "3.2",
+                                    "api_modules": [{"module_name": module_name, "endpoints": [ep_json]}],
+                                })
                                 valid, diag = validate_api_rule_matrix_schema(temp, strict=True)
                                 if not valid:
                                     st.error(f"❌ Endpoint JSON/schema lỗi: {diag}")
                                 else:
                                     if module_name not in approved_modules_map:
                                         approved_modules_map[module_name] = {"module_name": module_name, "endpoints": []}
-                                    approved_modules_map[module_name]["endpoints"].append(ep_json)
+                                    approved_modules_map[module_name]["endpoints"].append(temp["api_modules"][0]["endpoints"][0])
                             except Exception as e:
                                 st.error(f"❌ JSON endpoint không hợp lệ: {e}")
 
@@ -4439,13 +4635,16 @@ with tab_api:
                             mime="application/octet-stream", key="dl_api_xmind_v32"
                         )
                 with col_api_excel:
-                    api_excel_bytes = convert_tree_to_api_excel(st.session_state.api_parsed_tree)
-                    st.download_button(
-                        "📊 Tải API Excel", data=api_excel_bytes,
-                        file_name="API_TestCases_V3_2.xlsx",
-                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                        key="dl_api_excel_v32"
-                    )
+                    try:
+                        api_excel_bytes = convert_tree_to_api_excel(st.session_state.api_parsed_tree)
+                        st.download_button(
+                            "📊 Tải API Excel", data=api_excel_bytes,
+                            file_name="API_TestCases_V3_2.xlsx",
+                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                            key="dl_api_excel_v32"
+                        )
+                    except Exception as e:
+                        st.error(f"❌ Không thể tạo API Excel: {e}")
             else:
                 st.error(f"❌ Lỗi khi đóng gói XMind: {err_xmind}")
 

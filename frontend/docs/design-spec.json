@@ -1,0 +1,278 @@
+{
+  "meta": {
+    "project": "TestPilot AI",
+    "version": "1.1",
+    "language": "vi-VN",
+    "implementation_target": "Web desktop SaaS",
+    "reference_resolution": {
+      "width": 1536,
+      "height": 1024
+    }
+  },
+  "design_system": {
+    "style": "Clean SaaS, sáng, tối giản, thực dụng",
+    "avoid": [
+      "hoa lá trang trí",
+      "quote viết tay",
+      "banner không phục vụ chức năng",
+      "menu ngoài yêu cầu"
+    ],
+    "tokens": {
+      "colors": {
+        "background": "#F7F9FC",
+        "surface": "#FFFFFF",
+        "primary": "#4F5DFF",
+        "primarySoft": "#EEF0FF",
+        "textPrimary": "#0F1B4C",
+        "textSecondary": "#6E7A9A",
+        "border": "#E4E8F2",
+        "success": "#10B981",
+        "danger": "#EF4444",
+        "warning": "#F59E0B"
+      },
+      "typography": {
+        "fontFamily": "Inter, system-ui, sans-serif",
+        "pageTitlePx": 36,
+        "sectionTitlePx": 22,
+        "bodyPx": 14
+      },
+      "radius": {
+        "sm": 8,
+        "md": 12,
+        "lg": 16
+      },
+      "spacing": [
+        4,
+        8,
+        12,
+        16,
+        20,
+        24,
+        32,
+        40
+      ]
+    }
+  },
+  "navigation": {
+    "sidebarItems": [
+      {
+        "label": "Bảng điều khiển",
+        "route": "/dashboard"
+      },
+      {
+        "label": "Quản lý khóa API",
+        "route": "/api-keys"
+      }
+    ],
+    "projectAction": "+ Dự án mới",
+    "projectSearch": true,
+    "projectList": true
+  },
+  "routes": [
+    {
+      "screen": "00",
+      "path": "/login"
+    },
+    {
+      "screen": "01",
+      "path": "/dashboard"
+    },
+    {
+      "screen": "02",
+      "path": "/project/:projectId"
+    },
+    {
+      "screen": "03",
+      "path": "/project/:projectId/folder/:folderId/upload"
+    },
+    {
+      "screen": "04",
+      "path": "/project/:projectId/folder/:folderId/testcases"
+    },
+    {
+      "screen": "05",
+      "path": "/api-keys"
+    }
+  ],
+  "screens": [
+    {
+      "id": "00",
+      "name": "Đăng nhập",
+      "asset": "screens/00_login.png",
+      "route": "/login",
+      "layout": "split",
+      "fields": [
+        "Email / User ID",
+        "Mật khẩu",
+        "Ghi nhớ đăng nhập"
+      ],
+      "actions": [
+        "Đăng nhập",
+        "Đăng nhập bằng SSO nội bộ"
+      ]
+    },
+    {
+      "id": "01",
+      "name": "Bảng điều khiển",
+      "asset": "screens/01_dashboard.png",
+      "route": "/dashboard",
+      "breadcrumb": [
+        "Trang chủ",
+        "Bảng điều khiển"
+      ],
+      "focus": "Tạo dự án mới",
+      "fields": [
+        "Tên dự án",
+        "Mô tả ngắn",
+        "Loại dự án"
+      ],
+      "groups": [
+        "Thư mục chức năng - Web App",
+        "Thư mục chức năng - API"
+      ],
+      "actions": [
+        "+ Thêm thư mục",
+        "Lưu nháp",
+        "Tạo dự án"
+      ]
+    },
+    {
+      "id": "02",
+      "name": "Chi tiết dự án",
+      "asset": "screens/02_project_detail.png",
+      "route": "/project/:projectId",
+      "breadcrumb": [
+        "Trang chủ",
+        "{Tên dự án}"
+      ],
+      "sections": [
+        "Web App",
+        "API"
+      ],
+      "actions": [
+        "Tạo thư mục",
+        "Tải toàn bộ testcase",
+        "Tìm kiếm thư mục"
+      ],
+      "folderClick": "Mở Kho testcase của thư mục",
+      "newFolderFlow": "Popup chọn Web App/API -> Tải tài liệu"
+    },
+    {
+      "id": "03",
+      "name": "Tải tài liệu",
+      "asset": "screens/03_upload_document.png",
+      "route": "/project/:projectId/folder/:folderId/upload",
+      "acceptedFileTypes": [
+        "pdf",
+        "md",
+        "doc",
+        "docx"
+      ],
+      "tableColumns": [
+        "Tên tài liệu",
+        "Loại file",
+        "Dung lượng",
+        "Trạng thái",
+        "Thời gian"
+      ],
+      "actions": [
+        "Chọn tài liệu",
+        "Quay lại",
+        "Phân tích tài liệu"
+      ]
+    },
+    {
+      "id": "04",
+      "name": "Kho testcase",
+      "asset": "screens/04_testcase_workspace.png",
+      "route": "/project/:projectId/folder/:folderId/testcases",
+      "layout": "accordion",
+      "testcaseTypes": [
+        "Giao diện",
+        "Kiểm tra dữ liệu",
+        "Chức năng",
+        "Ngoại lệ",
+        "Popup",
+        "Luồng"
+      ],
+      "collapsedHeader": [
+        "id",
+        "name",
+        "type"
+      ],
+      "expandedFields": [
+        "preCondition",
+        "testData",
+        "steps",
+        "expectedResult",
+        "type"
+      ],
+      "stepExample": [
+        "1. Login vào hệ thống",
+        "2. Nhập ký tự",
+        "3. Quan sát kết quả"
+      ],
+      "actions": [
+        "+ Thêm testcase",
+        "Tải JSON",
+        "Tải Excel",
+        "Sửa",
+        "Xóa"
+      ],
+      "editBehavior": "Thêm/Sửa dùng popup; Xóa dùng popup xác nhận"
+    },
+    {
+      "id": "05",
+      "name": "Quản lý khóa API",
+      "asset": "screens/05_api_key_management.png",
+      "route": "/api-keys",
+      "modelOptions": [
+        "GPT-4o",
+        "Qwen Max",
+        "Gemini 1.5 Pro"
+      ],
+      "tableColumns": [
+        "Nhà cung cấp",
+        "Mô hình AI",
+        "Khóa API",
+        "Trạng thái",
+        "Thao tác"
+      ],
+      "keySecurity": {
+        "maskedAfterSave": true,
+        "example": "sk-••••••••••x9K2",
+        "neverRevealFullKeyAfterSave": true
+      },
+      "actions": [
+        "+ Thêm khóa API",
+        "Lưu",
+        "Hủy",
+        "Sửa",
+        "Xóa"
+      ]
+    }
+  ],
+  "schemas": {
+    "testcase": {
+      "id": "string",
+      "name": "string",
+      "preCondition": "string",
+      "testData": "string",
+      "steps": "string[]",
+      "expectedResult": "string",
+      "type": "Giao diện|Kiểm tra dữ liệu|Chức năng|Ngoại lệ|Popup|Luồng"
+    },
+    "project": {
+      "id": "string",
+      "name": "string",
+      "description": "string",
+      "type": "web|api|web_and_api"
+    },
+    "apiKey": {
+      "provider": "string",
+      "model": "string",
+      "maskedKey": "string",
+      "status": "Hoạt động|Hết hạn|Chưa kiểm tra"
+    }
+  }
+}

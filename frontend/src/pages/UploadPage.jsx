@@ -1,8 +1,8 @@
 import { ArrowLeft, ArrowRight, File, FileJson2, FileText, Trash2, UploadCloud } from 'lucide-react'
-import { useRef, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { useNavigate, useParams, useSearchParams } from 'react-router-dom'
 import AppShell from '../components/AppShell'
-import { analyzeApi, analyzeWeb, loadAiConfig } from '../api/client'
+import { analyzeApi, analyzeWeb, getAnalysisJob, invalidateProjectCache, loadAiConfig } from '../api/client'
 import { getProjectById } from '../data/projectStore'
 
 const fileMeta = file => ({
@@ -29,10 +29,74 @@ export default function UploadPage() {
   const [baFile, setBaFile] = useState(null)
   const [phase, setPhase] = useState('idle')
   const [error, setError] = useState('')
+  const [jobStatus, setJobStatus] = useState(null)
+  const pollTokenRef = useRef(0)
 
   const config = loadAiConfig()
   const hasFiles = scope === 'api' ? !!designFile && !!baFile : files.length > 0
   const addFiles = fileList => setFiles(prev => [...prev, ...Array.from(fileList)])
+  const jobStorageKey = `testpilot.job.${projectId}.${folderId}.${scope}`
+  const runStorageKey = `testpilot.run.${projectId}.${folderId}`
+
+  const finishJob = job => {
+    sessionStorage.removeItem(jobStorageKey)
+    invalidateProjectCache(projectId)
+    if (job?.run_id) sessionStorage.setItem(runStorageKey, job.run_id)
+    setJobStatus(job)
+    setPhase('done')
+    if (params.folderId) {
+      const runQuery = job?.run_id ? `&run=${encodeURIComponent(job.run_id)}` : ''
+      navigate(`/project/${projectId}/folder/${folderId}/testcases?scope=${encodeURIComponent(scope)}${runQuery}`, { replace: true })
+    } else {
+      navigate(`/project/${projectId}/scope/${scope}`, { replace: true })
+    }
+  }
+
+  const pollJob = async jobId => {
+    const token = ++pollTokenRef.current
+    let transientFailures = 0
+    setPhase('analyzing')
+    setJobStatus(current => current || { status: 'queued', stage: 'queued', progress: 0, message: 'Đã gửi tài liệu. Đang khởi tạo tác vụ...' })
+
+    while (token === pollTokenRef.current) {
+      try {
+        const job = await getAnalysisJob(jobId)
+        transientFailures = 0
+        setJobStatus(job)
+        if (job.status === 'completed') {
+          finishJob(job)
+          return
+        }
+        if (job.status === 'failed') {
+          sessionStorage.removeItem(jobStorageKey)
+          setError(job.error?.message || job.message || 'Phân tích tài liệu thất bại.')
+          setPhase('idle')
+          return
+        }
+      } catch (e) {
+        transientFailures += 1
+        if (e.status >= 500 && transientFailures <= 10) {
+          setJobStatus(current => ({
+            ...(current || {}),
+            message: 'Kết nối tạm thời gián đoạn. Đang tự kết nối lại...',
+          }))
+        } else {
+          setError(e.message || 'Không kiểm tra được trạng thái phân tích.')
+          setPhase('idle')
+          return
+        }
+      }
+      await new Promise(resolve => window.setTimeout(resolve, 3500))
+    }
+  }
+
+  useEffect(() => {
+    const existingJob = sessionStorage.getItem(jobStorageKey)
+    if (existingJob) pollJob(existingJob)
+    return () => { pollTokenRef.current += 1 }
+    // Resume exactly the job for this project/scope after refresh.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [jobStorageKey])
 
   const ensureConfig = () => {
     if (!config.apiKey?.trim()) {
@@ -46,15 +110,18 @@ export default function UploadPage() {
     if (!hasFiles || !ensureConfig()) return
     setError('')
     setPhase('analyzing')
+    setJobStatus({ status: 'queued', stage: 'uploading', progress: 0, message: 'Đang tải tài liệu lên server...' })
     try {
       const result = scope === 'api'
         ? await analyzeApi({ designFile, baFile, config, projectId, folderId })
         : await analyzeWeb({ files, config, projectId, folderId })
 
-      sessionStorage.setItem(`testpilot.run.${projectId}.${folderId}`, result.run_id)
-      navigate(`/project/${projectId}/scope/${scope}`, { replace: true })
+      if (!result.job_id) throw new Error('Server không trả về mã tác vụ phân tích.')
+      sessionStorage.setItem(jobStorageKey, result.job_id)
+      setJobStatus({ status: result.status || 'queued', stage: 'queued', progress: 0, message: result.message || 'Đã tiếp nhận tài liệu.' })
+      await pollJob(result.job_id)
     } catch (e) {
-      setError(e.message || 'Phân tích tài liệu thất bại.')
+      setError(e.message || 'Không thể khởi tạo tác vụ phân tích.')
       setPhase('idle')
     }
   }
@@ -92,7 +159,15 @@ export default function UploadPage() {
             <input ref={inputRef} type="file" multiple accept=".pdf,.md,.txt,.doc,.docx" hidden onChange={e => addFiles(e.target.files)} />
           </div>
         ) : (
-          <div className="api-upload-grid">
+          <div>
+            <div className="api-target-note">
+              <FileJson2 size={20} />
+              <div>
+                <b>API Design là phạm vi mục tiêu</b>
+                <span>AI sẽ nhận diện endpoint từ API Design, sau đó chỉ chọn các phần liên quan trong tài liệu BA để phân tích sâu. Các API khác trong BA sẽ không tự sinh testcase.</span>
+              </div>
+            </div>
+            <div className="api-upload-grid">
             <button className={`api-upload-slot ${designFile ? 'has-file' : ''}`} onClick={() => designRef.current?.click()}>
               <FileJson2 size={36} /><b>API Design / Spec</b><span>{designFile ? designFile.name : 'Chọn tài liệu'}</span>
             </button>
@@ -101,6 +176,7 @@ export default function UploadPage() {
             </button>
             <input ref={designRef} type="file" accept=".json,.yaml,.yml,.pdf,.md,.txt,.doc,.docx" hidden onChange={e => setDesignFile(e.target.files?.[0] || null)} />
             <input ref={baRef} type="file" accept=".pdf,.md,.txt,.doc,.docx" hidden onChange={e => setBaFile(e.target.files?.[0] || null)} />
+            </div>
           </div>
         )}
       </section>
@@ -109,7 +185,7 @@ export default function UploadPage() {
         <section className="card file-table-card">
           <div className="file-table-head">
             <div><File size={22} /><span><h3>Tài liệu đã chọn ({displayFiles.length})</h3></span></div>
-            <button className="btn btn-outline btn-balanced" onClick={() => { setFiles([]); setDesignFile(null); setBaFile(null); setPhase('idle') }}>
+            <button className="btn btn-outline btn-balanced" onClick={() => { setFiles([]); setDesignFile(null); setBaFile(null); setPhase('idle'); setJobStatus(null); setError('') }}>
               <Trash2 size={17} /> Xóa tất cả
             </button>
           </div>
@@ -137,9 +213,13 @@ export default function UploadPage() {
       </div>
 
       {phase === 'analyzing' && (
-        <div className="analysis-toast">
+        <div className="analysis-toast analysis-toast-job">
           <span className="spinner"></span>
-          <div><b>Đang phân tích tài liệu...</b><small>Vui lòng giữ trang này mở.</small></div>
+          <div className="analysis-toast-content">
+            <b>{jobStatus?.message || 'Đang phân tích tài liệu...'}</b>
+            <small>{Math.max(0, Number(jobStatus?.progress || 0))}% · AI chạy nền, bạn có thể giữ hoặc tải lại trang.</small>
+            <div className="analysis-progress"><span style={{ width: `${Math.max(3, Number(jobStatus?.progress || 0))}%` }} /></div>
+          </div>
         </div>
       )}
     </AppShell>

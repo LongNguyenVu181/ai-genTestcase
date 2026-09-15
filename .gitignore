@@ -9,3 +9,20 @@ venv/
 
 backend/data/*.db
 backend/data/*.db-*
+
+# Generated/runtime artifacts
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+node_modules/
+frontend/dist/
+*.log
+.DS_Store
+Thumbs.db
+.env
+.env.*
+backend/data/
+*.db
+*.sqlite
+*.sqlite3

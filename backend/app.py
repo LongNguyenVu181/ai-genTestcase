@@ -15,6 +15,7 @@ from typing import Any
 
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import FileResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
@@ -29,7 +30,8 @@ FRONTEND_DIST = APP_ROOT / "frontend" / "dist"
 DEFAULT_BASE_URL = "https://ws-2vuxxf5tta2cjplh.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1"
 DEFAULT_MODEL = "qwen-max"
 
-app = FastAPI(title="TestPilot AI API", version="1.7.0")
+app = FastAPI(title="TestPilot AI API", version="1.9.4")
+app.add_middleware(GZipMiddleware, minimum_size=1000)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
@@ -43,6 +45,17 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+
+@app.middleware("http")
+async def add_frontend_cache_headers(request, call_next):
+    response = await call_next(request)
+    path = request.url.path
+    if path.startswith("/assets/"):
+        response.headers["Cache-Control"] = "public, max-age=31536000, immutable"
+    elif not path.startswith("/api/") and response.headers.get("content-type", "").startswith("text/html"):
+        response.headers["Cache-Control"] = "no-cache"
+    return response
+
 WEB_AGENT1_CACHE: dict[str, Any] = {}
 API_AGENT1_CACHE: dict[str, Any] = {}
 
@@ -51,6 +64,20 @@ class ConfigTestRequest(BaseModel):
     api_key: str = Field(min_length=1)
     base_url: str = DEFAULT_BASE_URL
     model: str = DEFAULT_MODEL
+
+
+class ProjectPayload(BaseModel):
+    id: str
+    name: str
+    description: str = ""
+    type: str = "both"
+    webFolders: list[dict] = []
+    apiFolders: list[dict] = []
+    customFolders: list[dict] = []
+    enabledScopes: list[str] = []
+    updated: str = "vừa xong"
+    createdAt: float | None = None
+    updatedAt: float | None = None
 
 
 class TestcasePayload(BaseModel):
@@ -212,13 +239,48 @@ def _ensure_manual_run(project_id: str, folder_id: str, scope: str) -> str:
 def health():
     return {
         "ok": True,
-        "version": "1.7.0",
+        "version": "1.9.4",
         "web_pipeline": core.WEB_TEST_DESIGN_VERSION,
         "ai_stages": 1,
         "persistence": "sqlite",
+        "analysis_mode": "async_job_polling",
         "database": str(db.DB_PATH),
         "models": ["qwen-max", "qwen3.8-max", "qwen-plus"],
     }
+
+
+@app.get("/api/projects")
+def list_projects():
+    return {"projects": db.list_projects()}
+
+
+@app.get("/api/projects/{project_id}/metadata")
+def get_project_metadata(project_id: str):
+    project = db.get_project(project_id)
+    if not project:
+        raise HTTPException(404, "Không tìm thấy dự án")
+    return {"project": project}
+
+
+@app.put("/api/projects/{project_id}/metadata")
+def save_project_metadata(project_id: str, payload: ProjectPayload):
+    data = payload.model_dump()
+    data["id"] = project_id
+    data["updatedAt"] = data.get("updatedAt") or time.time()
+    project = db.upsert_project(data)
+    return {"ok": True, "project": project}
+
+
+@app.post("/api/projects/sync")
+def sync_projects(payload: dict):
+    projects = payload.get("projects") if isinstance(payload, dict) else []
+    if not isinstance(projects, list):
+        raise HTTPException(400, "projects phải là array")
+    saved = []
+    for project in projects:
+        if isinstance(project, dict) and (project.get("id") or "").strip():
+            saved.append(db.upsert_project(project))
+    return {"ok": True, "projects": db.list_projects(), "saved": len(saved)}
 
 
 @app.post("/api/config/test")
@@ -261,7 +323,268 @@ async def test_config(payload: ConfigTestRequest):
     }
 
 
-@app.post("/api/web/analyze")
+ANALYSIS_TASKS: set[asyncio.Task] = set()
+
+
+def _launch_analysis_job(coro) -> None:
+    task = asyncio.create_task(coro)
+    ANALYSIS_TASKS.add(task)
+    task.add_done_callback(ANALYSIS_TASKS.discard)
+
+
+def _job_failure_payload(exc: Exception) -> dict:
+    if isinstance(exc, HTTPException):
+        detail = exc.detail
+        if isinstance(detail, dict):
+            return detail
+        return {"message": str(detail), "status_code": exc.status_code}
+    return {"message": str(exc) or exc.__class__.__name__, "type": exc.__class__.__name__}
+
+
+async def _process_web_analysis_job(
+    *,
+    job_id: str,
+    uploads: list[tuple[str, bytes]],
+    api_key: str,
+    base_url: str,
+    model: str,
+    project_id: str,
+    folder_id: str,
+) -> None:
+    try:
+        db.update_analysis_job(
+            job_id,
+            status="processing",
+            stage="extracting",
+            message="Đang đọc và trích xuất nội dung tài liệu...",
+            progress=5,
+        )
+        sources: list[str] = []
+        names: list[str] = []
+        total = max(1, len(uploads))
+        for index, (name, data) in enumerate(uploads, start=1):
+            text = await asyncio.to_thread(extract_upload_text, name, data)
+            if text.strip():
+                sources.append(f"=== SOURCE DOCUMENT: {name} ===\n{text}")
+                names.append(name)
+            db.update_analysis_job(
+                job_id,
+                message=f"Đã đọc {index}/{total} tài liệu.",
+                progress=min(15, 5 + int(index / total * 10)),
+            )
+
+        if not sources:
+            raise HTTPException(400, "Không trích xuất được nội dung từ tài liệu")
+
+        raw_text = "\n\n".join(sources)
+        base_filename = Path(names[0]).stem if len(names) == 1 else "multi_document_web"
+        db.update_analysis_job(
+            job_id,
+            stage="analyzing",
+            message="AI đang phân tích yêu cầu và xây dựng Rule Matrix...",
+            progress=20,
+        )
+
+        def _call():
+            return core.run_agent1_document_pipeline(
+                raw_text=raw_text,
+                base_filename=base_filename,
+                api_key=api_key,
+                base_url=base_url,
+                model=model,
+                prompt_template=core.PROMPT_AGENT1_EXTRACT_RULE_MATRIX,
+                cache=WEB_AGENT1_CACHE,
+            )
+
+        ok, matrix, summary = await asyncio.to_thread(_call)
+        if not ok or matrix is None:
+            raise HTTPException(422, detail={"message": "AI phân tích Web thất bại", "summary": summary})
+
+        db.update_analysis_job(
+            job_id,
+            stage="mapping",
+            message="Đang chuyển Rule Matrix thành testcase...",
+            progress=82,
+        )
+        testcases = mapper.map_web_matrix_to_testcases(matrix)
+        expected_rules = (summary.get("merge") or {}).get("final_rules")
+        if expected_rules is not None and len(testcases) != int(expected_rules):
+            raise HTTPException(500, detail={
+                "message": "Mapping testcase không bảo toàn số Rule Matrix",
+                "final_rules": expected_rules,
+                "mapped_testcases": len(testcases),
+            })
+
+        db.update_analysis_job(
+            job_id,
+            stage="saving",
+            message="Đang lưu testcase vào workspace...",
+            progress=92,
+        )
+        run_id = uuid.uuid4().hex
+        db.save_run(
+            run_id=run_id,
+            kind="web",
+            project_id=project_id,
+            folder_id=folder_id,
+            source_names=names,
+            matrix=matrix,
+            agent1_summary=summary,
+        )
+        saved = db.replace_run_testcases(
+            run_id=run_id,
+            project_id=project_id,
+            folder_id=folder_id,
+            scope="web",
+            testcases=testcases,
+        )
+        invalid = sum(1 for tc in saved if not tc.get("validation", {}).get("valid", False))
+        db.update_analysis_job(
+            job_id,
+            status="completed",
+            stage="completed",
+            message=f"Hoàn tất {len(saved)} testcase" + (f", {invalid} case cần kiểm tra." if invalid else "."),
+            progress=100,
+            run_id=run_id,
+            error_payload={},
+        )
+    except Exception as exc:
+        payload = _job_failure_payload(exc)
+        db.update_analysis_job(
+            job_id,
+            status="failed",
+            stage="failed",
+            message=payload.get("message") or "Phân tích tài liệu thất bại.",
+            error_payload=payload,
+        )
+
+
+async def _process_api_analysis_job(
+    *,
+    job_id: str,
+    design_upload: tuple[str, bytes],
+    ba_upload: tuple[str, bytes],
+    api_key: str,
+    base_url: str,
+    model: str,
+    project_id: str,
+    folder_id: str,
+) -> None:
+    try:
+        design_name, design_bytes = design_upload
+        ba_name, ba_bytes = ba_upload
+        db.update_analysis_job(
+            job_id,
+            status="processing",
+            stage="extracting",
+            message="Đang đọc API Design và tài liệu BA...",
+            progress=5,
+        )
+        design_text, ba_text = await asyncio.gather(
+            asyncio.to_thread(extract_upload_text, design_name, design_bytes),
+            asyncio.to_thread(extract_upload_text, ba_name, ba_bytes),
+        )
+        if not design_text.strip() or not ba_text.strip():
+            raise HTTPException(400, "Không trích xuất được đầy đủ nội dung tài liệu API")
+
+        base_filename = f"{Path(design_name).stem}_{Path(ba_name).stem}"
+        db.update_analysis_job(
+            job_id,
+            stage="analyzing",
+            message="Đang nhận diện API mục tiêu từ API Design...",
+            progress=20,
+        )
+
+        def _progress(current, total, message):
+            try:
+                progress = int((float(current) / max(1.0, float(total))) * 100) if total else int(current)
+            except Exception:
+                progress = int(current or 20)
+            db.update_analysis_job(
+                job_id,
+                status="processing",
+                stage="analyzing",
+                message=message,
+                progress=max(10, min(90, progress)),
+            )
+
+        def _call():
+            return core.run_api_agent1_document_pipeline(
+                design_text=design_text,
+                ba_text=ba_text,
+                base_filename=base_filename,
+                api_key=api_key,
+                base_url=base_url,
+                model=model,
+                prompt_template=core.PROMPT_API_AGENT1_RULE_MATRIX,
+                cache=API_AGENT1_CACHE,
+                progress_callback=_progress,
+            )
+
+        ok, matrix, summary = await asyncio.to_thread(_call)
+        if not ok or matrix is None:
+            raise HTTPException(422, detail={"message": "AI phân tích API thất bại", "summary": summary})
+
+        db.update_analysis_job(
+            job_id,
+            stage="mapping",
+            message="Đang chuyển Rule Matrix API thành testcase...",
+            progress=82,
+        )
+        testcases = mapper.map_api_matrix_to_testcases(matrix)
+        expected_rules = (summary.get("merge") or {}).get("final_rules")
+        if expected_rules is not None and len(testcases) != int(expected_rules):
+            raise HTTPException(500, detail={
+                "message": "Mapping testcase API không bảo toàn số Rule Matrix",
+                "final_rules": expected_rules,
+                "mapped_testcases": len(testcases),
+            })
+
+        db.update_analysis_job(
+            job_id,
+            stage="saving",
+            message="Đang lưu testcase API vào workspace...",
+            progress=92,
+        )
+        run_id = uuid.uuid4().hex
+        db.save_run(
+            run_id=run_id,
+            kind="api",
+            project_id=project_id,
+            folder_id=folder_id,
+            source_names=[design_name, ba_name],
+            matrix=matrix,
+            agent1_summary=summary,
+        )
+        saved = db.replace_run_testcases(
+            run_id=run_id,
+            project_id=project_id,
+            folder_id=folder_id,
+            scope="api",
+            testcases=testcases,
+        )
+        invalid = sum(1 for tc in saved if not tc.get("validation", {}).get("valid", False))
+        db.update_analysis_job(
+            job_id,
+            status="completed",
+            stage="completed",
+            message=f"Hoàn tất {len(saved)} testcase" + (f", {invalid} case cần kiểm tra." if invalid else "."),
+            progress=100,
+            run_id=run_id,
+            error_payload={},
+        )
+    except Exception as exc:
+        payload = _job_failure_payload(exc)
+        db.update_analysis_job(
+            job_id,
+            status="failed",
+            stage="failed",
+            message=payload.get("message") or "Phân tích tài liệu API thất bại.",
+            error_payload=payload,
+        )
+
+
+@app.post("/api/web/analyze", status_code=202)
 async def web_analyze(
     files: list[UploadFile] = File(...),
     api_key: str = Form(...),
@@ -272,77 +595,33 @@ async def web_analyze(
 ):
     if not files:
         raise HTTPException(400, "Chưa có tài liệu")
-
-    sources: list[str] = []
-    names: list[str] = []
-    for upload in files:
-        name, data = await _read_upload(upload)
-        text = extract_upload_text(name, data)
-        if text.strip():
-            sources.append(f"=== SOURCE DOCUMENT: {name} ===\n{text}")
-            names.append(name)
-
-    if not sources:
-        raise HTTPException(400, "Không trích xuất được nội dung từ tài liệu")
-
-    raw_text = "\n\n".join(sources)
-    base_filename = Path(names[0]).stem if len(names) == 1 else "multi_document_web"
-
-    def _call():
-        return core.run_agent1_document_pipeline(
-            raw_text=raw_text,
-            base_filename=base_filename,
-            api_key=api_key,
-            base_url=base_url,
-            model=model,
-            prompt_template=core.PROMPT_AGENT1_EXTRACT_RULE_MATRIX,
-            cache=WEB_AGENT1_CACHE,
-        )
-
-    ok, matrix, summary = await asyncio.to_thread(_call)
-    if not ok or matrix is None:
-        raise HTTPException(422, detail={"message": "AI phân tích Web thất bại", "summary": summary})
-
-    # JSON Rule Matrix remains the hidden internal source of truth.
-    # No second AI call: Python maps it deterministically to reviewable testcase fields.
-    testcases = mapper.map_web_matrix_to_testcases(matrix)
-    expected_rules = (summary.get("merge") or {}).get("final_rules")
-    if expected_rules is not None and len(testcases) != int(expected_rules):
-        raise HTTPException(500, detail={
-            "message": "Mapping testcase không bảo toàn số Rule Matrix",
-            "final_rules": expected_rules,
-            "mapped_testcases": len(testcases),
-        })
-
-    run_id = uuid.uuid4().hex
-    db.save_run(
-        run_id=run_id,
+    uploads = [await _read_upload(upload) for upload in files]
+    job_id = uuid.uuid4().hex
+    db.create_analysis_job(
+        job_id=job_id,
         kind="web",
         project_id=project_id,
         folder_id=folder_id,
-        source_names=names,
-        matrix=matrix,
-        agent1_summary=summary,
+        source_names=[name for name, _ in uploads],
     )
-    saved = db.replace_run_testcases(
-        run_id=run_id,
+    _launch_analysis_job(_process_web_analysis_job(
+        job_id=job_id,
+        uploads=uploads,
+        api_key=api_key,
+        base_url=base_url,
+        model=model,
         project_id=project_id,
         folder_id=folder_id,
-        scope="web",
-        testcases=testcases,
-    )
-
-    invalid = sum(1 for tc in saved if not tc.get("validation", {}).get("valid", False))
+    ))
     return {
         "ok": True,
-        "run_id": run_id,
-        "summary": summary,
-        "testcases": saved,
-        "validation": {"total": len(saved), "invalid": invalid},
+        "job_id": job_id,
+        "status": "queued",
+        "message": "Đã tiếp nhận tài liệu. AI sẽ xử lý ở background.",
     }
 
 
-@app.post("/api/api/analyze")
+@app.post("/api/api/analyze", status_code=202)
 async def api_analyze(
     design_file: UploadFile = File(...),
     ba_file: UploadFile = File(...),
@@ -352,89 +631,40 @@ async def api_analyze(
     project_id: str = Form("default-project"),
     folder_id: str = Form("default-folder"),
 ):
-    design_name, design_bytes = await _read_upload(design_file)
-    ba_name, ba_bytes = await _read_upload(ba_file)
-    design_text = extract_upload_text(design_name, design_bytes)
-    ba_text = extract_upload_text(ba_name, ba_bytes)
-    base_filename = f"{Path(design_name).stem}_{Path(ba_name).stem}"
-
-    def _call():
-        return core.run_api_agent1_document_pipeline(
-            design_text=design_text,
-            ba_text=ba_text,
-            base_filename=base_filename,
-            api_key=api_key,
-            base_url=base_url,
-            model=model,
-            prompt_template=core.PROMPT_API_AGENT1_RULE_MATRIX,
-            cache=API_AGENT1_CACHE,
-        )
-
-    ok, matrix, summary = await asyncio.to_thread(_call)
-    if not ok or matrix is None:
-        raise HTTPException(422, detail={"message": "AI phân tích API thất bại", "summary": summary})
-
-    testcases = mapper.map_api_matrix_to_testcases(matrix)
-    expected_rules = (summary.get("merge") or {}).get("final_rules")
-    if expected_rules is not None and len(testcases) != int(expected_rules):
-        raise HTTPException(500, detail={
-            "message": "Mapping testcase API không bảo toàn số Rule Matrix",
-            "final_rules": expected_rules,
-            "mapped_testcases": len(testcases),
-        })
-    run_id = uuid.uuid4().hex
-
-    db.save_run(
-        run_id=run_id,
+    design_upload = await _read_upload(design_file)
+    ba_upload = await _read_upload(ba_file)
+    job_id = uuid.uuid4().hex
+    db.create_analysis_job(
+        job_id=job_id,
         kind="api",
         project_id=project_id,
         folder_id=folder_id,
-        source_names=[design_name, ba_name],
-        matrix=matrix,
-        agent1_summary=summary,
+        source_names=[design_upload[0], ba_upload[0]],
     )
-    saved = db.replace_run_testcases(
-        run_id=run_id,
+    _launch_analysis_job(_process_api_analysis_job(
+        job_id=job_id,
+        design_upload=design_upload,
+        ba_upload=ba_upload,
+        api_key=api_key,
+        base_url=base_url,
+        model=model,
         project_id=project_id,
         folder_id=folder_id,
-        scope="api",
-        testcases=testcases,
-    )
-    invalid = sum(1 for tc in saved if not tc.get("validation", {}).get("valid", False))
+    ))
     return {
         "ok": True,
-        "run_id": run_id,
-        "summary": summary,
-        "testcases": saved,
-        "validation": {"total": len(saved), "invalid": invalid},
+        "job_id": job_id,
+        "status": "queued",
+        "message": "Đã tiếp nhận tài liệu API. AI sẽ xử lý ở background.",
     }
 
 
-# Backward-compatible endpoints: NO AI Agent 2 anymore.
-@app.post("/api/web/generate")
-async def web_generate_deprecated(payload: dict):
-    run_id = str(payload.get("run_id", ""))
-    _get_run_or_404(run_id)
-    testcases = db.list_run_testcases(run_id)
-    return {
-        "ok": True,
-        "run_id": run_id,
-        "testcases": testcases,
-        "summary": {"mode": "deterministic", "ai_agent2": False},
-    }
-
-
-@app.post("/api/api/generate")
-async def api_generate_deprecated(payload: dict):
-    run_id = str(payload.get("run_id", ""))
-    _get_run_or_404(run_id)
-    testcases = db.list_run_testcases(run_id)
-    return {
-        "ok": True,
-        "run_id": run_id,
-        "testcases": testcases,
-        "summary": {"mode": "deterministic", "ai_agent2": False},
-    }
+@app.get("/api/jobs/{job_id}")
+def get_analysis_job(job_id: str):
+    job = db.get_analysis_job(job_id)
+    if not job:
+        raise HTTPException(404, "Không tìm thấy tác vụ phân tích.")
+    return job
 
 
 @app.get("/api/runs/{run_id}")
@@ -456,7 +686,7 @@ def get_run(run_id: str):
 @app.get("/api/runs/{run_id}/diagnostics")
 def get_diagnostics(run_id: str):
     run = _get_run_or_404(run_id)
-    return {"agent1": run.get("agent1_summary"), "agent2": None}
+    return {"analysis": run.get("agent1_summary")}
 
 
 @app.get("/api/projects/{project_id}/folders/{folder_id}/testcases")
@@ -472,46 +702,41 @@ def get_folder_testcases(project_id: str, folder_id: str, scope: str = "web"):
 
 @app.get("/api/projects/{project_id}/testcase-tree")
 def get_project_testcase_tree(project_id: str):
-    testcases = db.list_project_testcases(project_id)
+    rows = db.list_project_tree_summary(project_id)
     scopes = {
         "web": {"key": "web", "label": "Web App", "screens": []},
         "api": {"key": "api", "label": "API", "screens": []},
     }
     screen_maps: dict[str, dict[str, dict]] = {"web": {}, "api": {}}
+    total_testcases = 0
 
-    for tc in testcases:
-        scope = tc.get("scope") if tc.get("scope") in scopes else "web"
-        screen_name = str(tc.get("screen") or "Chưa xác định màn hình").strip()
+    for row in rows:
+        scope = row.get("scope") if row.get("scope") in scopes else "web"
+        screen_name = str(row.get("screen") or "Chưa xác định màn hình").strip()
+        count = int(row.get("count") or 0)
+        total_testcases += count
         smap = screen_maps[scope]
         if screen_name not in smap:
             node = {
                 "screen": screen_name,
                 "count": 0,
                 "folder_ids": [],
-                "testcases": [],
+                "folderCounts": {},
             }
             smap[screen_name] = node
             scopes[scope]["screens"].append(node)
         node = smap[screen_name]
-        node["count"] += 1
-        folder_id = tc.get("folderId")
-        if folder_id and folder_id not in node["folder_ids"]:
-            node["folder_ids"].append(folder_id)
-        node["testcases"].append({
-            "recordId": tc.get("recordId"),
-            "id": tc.get("id"),
-            "name": tc.get("name"),
-            "type": tc.get("type"),
-            "category": tc.get("category"),
-            "featureGroup": tc.get("featureGroup"),
-            "featureName": tc.get("featureName"),
-            "folderId": folder_id,
-        })
+        node["count"] += count
+        folder_id = row.get("folder_id")
+        if folder_id:
+            if folder_id not in node["folder_ids"]:
+                node["folder_ids"].append(folder_id)
+            node["folderCounts"][folder_id] = node["folderCounts"].get(folder_id, 0) + count
 
     return {
         "ok": True,
         "project_id": project_id,
-        "total_testcases": len(testcases),
+        "total_testcases": total_testcases,
         "total_screens": sum(len(item["screens"]) for item in scopes.values()),
         "scopes": [scopes["web"], scopes["api"]],
     }

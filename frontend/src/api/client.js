@@ -34,12 +34,21 @@ const parseResponse = async response => {
   const type = response.headers.get('content-type') || ''
   const payload = type.includes('application/json') ? await response.json() : await response.text()
   if (!response.ok) {
-    const detail = payload?.detail
-    const message = typeof detail === 'string'
-      ? detail
-      : detail?.message || payload?.message || (typeof payload === 'string' ? payload : `HTTP ${response.status}`)
+    const isHtml = type.includes('text/html') || (typeof payload === 'string' && /<!doctype html|<html/i.test(payload))
+    let message
+    if (isHtml && response.status === 524) {
+      message = 'Kết nối tới server bị timeout. Tác vụ AI có thể vẫn đang chạy; hãy kiểm tra trạng thái sau ít phút.'
+    } else if (isHtml && response.status >= 500) {
+      message = 'Không kết nối ổn định tới server. Vui lòng thử lại sau ít phút.'
+    } else {
+      const detail = payload?.detail
+      message = typeof detail === 'string'
+        ? detail
+        : detail?.message || payload?.message || (typeof payload === 'string' ? payload : `HTTP ${response.status}`)
+    }
     const err = new Error(message)
     err.payload = payload
+    err.status = response.status
     throw err
   }
   return payload
@@ -54,6 +63,54 @@ export const testAiConfig = config => fetch('/api/config/test', {
     model: config.model,
   }),
 }).then(parseResponse)
+
+
+const responseCache = new Map()
+const inflight = new Map()
+const CACHE_TTL_MS = 20000
+
+const cachedJson = (key, factory, ttl = CACHE_TTL_MS) => {
+  const now = Date.now()
+  const hit = responseCache.get(key)
+  if (hit && now - hit.at < ttl) return Promise.resolve(hit.value)
+  if (inflight.has(key)) return inflight.get(key)
+  const promise = factory()
+    .then(value => {
+      responseCache.set(key, { value, at: Date.now() })
+      inflight.delete(key)
+      return value
+    })
+    .catch(error => {
+      inflight.delete(key)
+      throw error
+    })
+  inflight.set(key, promise)
+  return promise
+}
+
+export const invalidateProjectCache = projectId => {
+  const prefix = `project:${projectId}:`
+  for (const key of responseCache.keys()) {
+    if (key.startsWith(prefix)) responseCache.delete(key)
+  }
+}
+
+export const listProjectMetadata = () =>
+  fetch('/api/projects').then(parseResponse)
+
+export const saveProjectMetadata = project =>
+  fetch(`/api/projects/${encodeURIComponent(project.id)}/metadata`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(project),
+  }).then(parseResponse)
+
+export const syncProjectMetadata = projects =>
+  fetch('/api/projects/sync', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ projects }),
+  }).then(parseResponse)
 
 export const analyzeWeb = async ({ files, config, projectId, folderId }) => {
   const form = new FormData()
@@ -78,10 +135,14 @@ export const analyzeApi = async ({ designFile, baFile, config, projectId, folder
   return fetch('/api/api/analyze', { method: 'POST', body: form }).then(parseResponse)
 }
 
+export const getAnalysisJob = jobId =>
+  fetch(`/api/jobs/${encodeURIComponent(jobId)}`, { cache: 'no-store' }).then(parseResponse)
+
 export const getRun = runId => fetch(`/api/runs/${runId}`).then(parseResponse)
 
 export const getFolderTestcases = ({ projectId, folderId, scope }) =>
-  fetch(`/api/projects/${encodeURIComponent(projectId)}/folders/${encodeURIComponent(folderId)}/testcases?scope=${encodeURIComponent(scope)}`).then(parseResponse)
+  cachedJson(`project:${projectId}:folder:${scope}:${folderId}`, () =>
+    fetch(`/api/projects/${encodeURIComponent(projectId)}/folders/${encodeURIComponent(folderId)}/testcases?scope=${encodeURIComponent(scope)}`).then(parseResponse), 12000)
 
 export const createTestcase = ({ projectId, folderId, scope, runId, testcase }) => fetch('/api/testcases', {
   method: 'POST',
@@ -112,11 +173,13 @@ export const downloadUrl = (runId, type) => `/api/runs/${runId}/${type}`
 
 
 export const getProjectTestcaseTree = projectId =>
-  fetch(`/api/projects/${encodeURIComponent(projectId)}/testcase-tree`).then(parseResponse)
+  cachedJson(`project:${projectId}:tree`, () =>
+    fetch(`/api/projects/${encodeURIComponent(projectId)}/testcase-tree`).then(parseResponse), 20000)
 
 
 export const getScreenTestcases = ({ projectId, scope, screen }) =>
-  fetch(`/api/projects/${encodeURIComponent(projectId)}/screen-testcases?scope=${encodeURIComponent(scope)}&screen=${encodeURIComponent(screen)}`).then(parseResponse)
+  cachedJson(`project:${projectId}:screen:${scope}:${screen}`, () =>
+    fetch(`/api/projects/${encodeURIComponent(projectId)}/screen-testcases?scope=${encodeURIComponent(scope)}&screen=${encodeURIComponent(screen)}`).then(parseResponse), 12000)
 
 export const screenDownloadUrl = ({ projectId, scope, screen, type }) =>
   `/api/projects/${encodeURIComponent(projectId)}/screen-${type}?scope=${encodeURIComponent(scope)}&screen=${encodeURIComponent(screen)}`

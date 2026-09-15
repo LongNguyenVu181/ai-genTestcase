@@ -6,7 +6,10 @@ from typing import Any
 
 import pipeline_core as core
 
-ALLOWED_TYPES = {"Giao diện", "Kiểm tra dữ liệu", "Chức năng", "Ngoại lệ", "Popup", "Luồng"}
+ALLOWED_TYPES = {
+    "Giao diện", "Kiểm tra dữ liệu", "Chức năng", "Ngoại lệ", "Popup", "Luồng",
+    "Auth", "Permission", "Validation", "Happy Path", "Business Rule",
+}
 
 WEB_REVIEW_CATEGORY_ORDER = {
     "VALIDATION": 1,
@@ -18,15 +21,19 @@ WEB_REVIEW_CATEGORY_ORDER = {
 }
 
 API_REVIEW_CATEGORY_ORDER = {
-    "REQUEST_VALIDATION": 1,
-    "RESPONSE_VALIDATION": 2,
-    "AUTHENTICATION": 3,
-    "AUTHORIZATION": 4,
-    "METHOD_URL": 5,
-    "HAPPY_PATH": 6,
-    "BUSINESS_RULE": 7,
-    "INTEGRATION": 8,
-    "EXCEPTION": 9,
+    "AUTH": 1,
+    "PERMISSION": 2,
+    "VALIDATION": 3,
+    "HAPPY_PATH": 4,
+    "BUSINESS_RULE": 5,
+}
+
+API_CATEGORY_TITLES = {
+    "AUTH": "1. Kiểm tra xác thực và token",
+    "PERMISSION": "2. Kiểm tra phân quyền",
+    "VALIDATION": "3. Kiểm tra Validate Input",
+    "HAPPY_PATH": "4. Kiểm tra Luồng chính (Happy Path)",
+    "BUSINESS_RULE": "5. Kiểm tra Luồng nghiệp vụ (Business Rule)",
 }
 
 EXTRA_BLANK_FIELDS = {
@@ -77,16 +84,18 @@ def _web_type(rule: dict) -> str:
 
 def _api_type(rule: dict) -> str:
     category = _clean(rule.get("category")).upper()
-    if category == "EXCEPTION":
-        return "Ngoại lệ"
-    if category in {"REQUEST_VALIDATION", "RESPONSE_VALIDATION"}:
-        return "Kiểm tra dữ liệu"
-    if category in {"AUTHENTICATION", "AUTHORIZATION", "INTEGRATION", "BUSINESS_RULE"}:
-        return "Luồng"
-    return "Chức năng"
+    return {
+        "AUTH": "Auth",
+        "PERMISSION": "Permission",
+        "VALIDATION": "Validation",
+        "HAPPY_PATH": "Happy Path",
+        "BUSINESS_RULE": "Business Rule",
+    }.get(category, "Business Rule")
 
 
 def _precondition(rule: dict, *, api: bool = False) -> str:
+    if api and _clean(rule.get("precondition")):
+        return str(rule.get("precondition") or "").strip()
     condition = _clean(rule.get("test_condition"))
     if not condition:
         return ""
@@ -106,6 +115,8 @@ def _precondition(rule: dict, *, api: bool = False) -> str:
 
 
 def _test_data(rule: dict) -> str:
+    if _clean(rule.get("test_data")):
+        return str(rule.get("test_data") or "").strip()
     condition = _clean(rule.get("test_condition"))
     if not condition:
         return ""
@@ -158,6 +169,52 @@ def _steps(rule: dict, screen_name: str, *, api: bool = False) -> list[str]:
             result.append(step)
     return result[:5]
 
+
+
+def _api_expected_result(rule: dict) -> str:
+    """Render one common Expected Result template for every API testcase."""
+    rows = [
+        ("HTTP Code", rule.get("expected_http_code", "")),
+        ("Status", rule.get("expected_status", "")),
+        ("Code", rule.get("expected_code", "")),
+        ("Message", rule.get("expected_message", "")),
+        ("TraceId", rule.get("expected_trace_id", "")),
+        ("Data/Body", rule.get("expected_data_body", "")),
+        ("Business Result", rule.get("business_result", "")),
+    ]
+    return "\n".join(f"{label}: {str(value or '').strip()}" for label, value in rows)
+
+
+def _api_steps(rule: dict, method: str, endpoint_path: str, endpoint_summary: str = "") -> list[str]:
+    target = _clean(rule.get("target"))
+    raw_data = str(rule.get("test_data") or "")
+    effective_method = method
+    effective_path = endpoint_path
+    if _clean(effective_method).upper() == "UNMAPPED":
+        effective_method = ""
+    if _clean(effective_path).upper() == "UNMAPPED":
+        effective_path = ""
+
+    # Senior-style wrong Method/URL cases keep the mutation in Data test. Reflect it
+    # in the actual call step so the generated testcase can be executed directly.
+    mm = re.search(r"(?im)^\s*Method\s*:\s*(GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS)\b", raw_data)
+    if mm:
+        effective_method = mm.group(1).upper()
+    um = re.search(r"(?im)^\s*(?:URL|Endpoint)\s*:\s*(\S+)", raw_data)
+    if um:
+        effective_path = um.group(1).strip()
+
+    steps = ["Chuẩn bị request theo PreConditions và Dữ liệu kiểm thử."]
+    if target:
+        steps.append(f"Áp dụng điều kiện kiểm thử cho {target}.")
+    call_target = " ".join(x for x in (effective_method, effective_path) if x).strip()
+    if not call_target:
+        call_target = _clean(endpoint_summary) or "API tương ứng"
+    steps.append(f"Gửi request {call_target}.")
+    steps.append("Kiểm tra response theo Kết quả mong đợi.")
+    if _clean(rule.get("business_result")):
+        steps.append("Kiểm tra Business Result/side effect theo Kết quả mong đợi.")
+    return steps[:5]
 
 def validate_testcase(tc: dict) -> dict:
     errors: dict[str, str] = {}
@@ -257,9 +314,12 @@ def map_api_matrix_to_testcases(matrix: dict) -> list[dict]:
     for module_index, module in enumerate(matrix.get("api_modules", [])):
         module_name = _clean(module.get("module_name")) or f"API Module {module_index + 1}"
         for endpoint in module.get("endpoints", []):
-            endpoint_target = " ".join(
-                x for x in (_clean(endpoint.get("method")), _clean(endpoint.get("path"))) if x
-            ).strip()
+            method = _clean(endpoint.get("method")).upper()
+            endpoint_path = _clean(endpoint.get("endpoint_path") or endpoint.get("path"))
+            endpoint_summary = _clean(endpoint.get("summary"))
+            display_method = "" if method == "UNMAPPED" else method
+            display_path = "" if endpoint_path.upper() == "UNMAPPED" else endpoint_path
+            endpoint_target = " ".join(x for x in (display_method, display_path) if x).strip() or endpoint_summary or module_name
             indexed = list(enumerate(endpoint.get("test_rules", [])))
             indexed.sort(
                 key=lambda item: (
@@ -274,21 +334,25 @@ def map_api_matrix_to_testcases(matrix: dict) -> list[dict]:
                     rule = {**rule, "target": endpoint_target}
                 name = _clean(rule.get("rule_name")) or _clean(rule.get("test_objective")) or visible_tc_id
                 category = _clean(rule.get("category")).upper()
+                category_title = API_CATEGORY_TITLES.get(category, category or "API")
                 tc = _base_case(
                     tc_id=visible_tc_id,
                     name=name,
                     pre_condition=_precondition(rule, api=True),
-                    steps=_steps(rule, module_name, api=True),
+                    steps=_api_steps(rule, method, endpoint_path, endpoint_summary),
                     test_data=_test_data(rule),
-                    expected_result=_clean(rule.get("expected_result")),
+                    expected_result=_api_expected_result(rule),
                     tc_type=_api_type(rule),
                     source_rule_id=source_rule_id,
                     source_requirement=_clean(rule.get("source_requirement")),
                     feature_group="API",
-                    feature_name=endpoint_target or module_name,
+                    feature_name=category_title,
                     category=category,
-                    screen=module_name,
+                    screen=endpoint_target,
                 )
+                tc["apiModule"] = module_name
+                tc["reconciliationStatus"] = _clean(rule.get("reconciliation_status"))
+                tc["appliedQaRule"] = _clean(rule.get("applied_qa_rule"))
                 result.append(tc)
     return result
 

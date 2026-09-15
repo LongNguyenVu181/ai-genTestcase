@@ -51,10 +51,10 @@ export default function ApiKeysPage() {
   return (
     <AppShell>
       <Breadcrumb items={['Trang chủ', 'Quản lý khóa API']} />
-      <PageHeader index="05" title="Quản lý khóa API" subtitle="Cấu hình đúng Qwen model và DashScope endpoint đang dùng trong pipeline Multi-Agent." />
+      <PageHeader index="05" title="Quản lý khóa API" subtitle="Cấu hình Qwen model và DashScope endpoint dùng cho pipeline phân tích testcase." />
 
       <section className="card model-card">
-        <div className="section-title compact"><KeyRound size={25} /><div><h2>Mô hình AI mặc định</h2><p>Model này sẽ được dùng cho cả Agent 1 và Agent 2 khi chạy thử prompt.</p></div></div>
+        <div className="section-title compact"><KeyRound size={25} /><div><h2>Mô hình AI mặc định</h2><p>Model này sẽ được dùng cho pipeline phân tích tài liệu và sinh testcase.</p></div></div>
         <div className="model-grid">
           {models.map(item => (
             <button key={item.value} className={`model-option ${config.model === item.value ? 'active' : ''}`} onClick={() => setConfig({ ...config, model: item.value })}>

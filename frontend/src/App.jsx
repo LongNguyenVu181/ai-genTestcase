@@ -15,12 +15,12 @@ export default function App() {
       <Route path="/dashboard" element={<DashboardPage />} />
       <Route path="/project/:projectId" element={<ProjectDetailPage />} />
 
-      {/* V1.7 explorer flow: Project -> Web/API -> Screen -> Testcase */}
+      {/* Project -> Web/API -> Screen -> Testcase */}
       <Route path="/project/:projectId/scope/:scope" element={<ScopeExplorerPage />} />
       <Route path="/project/:projectId/scope/:scope/upload" element={<UploadPage />} />
       <Route path="/project/:projectId/scope/:scope/testcases" element={<TestcasePage />} />
 
-      {/* Legacy routes kept so old bookmarks do not break. */}
+      {/* Custom workspace routes */}
       <Route path="/project/:projectId/folder/:folderId/upload" element={<UploadPage />} />
       <Route path="/project/:projectId/folder/:folderId/testcases" element={<TestcasePage />} />
 

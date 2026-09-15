@@ -1,8 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Core Multi-Agent pipeline extracted from the user's working Streamlit build.
-The AI prompts and pipeline semantics are intentionally preserved.
-Streamlit UI code is removed so this module can be called by FastAPI.
-"""
+"""TestPilot AI document-analysis pipelines used by the FastAPI backend."""
 import json
 import io
 import os
@@ -38,29 +35,22 @@ AGENT1_API_RETRIES = 1
 # Process independent Web chunks in parallel. Set TESTPILOT_WEB_PARALLEL_WORKERS=1 if provider rate-limit is tight.
 AGENT1_PARALLEL_WORKERS = max(1, int(os.getenv("TESTPILOT_WEB_PARALLEL_WORKERS", "2")))
 
-# LEGACY Agent 2 renderer constants — retained only for backward compatibility; V1.3 runtime does not call AI Agent 2.
-AGENT2_BATCH_MAX_RULES = 18
-AGENT2_BATCH_MAX_INPUT_CHARS = 18000
-AGENT2_MAX_RECURSION_DEPTH = 5
-AGENT2_API_RETRIES = 1
-
 # Qwen output budget. Nếu vẫn chạm length, pipeline sẽ tự chia nhỏ và retry.
 QWEN_MAX_OUTPUT_TOKENS = 32768
 
-# API Agent 1/2: dùng pipeline riêng nhưng cùng nguyên tắc scalable + recursive split.
-API_AGENT1_CHUNK_TARGET_CHARS = 10000
-API_AGENT1_CHUNK_MAX_CHARS = 13000
-API_AGENT1_CONTEXT_CHARS = 1200
+# API pipeline: targeted scope scan + deep analysis + recursive split.
+API_AGENT1_CHUNK_TARGET_CHARS = 7200
+API_AGENT1_CHUNK_MAX_CHARS = 9000
+API_AGENT1_CONTEXT_CHARS = 900
+# V1.9.3: BA doc is scanned cheaply; PRIMARY/CONTINUATION/DEPENDENCY are routed before deep analysis.
+API_SCOPE_SCAN_CHUNK_TARGET_CHARS = 6500
+API_SCOPE_SCAN_CHUNK_MAX_CHARS = 8200
+API_SCOPE_SCAN_MAX_TOKENS = 1400
+API_SCOPE_SCAN_WORKERS = max(1, int(os.getenv("TESTPILOT_API_SCOPE_WORKERS", "2")))
+API_DEEP_MAX_OUTPUT_TOKENS = 12288
 API_AGENT1_MIN_RECURSIVE_CHARS = 2200
 API_AGENT1_MAX_RECURSION_DEPTH = 6
 API_AGENT1_API_RETRIES = 1
-# Process independent Web chunks in parallel. Set TESTPILOT_WEB_PARALLEL_WORKERS=1 if provider rate-limit is tight.
-AGENT1_PARALLEL_WORKERS = max(1, int(os.getenv("TESTPILOT_WEB_PARALLEL_WORKERS", "2")))
-
-API_AGENT2_BATCH_MAX_RULES = 16
-API_AGENT2_BATCH_MAX_INPUT_CHARS = 17000
-API_AGENT2_MAX_RECURSION_DEPTH = 6
-API_AGENT2_API_RETRIES = 1
 API_ENDPOINT_HINT_LIMIT = 8
 
 # Web Rule Matrix schema — single source of truth for prompt + validator + renderer.
@@ -104,9 +94,7 @@ WEB_TC_TITLE_MAX_CHARS = 120
 
 # Cache namespace: bump when deterministic pipeline semantics change.
 WEB_AGENT1_CACHE_NAMESPACE = "web-agent1-v3.4-senior-hybrid-validation-r1"
-WEB_AGENT2_CACHE_NAMESPACE = "web-agent2-v3.4-senior-hybrid-validation-r1"
-API_AGENT1_CACHE_NAMESPACE = "api-agent1-v3.2-r2"
-API_AGENT2_CACHE_NAMESPACE = "api-agent2-v3.2-r2"
+API_AGENT1_CACHE_NAMESPACE = "api-agent1-v3.4-targeted-api-senior-template"
 
 # ==========================================
 
@@ -129,7 +117,7 @@ def log_error(msg: str, exc: Exception = None):
     return err_msg
 
 def extract_text_from_file(uploaded_file) -> str:
-    """Read Streamlit UploadedFile without consuming its cursor; support PDF and text-like files."""
+    """Read an uploaded file without consuming its cursor; supports PDF and text-like files."""
     if uploaded_file is None:
         return ""
 
@@ -200,6 +188,7 @@ def call_qwen_max_agent_detailed(
     prompt_template: str,
     max_tokens: int = QWEN_MAX_OUTPUT_TOKENS,
     agent_name: str = "QWEN_MAX_AGENT",
+    enable_thinking: bool | None = None,
 ) -> QwenCallResult:
     """Qwen caller có metadata đầy đủ để pipeline tự xử lý length/retry/split.
 
@@ -220,13 +209,25 @@ def call_qwen_max_agent_detailed(
     )
 
     try:
-        response = client.chat.completions.create(
-            model=model,
-            messages=[{"role": "user", "content": full_prompt}],
-            temperature=0.1,
-            max_tokens=max_tokens,
-            stream=True
-        )
+        request_kwargs = {
+            "model": model,
+            "messages": [{"role": "user", "content": full_prompt}],
+            "temperature": 0.1,
+            "max_tokens": max_tokens,
+            "stream": True,
+        }
+        if enable_thinking is not None:
+            request_kwargs["extra_body"] = {"enable_thinking": bool(enable_thinking)}
+        try:
+            response = client.chat.completions.create(**request_kwargs)
+        except Exception as first_exc:
+            # Some Qwen aliases do not expose enable_thinking even though other models do.
+            # Retry transport without that optional flag instead of failing the whole job.
+            if "extra_body" not in request_kwargs:
+                raise
+            log_info(f"[{agent_name}] enable_thinking không được provider chấp nhận; retry không truyền flag.")
+            request_kwargs.pop("extra_body", None)
+            response = client.chat.completions.create(**request_kwargs)
 
         full_response = []
         chunk_count = 0
@@ -544,7 +545,7 @@ def normalize_api_rule_matrix_enums(data: dict) -> dict:
             for rule in endpoint.get("test_rules", []) if isinstance(endpoint.get("test_rules"), list) else []:
                 if not isinstance(rule, dict):
                     continue
-                for field in ("category", "rule_type", "source_document"):
+                for field in ("category", "rule_type", "source_document", "reconciliation_status"):
                     if field in rule:
                         rule[field] = str(rule.get(field, "")).strip().upper()
     return normalized
@@ -1262,11 +1263,7 @@ def run_agent1_document_pipeline(
     cache: dict | None = None,
     progress_callback=None,
 ) -> tuple[bool, dict | None, dict]:
-    """Scalable Agent 1 pipeline.
-
-    V1.7 keeps the Senior prompt/chunk semantics unchanged, but independent
-    initial chunks may be processed with a small bounded worker pool.
-    """
+    """Run the scalable Web document-analysis pipeline."""
     started = time.time()
     initial_chunks = split_document_semantic(raw_text, base_filename)
     diagnostics: list[dict] = []
@@ -1389,164 +1386,8 @@ def run_agent1_document_pipeline(
     return True, final_matrix, summary
 
 
-def split_screen_rules_for_agent2(
-    screen: dict,
-    max_rules: int = AGENT2_BATCH_MAX_RULES,
-    max_input_chars: int = AGENT2_BATCH_MAX_INPUT_CHARS,
-) -> list[dict]:
-    """Pack Web rules by Senior-style feature grouping, then internal QA category.
-
-    This is presentation-only deterministic ordering; Python does not infer QA meaning.
-    """
-    indexed_rules = list(enumerate(screen.get("test_rules", [])))
-    indexed_rules.sort(
-        key=lambda item: (
-            WEB_FEATURE_GROUP_ORDER.get(str(item[1].get("feature_group", "")).strip().upper(), 999),
-            _normalize_text(item[1].get("feature_name", "")),
-            WEB_CATEGORY_ORDER.get(str(item[1].get("category", "")).strip().upper(), 999),
-            item[0],
-        )
-    )
-    rules = [rule for _, rule in indexed_rules]
-
-    batches = []
-    current = []
-    current_chars = 0
-    for rule in rules:
-        rule_chars = len(json.dumps(rule, ensure_ascii=False))
-        if current and (len(current) >= max_rules or current_chars + rule_chars > max_input_chars):
-            batches.append({"screen_name": screen.get("screen_name", "Unnamed"), "test_rules": current})
-            current = []
-            current_chars = 0
-        current.append(rule)
-        current_chars += rule_chars
-
-    if current:
-        batches.append({"screen_name": screen.get("screen_name", "Unnamed"), "test_rules": current})
-    return batches
 
 
-def render_agent2_batch_recursive(
-    batch_screen: dict,
-    api_key: str,
-    base_url: str,
-    model: str,
-    prompt_template: str,
-    batch_id: str,
-    depth: int = 0,
-    diagnostics: list | None = None,
-    cache: dict | None = None,
-) -> tuple[bool, list[str]]:
-    diagnostics = diagnostics if diagnostics is not None else []
-    payload = json.dumps(
-        {"test_design_version": WEB_TEST_DESIGN_VERSION, "screens": [batch_screen]},
-        ensure_ascii=False,
-    )
-    key = _cache_key(WEB_AGENT2_CACHE_NAMESPACE, model, prompt_template, payload)
-    rules = batch_screen.get("test_rules", [])
-    expected_count = len(rules)
-
-    if cache is not None and key in cache:
-        cached_text = cache[key]
-        cached_count = _count_web_testcases_in_nodes(_parse_bullet_forest(cached_text))
-        if cached_count == expected_count:
-            diagnostics.append({"batch_id": batch_id, "status": "CACHE_HIT", "rules": expected_count})
-            return True, [cached_text]
-        diagnostics.append({
-            "batch_id": batch_id,
-            "status": "CACHE_INVALIDATED",
-            "rules": expected_count,
-            "rendered_testcases": cached_count,
-        })
-        cache.pop(key, None)
-
-    call_result = None
-    for attempt in range(AGENT2_API_RETRIES + 1):
-        call_result = call_qwen_max_agent_detailed(
-            content=payload,
-            api_key=api_key,
-            base_url=base_url,
-            model=model,
-            prompt_template=prompt_template,
-            max_tokens=QWEN_MAX_OUTPUT_TOKENS,
-            agent_name=f"AGENT2/{batch_id}",
-        )
-        if call_result.ok or call_result.finish_reason == "length":
-            break
-        if attempt < AGENT2_API_RETRIES:
-            log_info(f"[AGENT2/{batch_id}] Retry API {attempt + 2}/{AGENT2_API_RETRIES + 1}")
-            time.sleep(2)
-
-    assert call_result is not None
-
-    rendered_count = 0
-    if call_result.complete:
-        rendered_count = _count_web_testcases_in_nodes(_parse_bullet_forest(call_result.text))
-        if rendered_count == expected_count:
-            diagnostics.append({
-                "batch_id": batch_id,
-                "status": "OK",
-                "rules": expected_count,
-                "rendered_testcases": rendered_count,
-                "elapsed": round(call_result.elapsed, 2),
-                "output_chars": len(call_result.text),
-            })
-            if cache is not None:
-                cache[key] = call_result.text
-            return True, [call_result.text]
-
-    if call_result.finish_reason == "length":
-        failure_reason = "MAX_TOKENS"
-    elif call_result.complete:
-        failure_reason = "TC_COUNT_MISMATCH"
-        log_error(
-            f"[AGENT2/{batch_id}] Renderer count mismatch | "
-            f"Rules={expected_count} | TestCases={rendered_count}"
-        )
-    else:
-        failure_reason = call_result.error or "UNKNOWN"
-
-    can_split = (
-        len(rules) > 1
-        and depth < AGENT2_MAX_RECURSION_DEPTH
-        and (call_result.finish_reason == "length" or failure_reason == "TC_COUNT_MISMATCH")
-    )
-    diagnostics.append({
-        "batch_id": batch_id,
-        "status": "SPLIT_RETRY" if can_split else "FAILED",
-        "reason": failure_reason,
-        "rules": expected_count,
-        "rendered_testcases": rendered_count,
-        "output_chars": len(call_result.text),
-    })
-
-    if not can_split:
-        return False, []
-
-    mid = max(1, len(rules) // 2)
-    outputs = []
-    for idx, child_rules in enumerate((rules[:mid], rules[mid:]), start=1):
-        if not child_rules:
-            continue
-        child_screen = {
-            "screen_name": batch_screen.get("screen_name", "Unnamed"),
-            "test_rules": child_rules,
-        }
-        ok, child_outputs = render_agent2_batch_recursive(
-            batch_screen=child_screen,
-            api_key=api_key,
-            base_url=base_url,
-            model=model,
-            prompt_template=prompt_template,
-            batch_id=f"{batch_id}.{idx}",
-            depth=depth + 1,
-            diagnostics=diagnostics,
-            cache=cache,
-        )
-        if not ok:
-            return False, []
-        outputs.extend(child_outputs)
-    return True, outputs
 
 
 def _parse_bullet_forest(text: str) -> list[dict]:
@@ -1578,196 +1419,20 @@ def _parse_bullet_forest(text: str) -> list[dict]:
     return root["children"]
 
 
-def _merge_bullet_nodes(target_children: list[dict], incoming: list[dict], depth: int = 0):
-    """Merge cùng Screen/FeatureGroup/FeatureName ở 3 level đầu; từ testcase trở xuống luôn append."""
-    if depth >= 3:
-        target_children.extend(copy.deepcopy(incoming))
-        return
-
-    index = {_normalize_text(node.get("title")): node for node in target_children}
-    for node in incoming:
-        key = _normalize_text(node.get("title"))
-        if key in index:
-            _merge_bullet_nodes(index[key]["children"], node.get("children", []), depth + 1)
-        else:
-            cloned = copy.deepcopy(node)
-            target_children.append(cloned)
-            index[key] = cloned
 
 
-def _renumber_testcases_in_nodes(nodes: list[dict]) -> int:
-    counter = 0
-
-    def walk(children):
-        nonlocal counter
-        for node in children:
-            title = node.get("title", "")
-            if re.match(r"^TC[_\- ]?\d+\s*[-:]", title, flags=re.IGNORECASE):
-                counter += 1
-                normalized_title = re.sub(
-                    r"^TC[_\- ]?\d+",
-                    f"TC_{counter:03d}",
-                    title,
-                    count=1,
-                    flags=re.IGNORECASE,
-                )
-                if len(normalized_title) > WEB_TC_TITLE_MAX_CHARS:
-                    normalized_title = normalized_title[:WEB_TC_TITLE_MAX_CHARS - 1].rstrip(" -:;,.") + "…"
-                node["title"] = normalized_title
-            walk(node.get("children", []))
-
-    walk(nodes)
-    return counter
 
 
-def _serialize_bullet_nodes(nodes: list[dict], depth: int = 0) -> list[str]:
-    """Serialize tree while keeping multiline node content on one physical tree line."""
-    lines = []
-    for node in nodes:
-        title = str(node.get("title", "")).replace("\r\n", "\n").replace("\r", "\n")
-        title = title.replace("\n", "\\n").strip()
-        lines.append("  " * depth + "- " + title)
-        lines.extend(_serialize_bullet_nodes(node.get("children", []), depth + 1))
-    return lines
 
 
-def _sort_numbered_category_nodes(nodes: list[dict]) -> None:
-    """Deterministically order numbered category siblings (1., 2., ...), recursively."""
-    def category_number(node: dict):
-        m = re.match(r"^(\d+)\.\s*", str(node.get("title", "")).strip())
-        return int(m.group(1)) if m else None
-
-    def walk(node: dict):
-        children = node.get("children", [])
-        if children:
-            numbered = [c for c in children if category_number(c) is not None]
-            if numbered:
-                unnumbered = [c for c in children if category_number(c) is None]
-                children[:] = sorted(numbered, key=category_number) + unnumbered
-            for child in children:
-                walk(child)
-
-    root = {"children": nodes}
-    walk(root)
 
 
-def _count_web_testcases_in_nodes(nodes: list[dict]) -> int:
-    pattern = re.compile(r"^TC[_\- ]?\d+\s*[-:]", flags=re.IGNORECASE)
-    total = 0
-    stack = list(nodes)
-    while stack:
-        node = stack.pop()
-        if pattern.match(str(node.get("title", ""))):
-            total += 1
-        stack.extend(node.get("children", []))
-    return total
 
 
-def _count_api_testcases_in_nodes(nodes: list[dict]) -> int:
-    pattern = re.compile(r"^TC_API[_\- ]?\d+\s*[-:]", flags=re.IGNORECASE)
-    total = 0
-    stack = list(nodes)
-    while stack:
-        node = stack.pop()
-        if pattern.match(str(node.get("title", ""))):
-            total += 1
-        stack.extend(node.get("children", []))
-    return total
 
 
-def merge_agent2_tree_outputs(outputs: list[str]) -> tuple[str, dict]:
-    merged_nodes = []
-    for output in outputs:
-        forest = _parse_bullet_forest(output)
-        _merge_bullet_nodes(merged_nodes, forest, depth=0)
-    _sort_numbered_category_nodes(merged_nodes)
-    tc_count = _renumber_testcases_in_nodes(merged_nodes)
-    merged_text = "\n".join(_serialize_bullet_nodes(merged_nodes)).strip()
-    return merged_text, {"agent2_leaf_outputs": len(outputs), "testcases_renumbered": tc_count}
 
 
-def run_agent2_rule_matrix_pipeline(
-    approved_screens: list[dict],
-    api_key: str,
-    base_url: str,
-    model: str,
-    prompt_template: str,
-    cache: dict | None = None,
-    progress_callback=None,
-) -> tuple[bool, str, dict]:
-    """Render Web Rule Matrix in bounded batches and enforce Rule-count == TC-count."""
-    started = time.time()
-    initial_batches = []
-    for screen_idx, screen in enumerate(approved_screens, start=1):
-        for batch_idx, batch in enumerate(split_screen_rules_for_agent2(screen), start=1):
-            initial_batches.append((f"S{screen_idx:02d}B{batch_idx:02d}", batch))
-
-    diagnostics = []
-    outputs = []
-    expected_rules = sum(len(s.get("test_rules", [])) for s in approved_screens)
-
-    log_info(
-        f"[AGENT2_PIPELINE] Screens={len(approved_screens)} | "
-        f"InitialBatches={len(initial_batches)} | Rules={expected_rules}"
-    )
-
-    for idx, (batch_id, batch) in enumerate(initial_batches, start=1):
-        if progress_callback:
-            progress_callback(
-                idx - 1,
-                len(initial_batches),
-                f"Agent 2 đang render batch {idx}/{len(initial_batches)} — "
-                f"{batch.get('screen_name')} ({len(batch.get('test_rules', []))} rules)",
-            )
-        ok, batch_outputs = render_agent2_batch_recursive(
-            batch_screen=batch,
-            api_key=api_key,
-            base_url=base_url,
-            model=model,
-            prompt_template=prompt_template,
-            batch_id=batch_id,
-            diagnostics=diagnostics,
-            cache=cache,
-        )
-        if not ok:
-            return False, "", {
-                "ok": False,
-                "initial_batches": len(initial_batches),
-                "expected_rules": expected_rules,
-                "elapsed": round(time.time() - started, 2),
-                "diagnostics": diagnostics,
-            }
-        outputs.extend(batch_outputs)
-        if progress_callback:
-            progress_callback(idx, len(initial_batches), f"Hoàn tất batch {idx}/{len(initial_batches)}")
-
-    merged_text, merge_stats = merge_agent2_tree_outputs(outputs)
-    actual_testcases = merge_stats["testcases_renumbered"]
-    count_ok = actual_testcases == expected_rules
-    summary = {
-        "ok": count_ok,
-        "initial_batches": len(initial_batches),
-        "expected_rules": expected_rules,
-        "elapsed": round(time.time() - started, 2),
-        "merge": merge_stats,
-        "diagnostics": diagnostics,
-    }
-
-    if not count_ok:
-        summary["count_mismatch"] = {
-            "rules": expected_rules,
-            "testcases": actual_testcases,
-        }
-        log_error(
-            f"[AGENT2_PIPELINE] Count invariant failed | Rules={expected_rules} | TestCases={actual_testcases}"
-        )
-        return False, "", summary
-
-    log_info(
-        f"[AGENT2_PIPELINE] Completed | Time={summary['elapsed']:.2f}s | "
-        f"LeafOutputs={merge_stats['agent2_leaf_outputs']} | TestCases={actual_testcases}"
-    )
-    return True, merged_text, summary
 
 
 def create_xmind_from_text(tree_data: str, output_path: str, root_title: str = "Kế hoạch & Kịch bản Kiểm thử"):
@@ -2178,31 +1843,30 @@ def convert_tree_to_ui_excel(tree_text: str) -> bytes:
 
 
 # ==========================================
-# 2.2 PIPELINE API V3.2 — CONTRACT QA BRAIN / LONG DOCUMENT
+# 2.2 PIPELINE API V3.3 — SENIOR TEMPLATE / STRUCTURED TESTCASE DESIGN / MULTI-DOC
 # ==========================================
 
 API_RULE_FIELDS = {
     "rule_id", "target", "category", "rule_type", "rule_name",
-    "test_objective", "test_condition", "expected_result",
-    "source_requirement", "source_document", "applied_qa_rule", "generation_reason"
+    "test_objective", "test_condition", "precondition", "test_data",
+    "expected_http_code", "expected_status", "expected_code", "expected_message",
+    "expected_trace_id", "expected_data_body", "business_result",
+    "source_requirement", "source_document", "reconciliation_status",
+    "applied_qa_rule", "generation_reason"
 }
 API_ALLOWED_CATEGORIES = {
-    "AUTHENTICATION", "AUTHORIZATION", "METHOD_URL", "REQUEST_VALIDATION",
-    "HAPPY_PATH", "BUSINESS_RULE", "RESPONSE_VALIDATION", "INTEGRATION", "EXCEPTION"
+    "AUTH", "PERMISSION", "VALIDATION", "HAPPY_PATH", "BUSINESS_RULE"
 }
 API_CATEGORY_ORDER = {
-    "AUTHENTICATION": 1,
-    "AUTHORIZATION": 2,
-    "METHOD_URL": 3,
-    "REQUEST_VALIDATION": 4,
-    "HAPPY_PATH": 5,
-    "BUSINESS_RULE": 6,
-    "RESPONSE_VALIDATION": 7,
-    "INTEGRATION": 8,
-    "EXCEPTION": 9,
+    "AUTH": 1,
+    "PERMISSION": 2,
+    "VALIDATION": 3,
+    "HAPPY_PATH": 4,
+    "BUSINESS_RULE": 5,
 }
 API_ALLOWED_RULE_TYPES = {"EXPLICIT", "DERIVED"}
 API_ALLOWED_SOURCE_DOCUMENTS = {"API_SPEC", "BA", "BOTH"}
+API_ALLOWED_RECONCILIATION_STATUSES = {"CONSISTENT", "COMPLEMENTARY", "CONFLICT", "DOC_ONLY", "DERIVED"}
 API_HTTP_METHODS = {"GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS", "UNMAPPED"}
 
 
@@ -2240,6 +1904,14 @@ def extract_api_endpoint_index(design_text: str) -> list[dict]:
             return
         key = (method, _normalize_text(path))
         if key in seen:
+            # Later text patterns may provide a human-readable title/description.
+            for existing in results:
+                if (existing.get("method"), _normalize_text(existing.get("path"))) == key:
+                    if not str(existing.get("summary", "")).strip() and str(summary or "").strip():
+                        existing["summary"] = str(summary or "").strip()
+                    if not str(existing.get("module", "")).strip() and str(module or "").strip():
+                        existing["module"] = str(module or "").strip()
+                    break
             return
         seen.add(key)
         results.append({
@@ -2309,6 +1981,28 @@ def extract_api_endpoint_index(design_text: str) -> list[dict]:
         if mm:
             add(mm.group(1), path)
 
+    # Human-readable API design docs often use "Endpoint: /..." + "Method: POST".
+    text = design_text or ""
+    for m in re.finditer(r'(?im)\bEndpoint\s*[:：]\s*([/][^\s|`\"\']+)', text):
+        path = m.group(1).strip().rstrip('.,;)')
+        window = text[max(0, m.start()-500):min(len(text), m.end()+900)]
+        mm = re.search(r'(?im)\bMethod\s*[:：]\s*(GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS)\b', window)
+        if mm:
+            # Nearby heading/description is useful for BA scope routing.
+            desc = ''
+            dm = re.search(r'(?im)\b(?:Mô tả|Description)\s*[:：]\s*(.+)', window)
+            if dm:
+                desc = dm.group(1).strip()[:240]
+            add(mm.group(1), path, desc)
+
+    # Also support a title beginning with /path followed by Method later in the section.
+    for m in re.finditer(r'(?im)^\s*([/][^\s:]+)\s*:\s*(.+)$', text):
+        path = m.group(1).strip()
+        tail = text[m.end():m.end()+1200]
+        mm = re.search(r'(?im)\bMethod\s*[:：]\s*(GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS)\b', tail)
+        if mm:
+            add(mm.group(1), path, m.group(2).strip()[:240])
+
     return results
 
 
@@ -2348,6 +2042,208 @@ def select_api_endpoint_hints(chunk_text: str, endpoint_index: list[dict], limit
     return [copy.deepcopy(ep) for _, ep in scored[:limit]]
 
 
+
+def _api_endpoint_key(ep: dict) -> tuple[str, str]:
+    return (str(ep.get("method", "UNMAPPED")).upper().strip(), str(ep.get("path") or ep.get("endpoint_path") or "UNMAPPED").strip())
+
+
+def extract_target_api_excerpt(design_text: str, endpoint: dict, radius: int = 3200) -> str:
+    """Small source excerpt around a target endpoint; used for routing, not testcase generation."""
+    text = design_text or ""
+    path = str(endpoint.get("path") or endpoint.get("endpoint_path") or "").strip()
+    if not text:
+        return ""
+    pos = text.find(path) if path and path != "UNMAPPED" else -1
+    if pos < 0:
+        # API design files are usually short; cap fallback so BA routing stays cheap.
+        return text[: min(len(text), radius * 2)]
+    start = max(0, pos - radius)
+    end = min(len(text), pos + len(path) + radius)
+    return text[start:end].strip()
+
+
+def build_target_api_descriptors(design_text: str, endpoint_index: list[dict]) -> list[dict]:
+    targets = []
+    for ep in endpoint_index:
+        targets.append({
+            "method": str(ep.get("method", "UNMAPPED")).upper().strip() or "UNMAPPED",
+            "endpoint_path": str(ep.get("path", "")).strip() or "UNMAPPED",
+            "summary": str(ep.get("summary", "")).strip(),
+            "module": str(ep.get("module", "")).strip(),
+            "spec_excerpt": extract_target_api_excerpt(design_text, ep),
+        })
+    if not targets:
+        # Keep pipeline usable for informal specs without a parseable endpoint.
+        targets.append({
+            "method": "UNMAPPED",
+            "endpoint_path": "UNMAPPED",
+            "summary": "API được mô tả trong API Design/Spec",
+            "module": "",
+            "spec_excerpt": (design_text or "")[:6400],
+        })
+    return targets
+
+
+def build_api_scope_router_payload(ba_chunk: dict, targets: list[dict]) -> str:
+    compact_targets = []
+    for target in targets:
+        compact_targets.append({
+            "method": target.get("method", "UNMAPPED"),
+            "endpoint_path": target.get("endpoint_path", "UNMAPPED"),
+            "summary": target.get("summary", ""),
+            "spec_excerpt": target.get("spec_excerpt", "")[:5000],
+        })
+    return f"""=== TARGET API(S) FROM API DESIGN / SPEC ===
+{json.dumps(compact_targets, ensure_ascii=False, indent=2)}
+
+=== BA CHUNK METADATA ===
+chunk_id: {ba_chunk.get('chunk_id')}
+section_hint: {ba_chunk.get('title')}
+
+=== BA CURRENT SOURCE ===
+{ba_chunk.get('core_text', '')}
+"""
+
+
+def fallback_route_ba_chunk_by_spec_overlap(ba_chunk: dict, targets: list[dict], min_overlap: int = 4) -> list[dict]:
+    """Conservative lexical fallback when the scope-router call fails.
+
+    Uses target API spec excerpt rather than endpoint path alone, so human BA docs can
+    still match on business terms such as duyệt/workflow/ngày hiệu lực.
+    """
+    chunk_tokens = _tokenize_for_api_hint(ba_chunk.get("core_text", ""))
+    generic = {
+        "thong", "giao", "dich", "system", "server", "client", "user",
+        "api", "service", "request", "response", "thanh", "cong", "khong",
+    }
+    chunk_tokens = {t for t in chunk_tokens if t not in generic}
+    matches = []
+    for target in targets:
+        spec_tokens = _tokenize_for_api_hint(" ".join([
+            str(target.get("summary", "")), str(target.get("spec_excerpt", ""))[:6000]
+        ]))
+        spec_tokens = {t for t in spec_tokens if t not in generic}
+        overlap = len(chunk_tokens & spec_tokens)
+        if overlap >= min_overlap:
+            matches.append({
+                "method": target.get("method", "UNMAPPED"),
+                "endpoint_path": target.get("endpoint_path", "UNMAPPED"),
+                "summary": target.get("summary", ""),
+                "confidence": min(0.75, 0.35 + overlap / 40.0),
+                "reason": f"lexical spec overlap={overlap}",
+            })
+    return matches
+
+
+def _normalize_scope_role(value: str) -> str:
+    role = str(value or "").strip().upper()
+    if role in {"PRIMARY", "CONTINUATION", "DEPENDENCY", "OUT_OF_SCOPE"}:
+        return role
+    return "OUT_OF_SCOPE"
+
+
+def _build_continuation_target(primary_target: dict, match: dict) -> dict:
+    """Build a stable target descriptor for a continuation API without inventing its contract.
+
+    Exact method/path are kept only when the router extracted them from the BA source.
+    Unknown identifiers remain UNMAPPED while summary carries the BA operation name so
+    the testcase workspace can still be separated from the primary API.
+    """
+    name = str(match.get("related_api_name") or "API tiếp nối").strip() or "API tiếp nối"
+    method = str(match.get("related_method") or "UNMAPPED").upper().strip() or "UNMAPPED"
+    path = str(match.get("related_endpoint_path") or "UNMAPPED").strip() or "UNMAPPED"
+    if not path.startswith("/") and path != "UNMAPPED":
+        # A non-path phrase is not an endpoint contract. Keep it only as the summary.
+        path = "UNMAPPED"
+    return {
+        "method": method,
+        "endpoint_path": path,
+        "summary": name,
+        "module": str(primary_target.get("module") or "").strip(),
+        "spec_excerpt": "",
+        "scope_role": "CONTINUATION",
+        "parent_method": primary_target.get("method", "UNMAPPED"),
+        "parent_endpoint_path": primary_target.get("endpoint_path", "UNMAPPED"),
+    }
+
+
+def route_ba_chunk_to_target_apis(
+    ba_chunk: dict,
+    targets: list[dict],
+    api_key: str,
+    base_url: str,
+    model: str,
+    cache: dict | None = None,
+) -> tuple[bool, list[dict], dict]:
+    """Cheap scope scan only; no testcase generation.
+
+    V1.9.3 keeps PRIMARY and required CONTINUATION operations, preserves supporting
+    DEPENDENCY context under the primary API, and skips OUT_OF_SCOPE sibling flows.
+    """
+    payload = build_api_scope_router_payload(ba_chunk, targets)
+    cache_key = _cache_key("api-scope-router-v1.9.3-continuation", model, PROMPT_API_SCOPE_ROUTER, payload)
+    if cache is not None and cache_key in cache:
+        result = copy.deepcopy(cache[cache_key])
+        return True, result.get("matches", []), {"status": "CACHE_HIT", "chunk_id": ba_chunk.get("chunk_id")}
+
+    call = call_qwen_max_agent_detailed(
+        content=payload,
+        api_key=api_key,
+        base_url=base_url,
+        model=model,
+        prompt_template=PROMPT_API_SCOPE_ROUTER,
+        max_tokens=API_SCOPE_SCAN_MAX_TOKENS,
+        agent_name=f"API_SCOPE/{ba_chunk.get('chunk_id')}",
+        enable_thinking=False,
+    )
+    if not call.ok:
+        return False, [], {"status": "API_FAILED", "chunk_id": ba_chunk.get("chunk_id"), "error": call.error}
+    ok, parsed, diag = extract_json_from_model_response(call.text)
+    if not ok or not isinstance(parsed, dict):
+        return False, [], {"status": "PARSE_FAILED", "chunk_id": ba_chunk.get("chunk_id"), "diag": diag}
+
+    raw_matches = parsed.get("matches") if isinstance(parsed.get("matches"), list) else []
+    target_keys = {_api_endpoint_key(t): t for t in targets}
+    matches = []
+    for item in raw_matches:
+        if not isinstance(item, dict):
+            continue
+        method = str(item.get("method", "UNMAPPED")).upper().strip() or "UNMAPPED"
+        path = str(item.get("endpoint_path", "UNMAPPED")).strip() or "UNMAPPED"
+        target = target_keys.get((method, path))
+        if target is None and len(targets) == 1:
+            # Single primary spec is unambiguous even if the small router slightly drifts identifiers.
+            target = targets[0]
+            method, path = _api_endpoint_key(target)
+        if target is None:
+            continue
+
+        role = _normalize_scope_role(item.get("scope_role"))
+
+        match = {
+            "method": method,
+            "endpoint_path": path,
+            "summary": target.get("summary", ""),
+            "scope_role": role,
+            "related_api_name": str(item.get("related_api_name") or "").strip(),
+            "related_method": str(item.get("related_method") or "UNMAPPED").upper().strip() or "UNMAPPED",
+            "related_endpoint_path": str(item.get("related_endpoint_path") or "UNMAPPED").strip() or "UNMAPPED",
+            "confidence": float(item.get("confidence") or 0),
+            "reason": str(item.get("reason") or "").strip(),
+        }
+        matches.append(match)
+
+    result = {"matches": matches}
+    if cache is not None:
+        cache[cache_key] = copy.deepcopy(result)
+    role_counts = {}
+    for match in matches:
+        role_counts[match.get("scope_role", "OUT_OF_SCOPE")] = role_counts.get(match.get("scope_role", "OUT_OF_SCOPE"), 0) + 1
+    return True, matches, {
+        "status": "OK", "chunk_id": ba_chunk.get("chunk_id"),
+        "elapsed": round(call.elapsed, 2), "role_counts": role_counts,
+    }
+
 def build_api_combined_source(design_text: str, ba_text: str) -> str:
     parts = []
     if design_text and design_text.strip():
@@ -2357,10 +2253,34 @@ def build_api_combined_source(design_text: str, ba_text: str) -> str:
     return "\n\n".join(parts).strip()
 
 
-def build_api_agent1_chunk_payload(chunk: dict, endpoint_index: list[dict]) -> str:
+def build_api_agent1_chunk_payload(
+    chunk: dict,
+    endpoint_index: list[dict],
+    *,
+    source_document: str = "API_SPEC",
+    target_endpoint: dict | None = None,
+) -> str:
     hints = select_api_endpoint_hints(chunk.get("core_text", ""), endpoint_index)
     hint_text = json.dumps(hints, ensure_ascii=False, indent=2) if hints else "[]"
-    return f"""=== CHUNK METADATA — KHÔNG PHẢI REQUIREMENT ===
+    target = target_endpoint or {}
+    target_text = json.dumps({
+        "method": target.get("method", "UNMAPPED"),
+        "endpoint_path": target.get("endpoint_path") or target.get("path") or "UNMAPPED",
+        "summary": target.get("summary", ""),
+    }, ensure_ascii=False, indent=2)
+    return f"""=== FORCED ANALYSIS SCOPE — MANDATORY ===
+source_document: {source_document}
+TARGET API:
+{target_text}
+
+Rules for this call:
+- Generate rules ONLY for TARGET API / operation shown above.
+- Ignore sibling APIs/operations that are NOT the TARGET. If TARGET itself is a continuation such as Confirm Approval, analyze that continuation normally.
+- source_document of every generated rule MUST be exactly {source_document}.
+- If TARGET has an exact method/path, do not infer another endpoint from nearby BA text.
+- If TARGET endpoint_path is UNMAPPED, NEVER invent a URL. Use TARGET summary to identify the operation and keep method/path UNMAPPED unless the current source explicitly states them.
+
+=== CHUNK METADATA — KHÔNG PHẢI REQUIREMENT ===
 chunk_id: {chunk.get('chunk_id')}
 source_section_hint: {chunk.get('title')}
 chunk_depth: {chunk.get('depth', 0)}
@@ -2377,6 +2297,31 @@ chunk_depth: {chunk.get('depth', 0)}
 === NEXT CONTEXT — CHỈ DÙNG ĐỂ HIỂU, KHÔNG SINH RULE CHỈ TỪ ĐOẠN NÀY ===
 {chunk.get('next_context', '')}
 """
+
+
+
+def force_api_matrix_scope(data: dict, *, source_document: str, target_endpoint: dict | None) -> dict:
+    """Deterministically enforce scope metadata after LLM extraction."""
+    if not isinstance(data, dict):
+        return data
+    target_endpoint = target_endpoint or {}
+    method = str(target_endpoint.get("method", "UNMAPPED")).upper().strip() or "UNMAPPED"
+    path = str(target_endpoint.get("endpoint_path") or target_endpoint.get("path") or "UNMAPPED").strip() or "UNMAPPED"
+    summary = str(target_endpoint.get("summary", "")).strip()
+    source_document = "BA" if str(source_document).upper() == "BA" else "API_SPEC"
+    for module in data.get("api_modules", []) if isinstance(data.get("api_modules"), list) else []:
+        for ep in module.get("endpoints", []) if isinstance(module.get("endpoints"), list) else []:
+            ep["method"] = method
+            ep["endpoint_path"] = path
+            if summary and not str(ep.get("summary", "")).strip():
+                ep["summary"] = summary
+            for rule in ep.get("test_rules", []) if isinstance(ep.get("test_rules"), list) else []:
+                rule["source_document"] = source_document
+                if str(rule.get("rule_type", "")).upper() == "DERIVED":
+                    rule["reconciliation_status"] = "DERIVED"
+                else:
+                    rule["reconciliation_status"] = "DOC_ONLY"
+    return data
 
 
 def validate_api_rule_matrix_schema(data, strict: bool = False) -> tuple[bool, str]:
@@ -2421,12 +2366,15 @@ def validate_api_rule_matrix_schema(data, strict: bool = False) -> tuple[bool, s
                 category = str(rule.get("category", "")).upper().strip()
                 rule_type = str(rule.get("rule_type", "")).upper().strip()
                 source_document = str(rule.get("source_document", "")).upper().strip()
+                reconciliation_status = str(rule.get("reconciliation_status", "")).upper().strip()
                 if category not in API_ALLOWED_CATEGORIES:
                     return False, f"Rule {midx}.{eidx}.{ridx} category không hợp lệ: {category!r}"
                 if rule_type not in API_ALLOWED_RULE_TYPES:
                     return False, f"Rule {midx}.{eidx}.{ridx} rule_type không hợp lệ: {rule_type!r}"
                 if source_document not in API_ALLOWED_SOURCE_DOCUMENTS:
                     return False, f"Rule {midx}.{eidx}.{ridx} source_document không hợp lệ: {source_document!r}"
+                if reconciliation_status not in API_ALLOWED_RECONCILIATION_STATUSES:
+                    return False, f"Rule {midx}.{eidx}.{ridx} reconciliation_status không hợp lệ: {reconciliation_status!r}"
                 if strict:
                     for field in API_RULE_FIELDS:
                         if not isinstance(rule.get(field), str):
@@ -2452,9 +2400,39 @@ def _api_rule_signature(rule: dict) -> tuple:
         _normalize_text(rule.get("rule_type")),
         _normalize_text(rule.get("rule_name")),
         _normalize_text(rule.get("test_condition")),
-        _normalize_text(rule.get("expected_result")),
+        _normalize_text(rule.get("expected_http_code")),
+        _normalize_text(rule.get("expected_status")),
+        _normalize_text(rule.get("expected_code")),
+        _normalize_text(rule.get("expected_message")),
+        _normalize_text(rule.get("expected_data_body")),
+        _normalize_text(rule.get("business_result")),
         _normalize_text(rule.get("applied_qa_rule")),
     )
+
+
+def _api_rule_concept_signature(rule: dict) -> tuple:
+    """Logical identity used to reconcile the same rule across multiple documents."""
+    return (
+        _normalize_text(rule.get("target")),
+        _normalize_text(rule.get("category")),
+        _normalize_text(rule.get("rule_name")),
+        _normalize_text(rule.get("test_condition")),
+        _normalize_text(rule.get("applied_qa_rule")),
+    )
+
+
+def _api_rules_have_contract_conflict(a: dict, b: dict) -> bool:
+    """Conservative conflict detection: only exact contract/result fields can conflict.
+
+    Longer business_result prose is not compared because two docs often describe the
+    same outcome at different levels of detail.
+    """
+    for fld in ("expected_http_code", "expected_status", "expected_code", "expected_message"):
+        av = str(a.get(fld, "")).strip()
+        bv = str(b.get(fld, "")).strip()
+        if av and bv and _normalize_text(av) != _normalize_text(bv):
+            return True
+    return False
 
 
 def _merge_api_source_document(a: str, b: str) -> str:
@@ -2468,78 +2446,123 @@ def _merge_api_source_document(a: str, b: str) -> str:
     return aa or bb or "API_SPEC"
 
 
+def _merge_api_reconciliation_status(a: str, b: str, merged_source: str) -> str:
+    aa, bb = str(a or "").upper().strip(), str(b or "").upper().strip()
+    if "CONFLICT" in {aa, bb}:
+        return "CONFLICT"
+    if "DERIVED" in {aa, bb}:
+        return "DERIVED"
+    if merged_source == "BOTH":
+        if aa == bb == "CONSISTENT":
+            return "CONSISTENT"
+        return "COMPLEMENTARY"
+    return aa or bb or "DOC_ONLY"
+
+
 def merge_api_rule_matrices(matrices: list[dict]) -> tuple[dict, dict]:
-    """Merge Python-only theo module + METHOD + endpoint_path, dedup bảo thủ và renumber."""
-    modules_map: OrderedDict[str, dict] = OrderedDict()
-    seen_rule_map = {}
+    """Merge by TARGET ENDPOINT first, not by AI-generated module label.
+
+    V1.9.3 intentionally ignores module-name drift between API Spec and BA. The same
+    method+path is one logical API and must reconcile into one endpoint workspace.
+    """
+    endpoints_map: OrderedDict[tuple, dict] = OrderedDict()
+    concept_maps: dict[tuple, dict] = {}
     raw_rules = 0
     duplicates = 0
+    conflicts = 0
 
     for matrix in matrices:
         for module in matrix.get("api_modules", []):
-            module_name = str(module.get("module_name", "")).strip() or "UNMAPPED"
-            mkey = _normalize_text(module_name)
-            if mkey not in modules_map:
-                modules_map[mkey] = {"module_name": module_name, "endpoints": OrderedDict()}
-            endpoint_map = modules_map[mkey]["endpoints"]
-
+            module_name = str(module.get("module_name", "")).strip() or "Target API"
             for ep in module.get("endpoints", []):
                 method = str(ep.get("method", "UNMAPPED")).upper().strip() or "UNMAPPED"
                 path = str(ep.get("endpoint_path", "UNMAPPED")).strip() or "UNMAPPED"
-                ekey = (method, _normalize_text(path))
-                if ekey not in endpoint_map:
-                    endpoint_map[ekey] = {
+                summary_text = str(ep.get("summary", "")).strip()
+                # Continuation APIs may be named by BA without exposing an exact endpoint path.
+                # Keep distinct UNMAPPED operations separated by summary rather than collapsing them.
+                if path == "UNMAPPED":
+                    ekey = (method, "UNMAPPED::" + _normalize_text(summary_text or module_name))
+                else:
+                    ekey = (method, _normalize_text(path))
+                if ekey not in endpoints_map:
+                    endpoints_map[ekey] = {
+                        "module_name": module_name,
                         "method": method,
                         "endpoint_path": path,
                         "summary": str(ep.get("summary", "")).strip(),
                         "test_rules": [],
                     }
-                    seen_rule_map[(mkey, ekey)] = {}
-                target_ep = endpoint_map[ekey]
+                    concept_maps[ekey] = {}
+                target_ep = endpoints_map[ekey]
                 if not target_ep.get("summary") and ep.get("summary"):
                     target_ep["summary"] = str(ep.get("summary", "")).strip()
+                if target_ep.get("module_name") in {"Target API", "UNMAPPED"} and module_name not in {"Target API", "UNMAPPED"}:
+                    target_ep["module_name"] = module_name
 
-                sig_map = seen_rule_map[(mkey, ekey)]
-                for rule in ep.get("test_rules", []):
+                concept_map = concept_maps[ekey]
+                for incoming in ep.get("test_rules", []):
                     raw_rules += 1
-                    sig = _api_rule_signature(rule)
-                    if sig in sig_map:
+                    rule = copy.deepcopy(incoming)
+                    concept = _api_rule_concept_signature(rule)
+                    if concept in concept_map:
+                        existing_idx = concept_map[concept]
+                        existing = target_ep["test_rules"][existing_idx]
+                        if _api_rules_have_contract_conflict(existing, rule):
+                            conflicts += 1
+                            existing["reconciliation_status"] = "CONFLICT"
+                            rule["reconciliation_status"] = "CONFLICT"
+                            target_ep["test_rules"].append(rule)
+                            continue
+
                         duplicates += 1
-                        existing = target_ep["test_rules"][sig_map[sig]]
-                        existing["source_document"] = _merge_api_source_document(existing.get("source_document"), rule.get("source_document"))
+                        merged_source = _merge_api_source_document(existing.get("source_document"), rule.get("source_document"))
+                        existing["source_document"] = merged_source
+                        existing["reconciliation_status"] = _merge_api_reconciliation_status(
+                            existing.get("reconciliation_status"), rule.get("reconciliation_status"), merged_source
+                        )
                         old_src = str(existing.get("source_requirement", "")).strip()
                         new_src = str(rule.get("source_requirement", "")).strip()
                         if new_src and _normalize_text(new_src) != _normalize_text(old_src):
                             existing["source_requirement"] = (old_src + " | " + new_src).strip(" |")
+                        for fld in (
+                            "precondition", "test_data", "expected_http_code", "expected_status",
+                            "expected_code", "expected_message", "expected_trace_id",
+                            "expected_data_body", "business_result", "generation_reason",
+                        ):
+                            if not str(existing.get(fld, "")).strip() and str(rule.get(fld, "")).strip():
+                                existing[fld] = rule.get(fld, "")
                         continue
-                    sig_map[sig] = len(target_ep["test_rules"])
-                    target_ep["test_rules"].append(copy.deepcopy(rule))
+
+                    concept_map[concept] = len(target_ep["test_rules"])
+                    target_ep["test_rules"].append(rule)
 
     final_modules = []
     global_rule_counter = 0
     unmapped_endpoints = 0
-    for m_idx, module in enumerate(modules_map.values(), start=1):
-        endpoints = list(module["endpoints"].values())
-        for e_idx, ep in enumerate(endpoints, start=1):
-            if ep.get("method") == "UNMAPPED" or ep.get("endpoint_path") == "UNMAPPED":
-                unmapped_endpoints += 1
-            method = ep.get("method", "API")
-            slug = unicodedata.normalize("NFKD", ep.get("endpoint_path", "API")).encode("ascii", "ignore").decode("ascii")
-            slug = re.sub(r"[^A-Za-z0-9]+", "_", slug).strip("_").upper()[-28:] or f"EP{e_idx:02d}"
-            prefix = f"API_{method}_{slug}" if method != "UNMAPPED" else f"API_UNMAPPED_{m_idx:02d}_{e_idx:02d}"
-            for local_idx, rule in enumerate(ep.get("test_rules", []), start=1):
-                global_rule_counter += 1
-                rule["rule_id"] = f"{prefix}-{local_idx:03d}"
-        final_modules.append({"module_name": module["module_name"], "endpoints": endpoints})
+    for e_idx, ep_data in enumerate(endpoints_map.values(), start=1):
+        if ep_data.get("method") == "UNMAPPED" or ep_data.get("endpoint_path") == "UNMAPPED":
+            unmapped_endpoints += 1
+        method = ep_data.get("method", "API")
+        slug = unicodedata.normalize("NFKD", ep_data.get("endpoint_path", "API")).encode("ascii", "ignore").decode("ascii")
+        slug = re.sub(r"[^A-Za-z0-9]+", "_", slug).strip("_").upper()[-28:] or f"EP{e_idx:02d}"
+        prefix = f"API_{method}_{slug}" if method != "UNMAPPED" else f"API_UNMAPPED_{e_idx:02d}"
+        for local_idx, rule in enumerate(ep_data.get("test_rules", []), start=1):
+            global_rule_counter += 1
+            rule["rule_id"] = f"{prefix}-{local_idx:03d}"
+        final_modules.append({
+            "module_name": ep_data.pop("module_name", "Target API"),
+            "endpoints": [ep_data],
+        })
 
-    final = {"api_test_design_version": "3.2", "api_modules": final_modules}
+    final = {"api_test_design_version": "3.3", "api_modules": final_modules}
     stats = {
         "input_matrices": len(matrices),
         "modules": len(final_modules),
-        "endpoints": sum(len(m.get("endpoints", [])) for m in final_modules),
+        "endpoints": len(endpoints_map),
         "unmapped_endpoints": unmapped_endpoints,
         "raw_rules": raw_rules,
         "duplicates_removed": duplicates,
+        "conflicts_detected": conflicts,
         "final_rules": global_rule_counter,
     }
     return final, stats
@@ -2595,9 +2618,13 @@ def process_api_agent1_chunk_recursive(
     prompt_template: str,
     cache: dict | None = None,
     diagnostics: list | None = None,
+    source_document: str = "API_SPEC",
+    target_endpoint: dict | None = None,
 ) -> tuple[bool, list[dict]]:
     diagnostics = diagnostics if diagnostics is not None else []
-    payload = build_api_agent1_chunk_payload(chunk, endpoint_index)
+    payload = build_api_agent1_chunk_payload(
+        chunk, endpoint_index, source_document=source_document, target_endpoint=target_endpoint
+    )
     key = _cache_key(API_AGENT1_CACHE_NAMESPACE, model, prompt_template, payload)
     if cache is not None and key in cache:
         diagnostics.append({"chunk_id": chunk.get("chunk_id"), "status": "CACHE_HIT", "chars": len(chunk.get("core_text", ""))})
@@ -2612,8 +2639,9 @@ def process_api_agent1_chunk_recursive(
             base_url=base_url,
             model=model,
             prompt_template=prompt_template,
-            max_tokens=QWEN_MAX_OUTPUT_TOKENS,
+            max_tokens=API_DEEP_MAX_OUTPUT_TOKENS,
             agent_name=agent_name,
+            enable_thinking=False,
         )
         if call_result.ok or call_result.finish_reason == "length":
             break
@@ -2638,6 +2666,9 @@ def process_api_agent1_chunk_recursive(
             reason_to_split = "JSON_PARSE_FAIL"
         else:
             parsed_json = normalize_api_rule_matrix_enums(parsed_json)
+            parsed_json = force_api_matrix_scope(
+                parsed_json, source_document=source_document, target_endpoint=target_endpoint
+            )
             schema_ok, schema_diag = validate_api_rule_matrix_schema(parsed_json, strict=False)
             if not schema_ok:
                 reason_to_split = "SCHEMA_FAIL"
@@ -2684,7 +2715,8 @@ def process_api_agent1_chunk_recursive(
     all_matrices = []
     for child in children:
         ok, mats = process_api_agent1_chunk_recursive(
-            child, endpoint_index, api_key, base_url, model, prompt_template, cache, diagnostics
+            child, endpoint_index, api_key, base_url, model, prompt_template, cache, diagnostics,
+            source_document=source_document, target_endpoint=target_endpoint
         )
         if not ok:
             return False, []
@@ -2703,496 +2735,246 @@ def run_api_agent1_document_pipeline(
     cache: dict | None = None,
     progress_callback=None,
 ) -> tuple[bool, dict | None, dict]:
+    """V1.9.3 targeted multi-document API pipeline with continuation-aware routing.
+
+    API Design/Spec defines the target API(s). The BA document is scanned only for
+    relevance first; deep QA generation runs only on BA chunks mapped to a target API.
+    This prevents a 30+ page BA document from generating cases for unrelated APIs.
+    """
     started = time.time()
-    combined = build_api_combined_source(design_text, ba_text)
     endpoint_index = extract_api_endpoint_index(design_text)
-    initial_chunks = split_document_semantic(
-        combined,
-        base_title=base_filename,
-        target_chars=API_AGENT1_CHUNK_TARGET_CHARS,
-        max_chars=API_AGENT1_CHUNK_MAX_CHARS,
-        context_chars=API_AGENT1_CONTEXT_CHARS,
-    )
-    diagnostics = []
-    matrices = []
+    targets = build_target_api_descriptors(design_text, endpoint_index)
+    diagnostics: list[dict] = []
+    matrices: list[dict] = []
+
     log_info(
-        f"[API_AGENT1_PIPELINE] 📚 DocumentChars={len(combined):,} | InitialChunks={len(initial_chunks)} | "
-        f"EndpointIndex={len(endpoint_index)} | Target≈{API_AGENT1_CHUNK_TARGET_CHARS:,}"
+        f"[API_TARGET_PIPELINE] 🎯 TargetAPIs={len(targets)} | "
+        + ", ".join(f"{t.get('method')} {t.get('endpoint_path')}" for t in targets)
     )
-    for idx, chunk in enumerate(initial_chunks, start=1):
+
+    # Stage 1 — deep analysis of API contract itself, target by target.
+    if progress_callback:
+        progress_callback(0, 100, f"Đã nhận diện {len(targets)} API mục tiêu từ API Design")
+    for t_idx, target in enumerate(targets, start=1):
+        spec_excerpt = target.get("spec_excerpt") or design_text
+        spec_chunks = split_document_semantic(
+            spec_excerpt,
+            base_title=f"API_SPEC::{target.get('endpoint_path')}",
+            target_chars=API_AGENT1_CHUNK_TARGET_CHARS,
+            max_chars=API_AGENT1_CHUNK_MAX_CHARS,
+            context_chars=API_AGENT1_CONTEXT_CHARS,
+        )
+        for c_idx, chunk in enumerate(spec_chunks, start=1):
+            chunk["chunk_id"] = f"SPEC-{t_idx}.{c_idx}"
+            if progress_callback:
+                progress_callback(
+                    5 + int(15 * ((t_idx-1 + c_idx/max(1,len(spec_chunks))) / max(1,len(targets)))),
+                    100,
+                    f"Đang đọc contract API {target.get('method')} {target.get('endpoint_path')} ({c_idx}/{len(spec_chunks)})",
+                )
+            ok, mats = process_api_agent1_chunk_recursive(
+                chunk, endpoint_index, api_key, base_url, model, prompt_template,
+                cache, diagnostics, source_document="API_SPEC", target_endpoint=target,
+            )
+            if not ok:
+                return False, None, {
+                    "ok": False, "stage": "api_spec", "endpoint_index": len(endpoint_index),
+                    "targets": targets, "elapsed": round(time.time()-started,2), "diagnostics": diagnostics,
+                }
+            matrices.extend(mats)
+
+    # Stage 2 — cheap BA scope scan. It reads chunks for routing only, no testcase generation.
+    # V1.9.3 classifies each BA chunk as PRIMARY / CONTINUATION / DEPENDENCY / OUT_OF_SCOPE.
+    ba_chunks = split_document_semantic(
+        ba_text,
+        base_title=f"{base_filename}::BA",
+        target_chars=API_SCOPE_SCAN_CHUNK_TARGET_CHARS,
+        max_chars=API_SCOPE_SCAN_CHUNK_MAX_CHARS,
+        context_chars=450,
+    )
+    routed_pairs: list[tuple[dict, dict, str]] = []
+    scope_diagnostics = []
+    continuation_targets: OrderedDict[tuple, dict] = OrderedDict()
+    scope_role_counts = {"PRIMARY": 0, "CONTINUATION": 0, "DEPENDENCY": 0, "OUT_OF_SCOPE": 0}
+    for idx, chunk in enumerate(ba_chunks, start=1):
+        chunk["chunk_id"] = f"BA-SCAN-{idx}"
+
+    def _scan_one(chunk):
+        ok, matches, diag = route_ba_chunk_to_target_apis(
+            chunk, targets, api_key, base_url, model, cache
+        )
+        if not ok:
+            # Fallback is intentionally PRIMARY-only. It must never guess a continuation API.
+            fallback = fallback_route_ba_chunk_by_spec_overlap(chunk, targets)
+            matches = [{**m, "scope_role": "PRIMARY"} for m in fallback]
+        return chunk, matches, diag
+
+    def _accept_match(chunk, match):
+        primary_target = next(
+            (t for t in targets if _api_endpoint_key(t) == (match.get("method"), match.get("endpoint_path"))),
+            None,
+        )
+        if primary_target is None:
+            return
+        role = _normalize_scope_role(match.get("scope_role"))
+        scope_role_counts[role] = scope_role_counts.get(role, 0) + 1
+        if role == "PRIMARY":
+            routed_pairs.append((chunk, primary_target, role))
+        elif role == "DEPENDENCY":
+            # Dependency behavior remains under the parent API as BUSINESS_RULE/expected outcome.
+            # It does not become a new endpoint workspace by itself.
+            routed_pairs.append((chunk, primary_target, role))
+        elif role == "CONTINUATION":
+            cont = _build_continuation_target(primary_target, match)
+            ckey = (
+                _normalize_text(cont.get("summary", "")),
+                str(cont.get("method", "UNMAPPED")).upper(),
+                _normalize_text(cont.get("endpoint_path", "UNMAPPED")),
+                _api_endpoint_key(primary_target),
+            )
+            continuation_targets.setdefault(ckey, cont)
+            routed_pairs.append((chunk, continuation_targets[ckey], role))
+        # OUT_OF_SCOPE: intentionally ignored.
+
+    completed_scans = 0
+    if API_SCOPE_SCAN_WORKERS > 1 and len(ba_chunks) > 1:
+        with ThreadPoolExecutor(max_workers=min(API_SCOPE_SCAN_WORKERS, len(ba_chunks))) as executor:
+            futures = [executor.submit(_scan_one, chunk) for chunk in ba_chunks]
+            for future in as_completed(futures):
+                chunk, matches, diag = future.result()
+                completed_scans += 1
+                scope_diagnostics.append(diag)
+                if progress_callback:
+                    progress_callback(
+                        20 + int(30 * completed_scans / max(1, len(ba_chunks))), 100,
+                        f"Đang phân loại phạm vi BA ({completed_scans}/{len(ba_chunks)})",
+                    )
+                for match in matches:
+                    _accept_match(chunk, match)
+    else:
+        for chunk in ba_chunks:
+            chunk, matches, diag = _scan_one(chunk)
+            completed_scans += 1
+            scope_diagnostics.append(diag)
+            if progress_callback:
+                progress_callback(
+                    20 + int(30 * completed_scans / max(1, len(ba_chunks))), 100,
+                    f"Đang phân loại phạm vi BA ({completed_scans}/{len(ba_chunks)})",
+                )
+            for match in matches:
+                _accept_match(chunk, match)
+
+    # Deduplicate same BA chunk/analysis-target/role pair.
+    # Unknown continuation endpoints are separated by BA operation name, never collapsed together.
+    dedup = OrderedDict()
+    for chunk, target, role in routed_pairs:
+        target_identity = _api_endpoint_key(target)
+        if target_identity[1] == "UNMAPPED":
+            target_identity = (
+                target_identity[0],
+                "UNMAPPED::" + _normalize_text(target.get("summary", "API tiếp nối")),
+            )
+        dedup[(chunk.get("chunk_id"), role) + target_identity] = (chunk, target, role)
+    routed_pairs = list(dedup.values())
+
+    if not routed_pairs and ba_chunks:
+        # Never deep-analyze all BA as a fallback. Pick only a very small lexical PRIMARY shortlist.
+        scored = []
+        for chunk in ba_chunks:
+            fallback_matches = fallback_route_ba_chunk_by_spec_overlap(chunk, targets, min_overlap=2)
+            for match in fallback_matches:
+                target = next(
+                    (t for t in targets if _api_endpoint_key(t) == (match.get("method"), match.get("endpoint_path"))),
+                    None,
+                )
+                if target is not None:
+                    scored.append((float(match.get("confidence") or 0), chunk, target))
+        scored.sort(key=lambda item: item[0], reverse=True)
+        routed_pairs = [(chunk, target, "PRIMARY") for _, chunk, target in scored[:3]]
+        if routed_pairs:
+            log_info(
+                f"[API_SCOPE_ROUTER] ⚠️ AI router không chọn chunk; dùng lexical PRIMARY shortlist "
+                f"{len(routed_pairs)} chunk thay vì deep-analyze toàn BA."
+            )
+
+    selected_chunk_ids = {c.get("chunk_id") for c, _, _ in routed_pairs}
+    log_info(
+        f"[API_SCOPE_ROUTER] BAChunks={len(ba_chunks)} | RelevantPairs={len(routed_pairs)} | "
+        f"Continuations={len(continuation_targets)} | Roles={scope_role_counts} | "
+        f"Skipped={max(0, len(ba_chunks)-len(selected_chunk_ids))}"
+    )
+
+    # Stage 3 — deep analysis ONLY on selected BA chunks.
+    # PRIMARY + DEPENDENCY are forced into the primary API.
+    # CONTINUATION gets a separate API workspace; unknown method/path stay UNMAPPED rather than invented.
+    for idx, (chunk, target, scope_role) in enumerate(routed_pairs, start=1):
+        deep_chunk = dict(chunk)
+        deep_chunk["chunk_id"] = f"BA-DEEP-{idx}"
         if progress_callback:
-            progress_callback(idx-1, len(initial_chunks), f"API Agent 1 chunk {idx}/{len(initial_chunks)} — {chunk.get('title')} ({chunk.get('char_count',0):,} chars)")
+            progress_callback(
+                50 + int(32 * idx / max(1, len(routed_pairs))), 100,
+                f"Đang phân tích BA [{scope_role}] {target.get('summary') or target.get('endpoint_path')} "
+                f"({idx}/{len(routed_pairs)})",
+            )
         ok, mats = process_api_agent1_chunk_recursive(
-            chunk, endpoint_index, api_key, base_url, model, prompt_template, cache, diagnostics
+            deep_chunk, endpoint_index, api_key, base_url, model, prompt_template,
+            cache, diagnostics, source_document="BA", target_endpoint=target,
         )
         if not ok:
             return False, None, {
-                "ok": False, "document_chars": len(combined), "initial_chunks": len(initial_chunks),
-                "endpoint_index": len(endpoint_index), "elapsed": round(time.time()-started,2), "diagnostics": diagnostics,
+                "ok": False, "stage": "ba_deep", "endpoint_index": len(endpoint_index),
+                "targets": targets, "continuation_targets": list(continuation_targets.values()),
+                "ba_chunks": len(ba_chunks), "relevant_pairs": len(routed_pairs),
+                "scope_role_counts": scope_role_counts,
+                "elapsed": round(time.time()-started,2), "diagnostics": diagnostics,
+                "scope_diagnostics": scope_diagnostics,
             }
         matrices.extend(mats)
-        if progress_callback:
-            progress_callback(idx, len(initial_chunks), f"Hoàn tất API chunk {idx}/{len(initial_chunks)}")
 
+    if progress_callback:
+        progress_callback(85, 100, "Đang đối soát API Spec và BA, loại trùng và giữ conflict...")
     final, merge_stats = merge_api_rule_matrices(matrices)
     schema_ok, schema_diag = validate_api_rule_matrix_schema(final, strict=True)
     summary = {
-        "ok": schema_ok, "document_chars": len(combined), "initial_chunks": len(initial_chunks),
-        "endpoint_index": len(endpoint_index), "leaf_matrices": len(matrices),
-        "elapsed": round(time.time()-started,2), "merge": merge_stats, "schema": schema_diag,
+        "ok": schema_ok,
+        "document_chars": len(design_text or "") + len(ba_text or ""),
+        "endpoint_index": len(endpoint_index),
+        "target_apis": [{k: t.get(k) for k in ("method", "endpoint_path", "summary")} for t in targets],
+        "continuation_apis": [{k: t.get(k) for k in ("method", "endpoint_path", "summary")} for t in continuation_targets.values()],
+        "scope_role_counts": scope_role_counts,
+        "ba_chunks_scanned": len(ba_chunks),
+        "ba_relevant_pairs": len(routed_pairs),
+        "leaf_matrices": len(matrices),
+        "elapsed": round(time.time()-started,2),
+        "merge": merge_stats,
+        "schema": schema_diag,
+        "scope_diagnostics": scope_diagnostics,
         "diagnostics": diagnostics,
     }
     if not schema_ok:
-        log_error(f"[API_AGENT1_PIPELINE] ❌ Final schema fail | {schema_diag}")
+        log_error(f"[API_TARGET_PIPELINE] ❌ Final schema fail | {schema_diag}")
         return False, None, summary
+    if progress_callback:
+        progress_callback(90, 100, f"Đã hoàn tất Rule Matrix cho {merge_stats.get('endpoints', 0)} API/luồng tiếp nối")
     log_info(
-        f"[API_AGENT1_PIPELINE] ✅ Completed | Time={summary['elapsed']:.2f}s | Modules={merge_stats['modules']} | "
-        f"Endpoints={merge_stats['endpoints']} | FinalRules={merge_stats['final_rules']} | Unmapped={merge_stats['unmapped_endpoints']}"
+        f"[API_TARGET_PIPELINE] ✅ Completed | Time={summary['elapsed']:.2f}s | "
+        f"Targets={len(targets)} | Continuations={len(continuation_targets)} | "
+        f"BARelevant={len(routed_pairs)}/{len(ba_chunks)} | "
+        f"FinalRules={merge_stats['final_rules']}"
     )
     return True, final, summary
 
 
-def split_api_endpoint_rules_for_agent2(module_name: str, endpoint: dict) -> list[dict]:
-    indexed_rules = list(enumerate(endpoint.get("test_rules", [])))
-    indexed_rules.sort(
-        key=lambda item: (
-            API_CATEGORY_ORDER.get(str(item[1].get("category", "")).strip().upper(), 999),
-            item[0],
-        )
-    )
-    rules = [rule for _, rule in indexed_rules]
-
-    batches = []
-    current = []
-    current_chars = 0
-    for rule in rules:
-        rule_chars = len(json.dumps(rule, ensure_ascii=False))
-        if current and (
-            len(current) >= API_AGENT2_BATCH_MAX_RULES
-            or current_chars + rule_chars > API_AGENT2_BATCH_MAX_INPUT_CHARS
-        ):
-            batches.append({
-                "module_name": module_name,
-                "endpoint": {
-                    "method": endpoint.get("method", "UNMAPPED"),
-                    "endpoint_path": endpoint.get("endpoint_path", "UNMAPPED"),
-                    "summary": endpoint.get("summary", ""),
-                    "test_rules": current,
-                },
-            })
-            current = []
-            current_chars = 0
-        current.append(rule)
-        current_chars += rule_chars
-
-    if current:
-        batches.append({
-            "module_name": module_name,
-            "endpoint": {
-                "method": endpoint.get("method", "UNMAPPED"),
-                "endpoint_path": endpoint.get("endpoint_path", "UNMAPPED"),
-                "summary": endpoint.get("summary", ""),
-                "test_rules": current,
-            },
-        })
-    return batches
 
 
-def render_api_agent2_batch_recursive(
-    batch: dict,
-    api_key: str,
-    base_url: str,
-    model: str,
-    prompt_template: str,
-    batch_id: str,
-    depth: int = 0,
-    diagnostics: list | None = None,
-    cache: dict | None = None,
-) -> tuple[bool, list[str]]:
-    diagnostics = diagnostics if diagnostics is not None else []
-    payload = json.dumps({
-        "api_test_design_version": "3.2",
-        "api_modules": [{
-            "module_name": batch.get("module_name", "UNMAPPED"),
-            "endpoints": [batch.get("endpoint", {})],
-        }],
-    }, ensure_ascii=False)
-    key = _cache_key(API_AGENT2_CACHE_NAMESPACE, model, prompt_template, payload)
-    rules = batch.get("endpoint", {}).get("test_rules", [])
-    expected_count = len(rules)
-
-    if cache is not None and key in cache:
-        cached_text = cache[key]
-        cached_count = _count_api_testcases_in_nodes(_parse_bullet_forest(cached_text))
-        if cached_count == expected_count:
-            diagnostics.append({"batch_id": batch_id, "status": "CACHE_HIT", "rules": expected_count})
-            return True, [cached_text]
-        diagnostics.append({
-            "batch_id": batch_id,
-            "status": "CACHE_INVALIDATED",
-            "rules": expected_count,
-            "rendered_testcases": cached_count,
-        })
-        cache.pop(key, None)
-
-    call_result = None
-    for attempt in range(API_AGENT2_API_RETRIES + 1):
-        call_result = call_qwen_max_agent_detailed(
-            content=payload,
-            api_key=api_key,
-            base_url=base_url,
-            model=model,
-            prompt_template=prompt_template,
-            max_tokens=QWEN_MAX_OUTPUT_TOKENS,
-            agent_name=f"API_AGENT2/{batch_id}",
-        )
-        if call_result.ok or call_result.finish_reason == "length":
-            break
-        if attempt < API_AGENT2_API_RETRIES:
-            log_info(f"[API_AGENT2/{batch_id}] Retry API {attempt + 2}/{API_AGENT2_API_RETRIES + 1}")
-            time.sleep(2)
-
-    assert call_result is not None
-
-    rendered_count = 0
-    if call_result.complete:
-        rendered_count = _count_api_testcases_in_nodes(_parse_bullet_forest(call_result.text))
-        if rendered_count == expected_count:
-            diagnostics.append({
-                "batch_id": batch_id,
-                "status": "OK",
-                "rules": expected_count,
-                "rendered_testcases": rendered_count,
-                "elapsed": round(call_result.elapsed, 2),
-                "output_chars": len(call_result.text),
-            })
-            if cache is not None:
-                cache[key] = call_result.text
-            return True, [call_result.text]
-
-    if call_result.finish_reason == "length":
-        failure_reason = "MAX_TOKENS"
-    elif call_result.complete:
-        failure_reason = "TC_COUNT_MISMATCH"
-        log_error(
-            f"[API_AGENT2/{batch_id}] Renderer count mismatch | "
-            f"Rules={expected_count} | TestCases={rendered_count}"
-        )
-    else:
-        failure_reason = call_result.error or "UNKNOWN"
-
-    can_split = (
-        len(rules) > 1
-        and depth < API_AGENT2_MAX_RECURSION_DEPTH
-        and (call_result.finish_reason == "length" or failure_reason == "TC_COUNT_MISMATCH")
-    )
-    diagnostics.append({
-        "batch_id": batch_id,
-        "status": "SPLIT_RETRY" if can_split else "FAILED",
-        "reason": failure_reason,
-        "rules": expected_count,
-        "rendered_testcases": rendered_count,
-    })
-    if not can_split:
-        return False, []
-
-    mid = max(1, len(rules) // 2)
-    outputs = []
-    for idx, child_rules in enumerate((rules[:mid], rules[mid:]), start=1):
-        if not child_rules:
-            continue
-        child = copy.deepcopy(batch)
-        child["endpoint"]["test_rules"] = child_rules
-        ok, child_outputs = render_api_agent2_batch_recursive(
-            child,
-            api_key,
-            base_url,
-            model,
-            prompt_template,
-            f"{batch_id}.{idx}",
-            depth + 1,
-            diagnostics,
-            cache,
-        )
-        if not ok:
-            return False, []
-        outputs.extend(child_outputs)
-    return True, outputs
 
 
-def _renumber_api_testcases_in_nodes(nodes: list[dict]) -> int:
-    counter = 0
-    def walk(children):
-        nonlocal counter
-        for node in children:
-            title = str(node.get("title", ""))
-            if re.match(r"^TC_API[_\- ]?\d+\s*[-:]", title, flags=re.IGNORECASE):
-                counter += 1
-                node["title"] = re.sub(r"^TC_API[_\- ]?\d+", f"TC_API_{counter:03d}", title, count=1, flags=re.IGNORECASE)
-            walk(node.get("children", []))
-    walk(nodes)
-    return counter
 
 
-def merge_api_agent2_tree_outputs(outputs: list[str]) -> tuple[str, dict]:
-    merged_nodes = []
-    for output in outputs:
-        forest = _parse_bullet_forest(output)
-        _merge_bullet_nodes(merged_nodes, forest, depth=0)
-    _sort_numbered_category_nodes(merged_nodes)
-    tc_count = _renumber_api_testcases_in_nodes(merged_nodes)
-    return "\n".join(_serialize_bullet_nodes(merged_nodes)).strip(), {
-        "agent2_leaf_outputs": len(outputs),
-        "testcases_renumbered": tc_count,
-    }
 
 
-def run_api_agent2_rule_matrix_pipeline(
-    approved_modules: list[dict],
-    api_key: str,
-    base_url: str,
-    model: str,
-    prompt_template: str,
-    cache: dict | None = None,
-    progress_callback=None,
-) -> tuple[bool, str, dict]:
-    started = time.time()
-    initial_batches = []
-    for midx, module in enumerate(approved_modules, start=1):
-        for eidx, endpoint in enumerate(module.get("endpoints", []), start=1):
-            batches = split_api_endpoint_rules_for_agent2(module.get("module_name", "UNMAPPED"), endpoint)
-            for bidx, batch in enumerate(batches, start=1):
-                initial_batches.append((f"M{midx:02d}E{eidx:03d}B{bidx:02d}", batch))
-
-    diagnostics = []
-    outputs = []
-    total_rules = sum(
-        len(ep.get("test_rules", []))
-        for module in approved_modules
-        for ep in module.get("endpoints", [])
-    )
-    log_info(
-        f"[API_AGENT2_PIPELINE] Modules={len(approved_modules)} | "
-        f"Batches={len(initial_batches)} | Rules={total_rules}"
-    )
-
-    for idx, (batch_id, batch) in enumerate(initial_batches, start=1):
-        if progress_callback:
-            ep = batch.get("endpoint", {})
-            progress_callback(
-                idx - 1,
-                len(initial_batches),
-                f"API Agent 2 batch {idx}/{len(initial_batches)} — "
-                f"{ep.get('method')} {ep.get('endpoint_path')} "
-                f"({len(ep.get('test_rules', []))} rules)",
-            )
-        ok, batch_outputs = render_api_agent2_batch_recursive(
-            batch,
-            api_key,
-            base_url,
-            model,
-            prompt_template,
-            batch_id,
-            diagnostics=diagnostics,
-            cache=cache,
-        )
-        if not ok:
-            return False, "", {
-                "ok": False,
-                "initial_batches": len(initial_batches),
-                "expected_rules": total_rules,
-                "elapsed": round(time.time() - started, 2),
-                "diagnostics": diagnostics,
-            }
-        outputs.extend(batch_outputs)
-        if progress_callback:
-            progress_callback(idx, len(initial_batches), f"Hoàn tất API batch {idx}/{len(initial_batches)}")
-
-    merged_text, merge_stats = merge_api_agent2_tree_outputs(outputs)
-    actual_testcases = merge_stats["testcases_renumbered"]
-    count_ok = actual_testcases == total_rules
-    summary = {
-        "ok": count_ok,
-        "initial_batches": len(initial_batches),
-        "expected_rules": total_rules,
-        "elapsed": round(time.time() - started, 2),
-        "merge": merge_stats,
-        "diagnostics": diagnostics,
-    }
-    if not count_ok:
-        summary["count_mismatch"] = {"rules": total_rules, "testcases": actual_testcases}
-        log_error(
-            f"[API_AGENT2_PIPELINE] Count invariant failed | Rules={total_rules} | TestCases={actual_testcases}"
-        )
-        return False, "", summary
-
-    log_info(
-        f"[API_AGENT2_PIPELINE] Completed | Time={summary['elapsed']:.2f}s | "
-        f"TestCases={actual_testcases}"
-    )
-    return True, merged_text, summary
 
 
-def convert_tree_to_api_excel(tree_text: str) -> bytes:
-    """Export all API Module/Endpoint testcases and enforce TreeTC == ExcelTC."""
-    forest = _parse_bullet_forest(tree_text)
-    if not forest:
-        raise ValueError("Không có dữ liệu API Test Case để xuất Excel.")
-
-    expected_total = _count_api_testcases_in_nodes(forest)
-    if expected_total <= 0:
-        raise ValueError("Không tìm thấy Test Case API hợp lệ (TC_API_...).")
-
-    wb = Workbook()
-    ws = wb.active
-    ws.title = "API Test Execution"
-    ws.views.sheetView[0].showGridLines = True
-
-    fill_green = PatternFill(start_color="81C784", fill_type="solid")
-    fill_light_green = PatternFill(start_color="C8E6C9", fill_type="solid")
-    fill_white = PatternFill(start_color="FFFFFF", fill_type="solid")
-    fill_header_bg = PatternFill(start_color="4DD0E1", fill_type="solid")
-    fill_pink = PatternFill(start_color="F8BBD0", fill_type="solid")
-    fill_blue_exec = PatternFill(start_color="90CAF9", fill_type="solid")
-    thin_border = Border(
-        left=Side(style="thin", color="B0BEC5"),
-        right=Side(style="thin", color="B0BEC5"),
-        top=Side(style="thin", color="B0BEC5"),
-        bottom=Side(style="thin", color="B0BEC5"),
-    )
-    font_title = Font(name="Segoe UI", size=11, bold=True)
-    font_bold = Font(name="Segoe UI", size=10, bold=True)
-    font_body = Font(name="Segoe UI", size=10)
-    align_center = Alignment(horizontal="center", vertical="center", wrap_text=True)
-    align_left = Alignment(horizontal="left", vertical="center", wrap_text=True)
-
-    ws["D1"] = "KỊCH BẢN KIỂM THỬ API *"
-    ws["D1"].font = font_title
-    ws["D1"].alignment = align_center
-    ws["C2"] = "Phạm vi"
-    ws["C2"].font = font_bold
-    ws["D2"] = " / ".join([n.get("title", "") for n in forest[:3]]) if forest else "API Testing"
-    for row in range(1, 5):
-        for col in ("C", "D"):
-            ws[f"{col}{row}"].border = thin_border
-
-    headers = [
-        ("A11", "External ID", fill_header_bg),
-        ("B11", "Name", fill_pink),
-        ("C11", "PreConditions", fill_pink),
-        ("D11", "Importance", fill_pink),
-        ("E11", "Step", fill_pink),
-        ("F11", "Data test", fill_pink),
-        ("G11", "Expected Result", fill_pink),
-        ("H11", "Actual Result", fill_pink),
-        ("I11", "Lần 1", fill_blue_exec),
-        ("J11", "Lần 2", fill_blue_exec),
-    ]
-    for pos, value, fill in headers:
-        ws[pos] = value
-        ws[pos].font = font_bold
-        ws[pos].alignment = align_center
-        ws[pos].border = thin_border
-        ws[pos].fill = fill
-
-    current_row = 14
-    exported_total = 0
-
-    def clean_prefix(value, prefixes):
-        t = str(value).strip()
-        for prefix in prefixes:
-            if t.lower().startswith(prefix.lower()):
-                return t[len(prefix):].strip()
-        return t
-
-    def extract_details(node):
-        pre = step = expected = ""
-        for child in node.get("children", []):
-            title = str(child.get("title", ""))
-            low = title.lower()
-            if "pre-condition" in low or "precondition" in low or "tiền điều kiện" in low:
-                pre = pre or clean_prefix(title, ["Pre-condition:", "Precondition:", "Tiền điều kiện:"])
-            elif "steps & data test" in low or low.startswith("steps") or "các bước" in low:
-                step = step or clean_prefix(title, ["Steps & Data test:", "Steps:", "Các bước thực hiện:"])
-            elif "response" in low or "kết quả mong đợi" in low or "expected" in low:
-                expected = expected or clean_prefix(
-                    title,
-                    ["Response (Kết quả mong đợi):", "Kết quả mong đợi:", "Expected Result:"],
-                )
-            child_pre, child_step, child_expected = extract_details(child)
-            pre = pre or child_pre
-            step = step or child_step
-            expected = expected or child_expected
-        return pre, step, expected
-
-    def is_tc(node):
-        return bool(re.match(r"^TC_API[_\- ]?\d+", str(node.get("title", "")), flags=re.IGNORECASE))
-
-    def has_tc(node):
-        return is_tc(node) or any(has_tc(child) for child in node.get("children", []))
-
-    def write_group(title, level):
-        nonlocal current_row
-        ws.cell(row=current_row, column=2, value=("  " * max(0, level - 1)) + title).font = font_bold
-        for col in range(1, 11):
-            cell = ws.cell(row=current_row, column=col)
-            cell.fill = fill_green if level <= 2 else fill_light_green
-            cell.border = thin_border
-        current_row += 1
-
-    def walk(node, level=1):
-        nonlocal current_row, exported_total
-        if is_tc(node):
-            full = str(node.get("title", ""))
-            parts = full.split(" - ", 1)
-            tc_id = parts[0].strip()
-            tc_name = parts[1].strip() if len(parts) > 1 else full
-            pre, step, expected = extract_details(node)
-
-            ws.cell(row=current_row, column=1, value=tc_id).alignment = align_center
-            ws.cell(row=current_row, column=2, value=tc_name)
-            ws.cell(row=current_row, column=3, value=pre)
-            ws.cell(row=current_row, column=4, value=None)
-            ws.cell(row=current_row, column=5, value=step)
-            ws.cell(row=current_row, column=6, value=None)
-            ws.cell(row=current_row, column=7, value=expected)
-            for col in range(1, 11):
-                cell = ws.cell(row=current_row, column=col)
-                cell.font = font_body
-                cell.fill = fill_white
-                cell.border = thin_border
-                cell.alignment = align_center if col in (1, 4, 9, 10) else align_left
-            current_row += 1
-            exported_total += 1
-            return
-
-        if has_tc(node):
-            write_group(str(node.get("title", "")), level)
-            for child in node.get("children", []):
-                walk(child, level + 1)
-
-    for root in forest:
-        walk(root, 1)
-
-    if exported_total != expected_total:
-        raise ValueError(
-            f"API Excel export không đầy đủ: Tree có {expected_total} testcase nhưng Excel ghi {exported_total}."
-        )
-
-    for col, width in {
-        "A": 18, "B": 48, "C": 34, "D": 12, "E": 52,
-        "F": 18, "G": 52, "H": 20, "I": 10, "J": 10,
-    }.items():
-        ws.column_dimensions[col].width = width
-
-    ws.freeze_panes = "A12"
-    ws.auto_filter.ref = f"A11:J{max(11, current_row - 1)}"
-    log_info(f"[API_EXCEL_EXPORT] TreeTC={expected_total} | ExcelTC={exported_total}")
-
-    output = io.BytesIO()
-    wb.save(output)
-    output.seek(0)
-    return output.getvalue()
 
 
 # ============================================================
@@ -3303,6 +3085,7 @@ UI | VALIDATION | ACTION | DATA_GRID | BUSINESS_FLOW | EXCEPTION
 - Static display/presentation only: screen title, breadcrumb, static label/text, layout/section, visual icon, pure visibility, read-only display outside Data Grid, popup title/content/icon.
 - Placeholder/default/dropdown options/input behavior are NOT UI; they are VALIDATION.
 - Data Grid presentation/mapping is NOT UI; it is DATA_GRID.
+- IMPORTANT GROUPING: all columns/row-mapping/pagination/sort/empty-state rules of the same grid MUST share ONE stable feature_name for that grid (for example "Data Grid" or "Danh sách kết quả"). Do NOT create feature_name="Cột ..." for each column. Put the column name in target/rule_name instead.
 
 4.2 VALIDATION — FIELD / INPUT CONTROL TEST DESIGN
 VALIDATION owns ALL source-grounded behavior of Field/Input Controls, including initial state, allowed input, selection behavior, control-local interaction, and field-level dependency.
@@ -3527,8 +3310,10 @@ Use for search/filter controls and ALL source-grounded behavior owned by them:
 - `feature_name` should be the business filter name: "Chi nhánh", "Trái phiếu", "CIF", "Năm phát hành", "Loại phát hành", "Trạng thái lệnh", etc.
 
 5.4 DATA_GRID
+- ONE GRID = ONE feature_name. All column mapping rules stay inside that grid feature.
+- Column-specific name belongs to target/rule_name, not feature_name.
 Use for Grid structure/mapping/presentation/empty-nonempty/pagination rules.
-- `feature_name` should identify the Grid concern or column: "Cấu trúc lưới", "Cột ID", "Cột CIF", "Định dạng số", "Phân trang", "Trạng thái dữ liệu".
+- `feature_name` MUST identify the whole Grid, for example "Data Grid" or "Danh sách kết quả". Column/concern names such as "Cột ID", "Cột CIF", "Phân trang" belong to target/rule_name so all Grid testcase stay in one container.
 - Business actions such as Hủy/Hold/Xác nhận should NOT be hidden under DATA_GRID merely because their icon appears in a row.
 
 5.5 FUNCTION
@@ -3539,7 +3324,7 @@ Use for business actions/features not primarily a filter or Grid presentation:
 OWNERSHIP EXAMPLES:
 - Dropdown Chi nhánh timeout: category=EXCEPTION, feature_group=FILTER, feature_name="Chi nhánh".
 - Search API parameter Chi nhánh: category=BUSINESS_FLOW, feature_group=FILTER, feature_name="Chi nhánh".
-- Cột ID mapping: category=DATA_GRID, feature_group=DATA_GRID, feature_name="Cột ID".
+- Cột ID mapping: category=DATA_GRID, feature_group=DATA_GRID, feature_name="Data Grid"; target="Cột ID".
 - Button Hủy visibility: category=ACTION, feature_group=FUNCTION, feature_name="Hủy".
 - Hủy timeout: category=EXCEPTION, feature_group=FUNCTION, feature_name="Hủy".
 
@@ -3709,383 +3494,372 @@ CHUNK SOURCE
 """
 
 
-PROMPT_AGENT2_GEN_XMIND_FROM_RULE_MATRIX = """
-You are WEB_AGENT2_XMIND_RENDERER — a deterministic Test Case Renderer.
 
-You are NOT a QA Analyst.
-You MUST NOT re-analyze the SRS.
-You MUST NOT add/remove/merge/split Test Rules.
-You MUST NOT invent Validation, Business Rules, API behavior, Message, Permission, DB behavior, Test Data, or Exceptions.
 
-LANGUAGE:
-- ALL human-readable Test Case content and tree labels MUST be in VIETNAMESE.
-- Preserve technical identifiers/values/messages exactly when required.
+PROMPT_API_SCOPE_ROUTER = """
+You are API SCOPE ROUTER for multi-document QA analysis.
 
-YOUR ONLY TASK:
-Convert every input test_rule into exactly ONE Web Test Case, organized by `feature_group` and `feature_name` in a Senior-QA-style feature-oriented tree.
-If input has N valid test_rules -> output exactly N Test Cases.
+Your task is ONLY to classify how the BA CURRENT SOURCE relates to each PRIMARY TARGET API defined by API Design/Spec.
+You MUST NOT generate testcases, QA rules, expected results, or rewrite requirements.
+Thinking should be minimal and deterministic.
 
-==================================================
-1. SOURCE OF TRUTH
-==================================================
+SCOPE ROLES — MANDATORY:
+- PRIMARY: the chunk describes the target API itself, including its request validation, business eligibility, processing steps, direct side effects, or direct checks performed inside that API.
+- CONTINUATION: the chunk describes a DISTINCT callable API/operation that is a required next step to COMPLETE the same business capability/flow started by the PRIMARY API. Example: Approve -> Confirm Approval after authentication/signing.
+- DEPENDENCY: the chunk describes a supporting service/API/plugin/storage/payment/workflow call used by PRIMARY or CONTINUATION, but it is not itself the user-facing continuation that should become a full testcase endpoint workspace.
+- OUT_OF_SCOPE: sibling/alternative operation not required to complete the selected flow, e.g. List, Detail, Reject when PRIMARY is Approve; unrelated Print/Download/Reference APIs.
 
-Use ONLY these Rule Matrix fields:
-- screen_name
-- feature_group
-- feature_name
-- target
-- category
-- rule_name
-- test_objective
-- test_condition
-- expected_result
-- source_requirement
-- applied_qa_rule
+ROUTING PRINCIPLES:
+- API Design/Spec defines the PRIMARY target API(s).
+- Do NOT deep-analyze all 30+ BA pages. Classify each BA chunk first.
+- A same-domain sibling is NOT automatically relevant.
+- CONTINUATION must be a necessary next callable step in the selected business flow, not merely a nearby API.
+- Reject is usually an alternative branch to Approve, therefore OUT_OF_SCOPE when Approve is the target unless the spec explicitly selects Reject.
+- Confirm Approval after Approve/authentication is CONTINUATION when the BA shows it is required to complete approval.
+- Signing/auth init/verify, workflow service, S3/storage, account inquiry, payment, etc. are normally DEPENDENCY unless the BA clearly presents one as the selected continuation API itself.
+- For CONTINUATION, preserve an exact method/path ONLY if explicitly visible in CURRENT SOURCE. Never invent an endpoint. If unknown, use "UNMAPPED".
+- Be conservative about scope contamination, but do not cut off required continuation steps.
 
-The internal `category` is metadata for QA meaning; DO NOT use it as a top-level output section.
-The final tree MUST be organized by `feature_group` + `feature_name`.
+Return ONLY valid JSON:
+{
+  "matches": [
+    {
+      "method": "POST",
+      "endpoint_path": "/primary/example",
+      "scope_role": "PRIMARY | CONTINUATION | DEPENDENCY | OUT_OF_SCOPE",
+      "related_api_name": "",
+      "related_method": "UNMAPPED",
+      "related_endpoint_path": "UNMAPPED",
+      "confidence": 0.0,
+      "reason": "ngắn gọn"
+    }
+  ]
+}
 
-==================================================
-2. FIVE FIXED SENIOR-STYLE OUTPUT SECTIONS
-==================================================
+For every PRIMARY TARGET API, include exactly one match object.
+The top-level method and endpoint_path MUST exactly identify that PRIMARY TARGET API.
+For PRIMARY/DEPENDENCY/OUT_OF_SCOPE, related_* may be blank/UNMAPPED.
+For CONTINUATION, related_api_name is mandatory; related_method/path are exact only when source explicitly states them.
+No markdown. No explanation outside JSON.
 
-Map `feature_group` exactly:
-- PRECONDITION_PERMISSION -> 1. KIỂM TRA TIỀN ĐIỀU KIỆN - PHÂN QUYỀN
-- GENERAL_UI -> 2. KIỂM TRA GIAO DIỆN CHUNG
-- FILTER -> 3. KIỂM TRA BỘ LỌC
-- DATA_GRID -> 4. KIỂM TRA LƯỚI DỮ LIỆU
-- FUNCTION -> 5. KIỂM TRA CHỨC NĂNG
-
-Only create a section when it contains Test Cases.
-Under each section, group all Rules with the same `feature_name` under ONE feature node.
-Do NOT scatter the same feature into separate nodes because categories differ.
-
-Example:
-- Dropdown Chi nhánh validation + load API + search result + timeout all stay under:
-  3. KIỂM TRA BỘ LỌC -> Chi nhánh
-- Hủy visibility + confirmation + API + success + timeout all stay under:
-  5. KIỂM TRA CHỨC NĂNG -> Hủy
-
-==================================================
-3. TEST CASE TITLE — SENIOR STYLE
-==================================================
-
-Format:
-TC_(STT) - [Mục tiêu ngắn, rõ, có target khi cần]
-
-Rules:
-- Prefer a concise human-readable title around 45-90 characters.
-- Python applies a 120-character safety cap.
-- Do NOT repeat screen_name because Screen is already the root.
-- Do NOT dump full message/value list/condition/Expected/all Grid columns into title.
-- Put details into Pre-condition / Steps / Dữ liệu kiểm thử / Expected.
-
-GOOD:
-- "TC_001 - Kiểm tra giá trị mặc định trường Chi nhánh"
-- "TC_002 - Kiểm tra tìm kiếm theo Chi nhánh đã chọn"
-- "TC_003 - Kiểm tra Mapping cột ID"
-- "TC_004 - Kiểm tra Button Hủy khi không thỏa trạng thái tiền"
-- "TC_005 - Kiểm tra Hủy khi Server timeout"
-
-==================================================
-4. PRE-CONDITION / STEPS / DATA TEST / EXPECTED
-==================================================
-
-Pre-condition:
-- Include ONLY when `test_condition` clearly contains a prerequisite state/role/dependency that must already be true before the action.
-- Do not invent login/path/role not provided by Rule Matrix.
-- If no prerequisite exists, omit the node.
-
-Steps:
-- Short, executable, normally 1-4 steps.
-- Use target + test_objective + test_condition.
-- Do not copy full source_requirement into Steps.
-- Keep ALL step lines inside ONE node using literal \\n, not separate tree nodes.
-
-Dữ liệu kiểm thử:
-- If `test_condition` contains concrete input/value/boundary/status/selection, create ONE node:
-  "Dữ liệu kiểm thử: ..."
-- Preserve exact values/enums/boundaries.
-- Do not invent examples when Rule Matrix provides none.
-- If `test_condition` is empty and there is no concrete data, omit this node.
-
-Expected Result:
-- Render `expected_result` faithfully as authoritative expected behavior.
-- Keep exact message/value/state/format when provided.
-- Do NOT weaken it into "xử lý đúng" / "theo Spec".
-- Do NOT add a rejection mechanism/message/status not present in expected_result.
-
-==================================================
-5. TREE STRUCTURE
-==================================================
-
-- [screen_name]
-  - 1. KIỂM TRA TIỀN ĐIỀU KIỆN - PHÂN QUYỀN
-    - [feature_name]
-      - TC_001 - [Mục tiêu ngắn]
-        - Pre-condition: [...]                    # optional
-          - Các bước thực hiện: 1. ...\\n2. ...
-            - Dữ liệu kiểm thử: [...]             # optional when test_condition has data
-              - Kết quả mong đợi: ...
-  - 2. KIỂM TRA GIAO DIỆN CHUNG
-    - [feature_name]
-      - TC_...
-  - 3. KIỂM TRA BỘ LỌC
-    - Chi nhánh
-      - TC_...
-    - Trái phiếu
-      - TC_...
-  - 4. KIỂM TRA LƯỚI DỮ LIỆU
-    - Cấu trúc lưới
-      - TC_...
-    - Cột ID
-      - TC_...
-  - 5. KIỂM TRA CHỨC NĂNG
-    - Hủy
-      - TC_...
-
-If there is no Pre-condition:
-- Các bước thực hiện is the direct child of Test Case.
-
-If there is no Dữ liệu kiểm thử:
-- Kết quả mong đợi is the direct child of Các bước thực hiện.
-
-If both exist:
-Test Case -> Pre-condition -> Steps -> Dữ liệu kiểm thử -> Expected.
-
-Every logical multi-line text node MUST remain ONE physical tree line by using the literal escape sequence \\n inside the node.
-
-==================================================
-6. OUTPUT DISCIPLINE
-==================================================
-
-Return ONLY plain-text bullet tree using "-".
-NO JSON.
-NO markdown code block.
-NO explanation/statistics.
-Exactly 1 Test Case per input test_rule.
-ALL human-readable content MUST be in VIETNAMESE.
-
-=== TEST DESIGN / RULE MATRIX JSON ===
+=== INPUT ===
 {content}
 """
 
 
 PROMPT_API_AGENT1_RULE_MATRIX = """
-You are SENIOR API QA TEST DESIGN ENGINE / API QA BRAIN for Banking / Enterprise systems.
+You are SENIOR API QA TEST DESIGN ENGINE for Banking / Enterprise systems.
 
-LANGUAGE REQUIREMENT — CRITICAL:
-- ALL generated Rule Matrix textual content MUST be written in VIETNAMESE.
-- Keep technical identifiers exactly as they appear in the source when needed: module name, endpoint, HTTP method, header, parameter, schema field, enum, status code, error code, message, etc.
-- JSON keys and enum values MUST remain exactly as defined in the schema below.
-- Do not translate technical/business identifiers when translation could alter the original contract.
+LANGUAGE — CRITICAL:
+- ALL human-readable Rule Matrix content MUST be written in VIETNAMESE.
+- Keep technical identifiers exactly as the source defines them: endpoint, method, header, request field, enum, status, code, message, DB field, service name, etc.
+- JSON keys and enum values MUST remain exactly as defined below.
 
-YOUR ONLY TASK:
-Read the CURRENT SOURCE in the chunk and create an API TEST DESIGN / RULE MATRIX.
-You are the ONLY Agent allowed to apply API QA Test Design Rules.
-Downstream Python code validates, maps, persists and exports the API Rule Matrix deterministically. No second AI agent re-analyzes or renders it.
-
-==================================================
-CHUNK RULE — CRITICAL
-==================================================
-
-The input contains:
-- ENDPOINT INDEX HINT: Python-extracted metadata from the API design, used only to help identify endpoints.
-- PREVIOUS CONTEXT / NEXT CONTEXT: only used to understand requirements near boundaries.
-- CURRENT SOURCE: the PRIMARY source allowed to generate Test Rules.
-
-ONLY create a Rule when the requirement/contract/constraint/behavior is grounded in CURRENT SOURCE.
-You MAY use CONTEXT to complete the meaning of a requirement that belongs to CURRENT SOURCE.
-DO NOT create a Rule only from ENDPOINT INDEX HINT or CONTEXT.
-
-If CURRENT SOURCE describes a Business Rule but the endpoint cannot be mapped confidently:
-- method = "UNMAPPED"
-- endpoint_path = "UNMAPPED"
-- DO NOT guess the endpoint.
-
-This is one chunk of a large document. Fully cover CURRENT SOURCE and stop; do not try to review the entire document.
+YOUR ROLE:
+Design structured API test intent. You do NOT write free-form final testcase documents.
+Downstream Python renders the final testcase using the Senior template.
+Your job is to understand the documents, classify the test objective, preserve traceability, and output structured fields that can be used with minimal manual editing.
 
 ==================================================
-SOURCE PRIORITY / TRACEABILITY
+0. FORCED TARGET API — DO THIS BEFORE TEST DESIGN
 ==================================================
 
-API_SPEC is the source of truth for:
-- endpoint path / HTTP method
-- security scheme if present
+This call already contains a FORCED ANALYSIS SCOPE with exactly one TARGET API and one source_document role.
+- Generate Rules ONLY for that TARGET API.
+- NEVER create a sibling endpoint from CURRENT SOURCE.
+- Ignore detailed requirements that belong to List / Detail / Reject / Confirm-Approval / Signing / Payment or any other callable API when they are not the TARGET API.
+- A reference to a downstream/sibling API may support a direct behavior of TARGET API, but do not generate the sibling API's own contract/testcases.
+- method and endpoint_path in output MUST equal TARGET API when it is mapped.
+- Every Rule source_document MUST equal the forced source_document shown in the input.
+- ENDPOINT INDEX HINT is identification metadata only; it is NOT requirement evidence.
+
+==================================================
+1. CHUNK GROUNDING — CRITICAL
+==================================================
+
+Input contains:
+- ENDPOINT INDEX HINT: metadata only.
+- PREVIOUS/NEXT CONTEXT: boundary context only.
+- CURRENT SOURCE: primary evidence for creating Rules.
+
+Create a Rule only when its requirement/contract/behavior is grounded in CURRENT SOURCE.
+Context may complete the meaning of a CURRENT SOURCE requirement, but never create a Rule only from Context or Endpoint Hint.
+Fully cover CURRENT SOURCE and stop.
+
+==================================================
+2. MULTI-DOCUMENT SOURCE / RECONCILIATION
+==================================================
+
+API_SPEC is authoritative for documented API contract details:
+- endpoint + HTTP method
+- auth/security if stated
 - header/query/path/body schema
-- required/nullable/type/format/pattern/enum/min/max/length/items
-- request/response schema
-- documented status code / error code / message
+- required/nullable/type/format/pattern/enum/length/items
+- documented response/status/code/message
 
-BA is the source of truth for:
-- business flow
-- business condition
-- permission/role if described by BA
-- state transition
+BA is authoritative for documented business behavior:
+- business conditions / workflow / state transition
+- permission/role when explicitly described
 - data dependency
-- integration behavior / downstream mapping
-- business error/message if described by BA
+- downstream/integration behavior
+- DB/state/log side effect
+- business error/message
 
-If the same Rule is grounded in both documents: source_document = "BOTH".
-Do not silently resolve conflicts between API_SPEC and BA. If a conflict creates two different expectations, preserve clear traceability for QA Lead review; do not choose one side.
+source_document:
+- This value is FORCED by the input call: API_SPEC or BA.
+- Do NOT output BOTH during a single-source extraction call.
+- Python performs cross-document reconciliation after all scoped extraction is complete.
 
-==================================================
-ATOMIC RULE — DO NOT SUMMARIZE
-==================================================
+reconciliation_status during extraction:
+- DOC_ONLY: explicit rule extracted from this single source.
+- DERIVED: testcase is derived by an allowed QA rule from this source requirement.
+- Do NOT invent CONSISTENT / COMPLEMENTARY / CONFLICT in this call; Python determines those when API_SPEC and BA rules are merged.
 
-1 independent test objective = 1 test_rule.
-
-DO NOT combine independent objectives into vague Rules such as:
-- "Kiểm tra validate request"
-- "Kiểm tra các field"
-- "Kiểm tra các status code"
-- "Kiểm tra business rule"
-
-Example: if an endpoint has customerId required + maxLength 10:
-- missing customerId is one DERIVED Rule
-- boundary maxLength 10 is another DERIVED Rule
-Do not merge them if they require independent testing.
-
-But do not over-split one objective just to increase the Rule count.
+For CONFLICT:
+- keep the conflicting expectation visible in source_requirement/test_condition/business_result
+- do NOT invent a resolution
+- create only the minimum Rule(s) needed for QA Lead review
 
 ==================================================
-EXPLICIT / DERIVED
+3. STANDARD SENIOR API TEMPLATE — EXACTLY 5 CATEGORIES
+==================================================
+
+category MUST be exactly one of:
+AUTH | PERMISSION | VALIDATION | HAPPY_PATH | BUSINESS_RULE
+
+Do NOT create top-level categories for Response / Integration / Exception / Method_URL.
+Those concerns are represented inside the 5 standard groups:
+- URL / Method belongs to AUTH, matching the Senior template.
+- Downstream / timeout / DB / integration / exception branches belong to BUSINESS_RULE when documented.
+- Response/body validation is expressed in the expected_* fields of the relevant testcase, not as a separate category.
+
+==================================================
+4. ATOMICITY
+==================================================
+
+ONE independent test condition = ONE Rule = ONE Testcase.
+
+Do not merge independent failures such as:
+- invalid status + invalid txnType
+- N-1 + N + N+1
+- downstream failure + timeout
+
+Do not over-split one equivalent behavior just to increase testcase count.
+Do not generate a duplicate positive Business Rule if the same valid condition is already covered by a Happy Path.
+
+==================================================
+5. EXPLICIT / DERIVED
 ==================================================
 
 EXPLICIT:
-Requirement/behavior/validation/status/message directly described by the source.
-applied_qa_rule = "EXPLICIT FROM SPEC" or "EXPLICIT FROM BA".
+- requirement / branch / response / error directly described by source.
 
 DERIVED:
-Specific contract/requirement + one allowed QA Rule below => Test Rule.
-DERIVED requires source_requirement + applied_qa_rule + generation_reason.
+- source gives a specific contract/rule and one QA catalog rule below deterministically creates a testcase.
+- applied_qa_rule and generation_reason are mandatory.
 
-INFERRED / BEST PRACTICE without source evidence => DO NOT output.
-
-==================================================
-API QA RULE LIBRARY — ONLY USE THESE RULES
-==================================================
-
-1. METHOD / URL
-- Documented Method/Path
-- Wrong Method Negative: only DERIVE when method/path is explicitly defined. Do not assert 405 unless the Spec says so.
-- Unknown/Wrong Path: only create when routing/not-found behavior or status is documented.
-
-2. AUTHENTICATION
-Only apply when endpoint/global security says the API requires authentication.
-You MAY DERIVE:
-- Missing Credential
-- Invalid Credential / malformed credential
-- Expired Credential only when Bearer/JWT/OAuth/token lifecycle has source basis
-DO NOT invent 401/message if the source does not provide it.
-
-3. AUTHORIZATION
-Only create when role/scope/permission/branch/unit ownership is documented.
-Do not invent a role matrix from general knowledge.
-
-4. REQUEST FIELD / PARAMETER
-Use the exact location: header | path | query | body.
-- required=true / required schema => Missing Field/Parameter
-- nullable=false or explicit no-null rule => Null invalid
-- data type => Wrong Type
-- minLength/maxLength => Boundary Value
-- minimum/maximum/exclusiveMinimum/exclusiveMaximum => Numeric Boundary
-- pattern/format => Valid/Invalid Format
-- enum/allowed values => In Enum / Outside Enum
-- array minItems/maxItems/uniqueItems/item type => Array Boundary / Duplicate / Wrong Item Type
-- nested object required property => Missing Nested Required Field
-
-DO NOT invent empty/whitespace/special char/unicode/trim cases unless the schema or BA provides a suitable basis.
-Required does NOT automatically mean null/empty invalid unless the contract says so.
-
-5. HAPPY PATH
-Each distinct success scenario described by Spec/BA = one separate Rule.
-Preserve the documented request condition, status code, message, and response behavior.
-
-6. RESPONSE VALIDATION
-Only create from response contracts explicitly described by the source:
-- documented status code
-- response schema / required response field
-- response field format/mapping
-- business code/message
-Do not invent status codes not present in the source.
-
-7. BUSINESS RULE
-Each specific business condition / state / dependency / permission = one separate Rule.
-Do not hide a specific Business Rule inside Happy Path if it needs an independent objective.
-
-8. INTEGRATION
-Only when the source describes downstream/upstream systems:
-- request/response mapping
-- downstream code mapping
-- retry/timeout/fallback if described
-- DB update/query if described
-Do not invent external-system behavior.
-
-9. EXCEPTION
-Only when there is source evidence:
-- timeout
-- network/system error
-- payload/file limit
-- database error
-- documented 4xx/5xx
-- downstream exception
-Do not automatically generate 500/timeout/database error.
+Do NOT generate generic "best practice" cases without source basis.
 
 ==================================================
-PRESERVE CONTRACT DETAILS — CRITICAL
+6. API QA RULE CATALOG
 ==================================================
 
-Do not lose information that has testing value.
-If the source contains the following, preserve it in source_requirement/test_condition/expected_result as appropriate:
-- endpoint + method
-- header/parameter/body field name + location
-- required/nullable/type
-- min/max/length/boundary
-- pattern/format/enum
-- exact status code
-- exact business/error code
-- exact message
-- request/response mapping
-- state/role/permission
-- downstream code
-- DB behavior
+6.1 AUTH
+Use AUTH for Authentication AND URL/Method checks, matching the Senior testcase template.
 
-Do not turn:
-"codeType=BOND_TYPE, status=null"
-into:
-"Kiểm tra API danh mục".
+Authentication — only if auth/token is documented:
+- Missing credential
+- Invalid credential if contract/security supports it
+- Expired credential only when token lifecycle/expiry is supported
+- Valid credential is normally exercised by Happy Path; avoid duplicate testcase unless source requires a separate auth-success objective
+
+URL / Method — only when endpoint/method is explicitly known:
+- wrong Method: one representative negative case
+- wrong URL/path: one representative negative case
+Do not invent expected 404/405/message unless the source documents it.
+
+6.2 PERMISSION
+Only when permission / scope / role / ownership / authorized account/resource is explicitly documented.
+Examples:
+- no service/function permission
+- API permission exists but required resource/account permission is absent
+
+IMPORTANT:
+Workflow eligibility is BUSINESS_RULE, not PERMISSION, unless the source specifically defines it as access authorization.
+Do not invent functionCode/productCode/subProductCode/role/account permission when source does not describe them.
+
+6.3 VALIDATION — REQUEST CONTRACT ONLY
+VALIDATION covers request shape/field contract, NOT business semantics.
+
+Required List:
+IF field type=List/Array AND required=true, you MAY DERIVE separate cases for:
+- missing field
+- null
+- empty list []
+- null/blank element when item validity makes this meaningful
+- invalid item type/format only when item constraints exist
+
+Required String:
+IF field type=String AND required=true, you MAY DERIVE separate cases for:
+- missing field
+- null
+- empty string
+- whitespace-only
+
+Length:
+- exact length N -> N-1, N, N+1 as independent Rules when length is testable
+- max/min length -> generate meaningful boundary branches around the documented boundary
+
+Character / Pattern:
+- derive valid/invalid character classes only when source defines allowed characters/pattern/format
+- String type alone is NOT evidence that special characters must fail
+
+Enum:
+- meaningful allowed value/path
+- one outside-enum invalid value when enum/allowed values are documented
+
+Date/Number format:
+- missing/null/wrong type/wrong format when contract supports the distinction
+
+Business semantics such as "txnId does not exist", "status invalid", "effDate expired" are BUSINESS_RULE, not VALIDATION.
+
+6.4 HAPPY_PATH
+At least one success scenario per endpoint when success behavior is documented.
+Do NOT assume one API = one success testcase.
+Create separate Happy Path Rules when a condition changes the actual processing path, for example:
+- intermediate checker vs final checker
+- one-level vs two-level workflow
+- distinct authentication/signing method
+- single vs batch when batch behavior is genuinely supported/meaningful
+
+Happy Path expected fields should capture the documented successful response/business outcome without dumping an entire sample response unnecessarily.
+
+6.5 BUSINESS_RULE
+Every independent business decision branch that changes expected behavior should be its own Rule.
+Use for:
+- existence / data-found rule
+- date/time comparison
+- exact equality/inequality
+- transaction state/status
+- transaction type / business enum
+- workflow branch / workflow eligibility
+- configured time window / parameter
+- account/business eligibility
+- numeric formula / balance boundary
+- downstream service result
+- DB / state / log side effects
+- async behavior when documented
+- timeout/system/downstream error when documented
+
+Decision / Boundary derivation examples:
+- A < B and source defines fail; A >= B pass -> create meaningful fail + boundary/pass coverage without unnecessary permutations.
+- valid state = PENDING_APPROVAL -> invalid state is a separate Rule; valid state is normally already covered by Happy Path.
+- external service source defines SUCCESS / FAILURE / TIMEOUT with different outcomes -> 3 independent Rules.
+
+Do NOT create undocumented timeout/500/retry/DB/network cases.
 
 ==================================================
-EXPECTED RESULT — DO NOT INVENT
+7. PRECONDITION — SOURCE-DRIVEN AND OPTIONAL
 ==================================================
 
-Every Rule MUST contain enough expected_result for deterministic Python mapping/export.
-- If the source provides exact status/message/body => preserve it exactly.
-- If a Rule is DERIVED from schema but the source does not provide an exact status/message => describe the expectation only at the contract level; DO NOT invent a code/message.
+precondition MUST contain only conditions needed to execute/reach THIS testcase.
+Do not use one banking precondition template for every API.
 
-Example in VIETNAMESE:
-"Request không thỏa contract vì thiếu field bắt buộc customerId; source không cung cấp status code cụ thể nên không khẳng định status code."
+Include a precondition only when:
+1. explicitly described by source; OR
+2. strictly required to reach the target branch.
+
+For a testcase targeting processing step N:
+- include required prior valid steps/states needed to reach N
+- include the target setup/condition when it is a stateful prerequisite
+- do NOT include conditions that happen after step N
+
+Do NOT invent:
+- function code
+- product/sub-product code
+- workflow state
+- account permission
+- DB state
+- previous API call
+unless the documents support it.
+
+If no special precondition is needed, use an empty string.
 
 ==================================================
-OUTPUT ROOT SCHEMA — MANDATORY
+8. TEST DATA — USABLE, DO NOT FABRICATE REAL DATA
 ==================================================
 
-Return ONLY valid JSON.
-NO markdown fence.
-NO text before/after JSON.
-The root MUST be an object containing an "api_modules" array.
-DO NOT return an endpoint object or Rule object at root.
+test_data should be directly usable as a testcase design artifact.
+- If source provides concrete sample data, preserve it when appropriate.
+- For validation, show the exact mutation/invalid value/JSON fragment when possible.
+- When real environment data is required but not provided, use explicit placeholders instead of fabricating IDs/tokens:
+  <VALID_TOKEN>
+  <EXPIRED_TOKEN>
+  <VALID_TXN_ID>
+  <NON_EXISTING_TXN_ID>
+  <TXN_PENDING_APPROVAL>
 
-IMPORTANT LANGUAGE RULE:
-Write these textual values in VIETNAMESE:
-module_name (when it is a business-readable name), summary, target, rule_name,
-test_objective, test_condition, expected_result, source_requirement, generation_reason.
-Keep endpoint_path, HTTP method, field/parameter names, codes, enum values, and exact source messages unchanged when needed.
-applied_qa_rule may keep standard QA technique names in English.
+Do not invent production/customer/account data.
+
+==================================================
+9. EXPECTED RESULT — ONE COMMON OUTPUT TEMPLATE FOR ALL CASES
+==================================================
+
+DO NOT write one long free-form expected_result paragraph.
+Fill these structured fields for EVERY Rule:
+- expected_http_code
+- expected_status
+- expected_code
+- expected_message
+- expected_trace_id
+- expected_data_body
+- business_result
+
+Rules:
+- Fill exact values only when source supports them.
+- If a field is not documented, return empty string "".
+- Do not infer 200/400/401/403/404/405/500 unless documented or explicitly part of the source behavior.
+- exact message/code from source must be preserved verbatim when important.
+- expected_data_body is a concise expectation such as "Có dữ liệu đúng cấu trúc theo đặc tả", not a pasted full sample response unless exact body matching is the requirement.
+- business_result describes the expected business outcome/state/DB/log/downstream effect when documented; otherwise empty.
+- TraceId: use "Có giá trị" only if source confirms that traceId is part of the relevant response contract; otherwise blank.
+
+Python will always render the SAME final layout:
+HTTP Code:
+Status:
+Code:
+Message:
+TraceId:
+Data/Body:
+Business Result:
+
+Actual Result is execution-time evidence and MUST NOT be generated here.
+
+==================================================
+10. PRESERVE TRACEABILITY
+==================================================
+
+Do not lose testable source details:
+- endpoint/method
+- field location + name
+- required/type/length/pattern/enum
+- exact business condition
+- status/state transition
+- documented response/error code/message
+- downstream mapping
+- DB/log/state side effect
+
+source_requirement should contain a concise source-grounded statement, not an invented summary.
+
+==================================================
+11. OUTPUT SCHEMA — MANDATORY
+==================================================
+
+Return ONLY valid JSON. No markdown. No explanation.
+Root MUST contain api_modules.
 
 {
-  "api_test_design_version": "3.2",
+  "api_test_design_version": "3.3",
   "api_modules": [
     {
       "module_name": "",
@@ -4098,14 +3872,23 @@ applied_qa_rule may keep standard QA technique names in English.
             {
               "rule_id": "TMP-001",
               "target": "",
-              "category": "AUTHENTICATION | AUTHORIZATION | METHOD_URL | REQUEST_VALIDATION | HAPPY_PATH | BUSINESS_RULE | RESPONSE_VALIDATION | INTEGRATION | EXCEPTION",
+              "category": "AUTH | PERMISSION | VALIDATION | HAPPY_PATH | BUSINESS_RULE",
               "rule_type": "EXPLICIT | DERIVED",
               "rule_name": "",
               "test_objective": "",
               "test_condition": "",
-              "expected_result": "",
+              "precondition": "",
+              "test_data": "",
+              "expected_http_code": "",
+              "expected_status": "",
+              "expected_code": "",
+              "expected_message": "",
+              "expected_trace_id": "",
+              "expected_data_body": "",
+              "business_result": "",
               "source_requirement": "",
               "source_document": "API_SPEC | BA | BOTH",
+              "reconciliation_status": "CONSISTENT | COMPLEMENTARY | CONFLICT | DOC_ONLY | DERIVED",
               "applied_qa_rule": "",
               "generation_reason": ""
             }
@@ -4117,124 +3900,30 @@ applied_qa_rule may keep standard QA technique names in English.
 }
 
 If CURRENT SOURCE has no meaningful testable requirement:
-{"api_test_design_version":"3.2","api_modules":[]}
+{"api_test_design_version":"3.3","api_modules":[]}
 
 ==================================================
-FINAL CHECK BEFORE OUTPUT
+12. FINAL SELF-CHECK
 ==================================================
 
-- Did you cover every meaningful contract/requirement in CURRENT SOURCE?
-- Did you preserve important parameter/header/body/status/business conditions?
-- Did you merge multiple independent objectives into one Rule?
-- Is EXPLICIT/DERIVED classification correct?
-- Does every DERIVED Rule contain applied_qa_rule?
-- Did you invent 401/403/404/405/500/message/timeout/DB behavior?
-- Is any Rule based only on Endpoint Index Hint/Context?
-- Is the root exactly an api_modules array?
-- Are all generated human-readable Rule Matrix fields in VIETNAMESE?
+- Category is exactly one of the 5 Senior template groups?
+- Every Rule belongs ONLY to FORCED TARGET API and no sibling endpoint was created?
+- Validation is contract-level; business semantics are Business Rule?
+- One independent branch = one Rule?
+- Precondition contains only source-supported/prerequisite conditions?
+- No banking-specific prerequisite was invented?
+- Test data is usable or uses explicit placeholders instead of fake environment data?
+- Expected fields use one common template and contain no invented code/message/status?
+- Side effects are in business_result rather than separate Response/Integration categories?
+- Conflict is preserved rather than silently resolved?
+- DERIVED Rules have applied_qa_rule + generation_reason?
+- Human-readable content is Vietnamese?
 
 === INPUT CHUNK ===
 {content}
 """
 
 
-PROMPT_API_AGENT2_RENDERER = """
-You are API TEST CASE RENDERER.
-You are NOT an API QA Analyst.
-You MUST NOT re-read the API Spec/BA and MUST NOT apply additional QA Rules.
-
-LANGUAGE REQUIREMENT — CRITICAL:
-- ALL generated API Test Case content and tree labels MUST be written in VIETNAMESE.
-- Keep technical identifiers exactly as they appear in the Rule Matrix: HTTP Method, Endpoint, Header, Parameter, Field Name, Status Code, Response Code, enum/code/message where exact preservation is required.
-
-YOUR ONLY TASK:
-Convert every test_rule in the API TEST DESIGN / RULE MATRIX into exactly 1 API Test Case in tree format.
-
-==================================================
-SOURCE OF TRUTH — CRITICAL
-==================================================
-
-The Rule Matrix is the ONLY source of truth.
-DO NOT:
-- add/remove/merge test_rule
-- invent auth cases
-- invent wrong method/url cases
-- invent validation
-- invent status code/message
-- invent Business Rules
-- invent DB/integration behavior
-- invent exceptions
-
-If the input has N test_rules => output exactly N Test Cases.
-
-==================================================
-MAPPING 1 RULE = 1 TEST CASE
-==================================================
-
-Use exactly:
-- module_name
-- method
-- endpoint_path
-- summary
-- target
-- category
-- rule_name
-- test_objective
-- test_condition
-- expected_result
-- source_requirement
-
-Do not invent values that are not present in the Rule Matrix.
-If the endpoint is UNMAPPED: keep UNMAPPED; do not guess URL/method.
-
-==================================================
-CATEGORY TREE ORDER
-==================================================
-
-AUTHENTICATION -> 1. Kiểm tra Xác thực
-AUTHORIZATION -> 2. Kiểm tra Phân quyền
-METHOD_URL -> 3. Kiểm tra Method & URL
-REQUEST_VALIDATION -> 4. Kiểm tra Validate Request
-HAPPY_PATH -> 5. Kiểm tra Luồng thành công
-BUSINESS_RULE -> 6. Kiểm tra Business Rules
-RESPONSE_VALIDATION -> 7. Kiểm tra Response
-INTEGRATION -> 8. Kiểm tra Tích hợp
-EXCEPTION -> 9. Kiểm tra Ngoại lệ
-
-Only create a category if it contains Rules.
-
-==================================================
-OUTPUT STRUCTURE
-==================================================
-
-- [Module]
-  - [METHOD] [Endpoint Path]
-    - [Nhóm kiểm thử]
-      - TC_API_001 - [METHOD] [Endpoint] - [rule_name]
-        - Pre-condition: chỉ dùng điều kiện được Rule Matrix cung cấp hoặc điều kiện tối thiểu không suy diễn
-          - Steps & Data test: 1. Chuẩn bị request theo test_condition -> 2. Gọi đúng method/endpoint trong Matrix -> 3. Truyền dữ liệu/header/param/body đúng target/rule -> 4. Send Request
-            - Response (Kết quả mong đợi): dùng đúng expected_result; nếu Matrix không có exact status/message thì KHÔNG tự thêm
-
-Pre-condition is the direct child of the Test Case.
-Steps & Data test is the direct child of Pre-condition.
-Response is the direct child of Steps & Data test.
-Steps/Response stay on one line; do not create a separate node for each item.
-
-All human-readable Test Case text MUST be in VIETNAMESE.
-
-==================================================
-OUTPUT
-==================================================
-
-Return ONLY a plain-text tree using "-".
-NO JSON.
-NO markdown code block.
-NO explanation/statistics.
-ALL generated Test Case content MUST be in VIETNAMESE.
-
-=== API TEST DESIGN / RULE MATRIX ===
-{content}
-"""
 
 
 # ==========================================

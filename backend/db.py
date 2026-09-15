@@ -5,13 +5,23 @@ import json
 import os
 import sqlite3
 import time
+import shutil
 from pathlib import Path
 from typing import Any
 
 BACKEND_DIR = Path(__file__).resolve().parent
-DEFAULT_DB_PATH = BACKEND_DIR / "data" / "testpilot.db"
-DB_PATH = Path(os.getenv("TESTPILOT_DB_PATH", str(DEFAULT_DB_PATH)))
+# V1.9.2: keep data OUTSIDE versioned source folders so rebuilding/upgrading the app
+# does not make projects/testcases appear to disappear. Override with TESTPILOT_DB_PATH if needed.
+DEFAULT_DATA_DIR = Path(os.getenv("TESTPILOT_DATA_DIR", str(Path.home() / ".testpilot-ai")))
+DEFAULT_DB_PATH = DEFAULT_DATA_DIR / "testpilot.db"
+DB_PATH = Path(os.getenv("TESTPILOT_DB_PATH", str(DEFAULT_DB_PATH))).expanduser()
 DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+LEGACY_DB_PATH = BACKEND_DIR / "data" / "testpilot.db"
+if not DB_PATH.exists() and LEGACY_DB_PATH.exists() and LEGACY_DB_PATH.resolve() != DB_PATH.resolve():
+    try:
+        shutil.copy2(LEGACY_DB_PATH, DB_PATH)
+    except Exception:
+        pass
 
 
 def _connect() -> sqlite3.Connection:
@@ -94,8 +104,242 @@ def init_db() -> None:
 
             CREATE INDEX IF NOT EXISTS idx_testcases_run
               ON testcases(run_id, sort_order);
+
+            CREATE INDEX IF NOT EXISTS idx_testcases_project_tree
+              ON testcases(project_id, scope, screen, folder_id);
+
+            CREATE TABLE IF NOT EXISTS analysis_jobs (
+                job_id TEXT PRIMARY KEY,
+                kind TEXT NOT NULL,
+                project_id TEXT NOT NULL,
+                folder_id TEXT NOT NULL,
+                status TEXT NOT NULL,
+                stage TEXT NOT NULL DEFAULT 'queued',
+                message TEXT NOT NULL DEFAULT '',
+                progress INTEGER NOT NULL DEFAULT 0,
+                run_id TEXT,
+                source_names_json TEXT NOT NULL DEFAULT '[]',
+                error_json TEXT NOT NULL DEFAULT '{}',
+                created_at REAL NOT NULL,
+                updated_at REAL NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_analysis_jobs_status
+              ON analysis_jobs(status, updated_at);
+
+            CREATE TABLE IF NOT EXISTS projects (
+                project_id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                description TEXT NOT NULL DEFAULT '',
+                project_type TEXT NOT NULL DEFAULT 'both',
+                data_json TEXT NOT NULL DEFAULT '{}',
+                created_at REAL NOT NULL,
+                updated_at REAL NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_projects_updated
+              ON projects(updated_at DESC);
             """
         )
+
+
+def upsert_project(project: dict) -> dict:
+    project_id = str(project.get("id") or project.get("project_id") or "").strip()
+    if not project_id:
+        raise ValueError("project id is required")
+    name = str(project.get("name") or project_id).strip()
+    description = str(project.get("description") or "").strip()
+    project_type = str(project.get("type") or project.get("project_type") or "both").strip().lower()
+    if project_type not in {"web", "api", "both"}:
+        project_type = "both"
+    created_at = float(project.get("createdAt") or project.get("created_at") or time.time())
+    updated_at = float(project.get("updatedAt") or project.get("updated_at") or time.time())
+    payload = dict(project)
+    payload["id"] = project_id
+    payload["name"] = name
+    payload["description"] = description
+    payload["type"] = project_type
+    payload["createdAt"] = created_at
+    payload["updatedAt"] = updated_at
+    with _connect() as conn:
+        conn.execute(
+            """
+            INSERT INTO projects(project_id, name, description, project_type, data_json, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(project_id) DO UPDATE SET
+              name=excluded.name,
+              description=excluded.description,
+              project_type=excluded.project_type,
+              data_json=excluded.data_json,
+              updated_at=excluded.updated_at
+            """,
+            (project_id, name, description, project_type, json.dumps(payload, ensure_ascii=False), created_at, updated_at),
+        )
+    return get_project(project_id) or payload
+
+
+def get_project(project_id: str) -> dict | None:
+    with _connect() as conn:
+        row = conn.execute("SELECT * FROM projects WHERE project_id=?", (project_id,)).fetchone()
+    if not row:
+        return None
+    try:
+        data = json.loads(row["data_json"] or "{}")
+    except Exception:
+        data = {}
+    data.update({
+        "id": row["project_id"],
+        "name": row["name"],
+        "description": row["description"],
+        "type": row["project_type"],
+        "createdAt": row["created_at"],
+        "updatedAt": row["updated_at"],
+    })
+    return data
+
+
+def list_projects() -> list[dict]:
+    # Read all project metadata in one SQLite query. The previous implementation
+    # opened a new connection for every row, which becomes noticeably slower over
+    # a Cloudflare tunnel and on Windows antivirus-scanned folders.
+    with _connect() as conn:
+        rows = conn.execute(
+            """SELECT project_id, name, description, project_type, data_json, created_at, updated_at
+               FROM projects
+               ORDER BY updated_at DESC, created_at DESC"""
+        ).fetchall()
+    projects: list[dict] = []
+    for row in rows:
+        try:
+            data = json.loads(row["data_json"] or "{}")
+        except Exception:
+            data = {}
+        data.update({
+            "id": row["project_id"],
+            "name": row["name"],
+            "description": row["description"],
+            "type": row["project_type"],
+            "createdAt": row["created_at"],
+            "updatedAt": row["updated_at"],
+        })
+        projects.append(data)
+    return projects
+
+
+def delete_project(project_id: str) -> bool:
+    with _connect() as conn:
+        cur = conn.execute("DELETE FROM projects WHERE project_id=?", (project_id,))
+        return cur.rowcount > 0
+
+
+def create_analysis_job(
+    *,
+    job_id: str,
+    kind: str,
+    project_id: str,
+    folder_id: str,
+    source_names: list[str],
+) -> None:
+    now = time.time()
+    with _connect() as conn:
+        conn.execute(
+            """
+            INSERT INTO analysis_jobs
+            (job_id, kind, project_id, folder_id, status, stage, message, progress,
+             run_id, source_names_json, error_json, created_at, updated_at)
+            VALUES (?, ?, ?, ?, 'queued', 'queued', ?, 0, NULL, ?, '{}', ?, ?)
+            """,
+            (
+                job_id, kind, project_id, folder_id,
+                "Đã tiếp nhận tài liệu. Đang xếp hàng phân tích.",
+                json.dumps(source_names, ensure_ascii=False),
+                now, now,
+            ),
+        )
+
+
+def update_analysis_job(
+    job_id: str,
+    *,
+    status: str | None = None,
+    stage: str | None = None,
+    message: str | None = None,
+    progress: int | None = None,
+    run_id: str | None = None,
+    error_payload: dict | None = None,
+) -> None:
+    fields: list[str] = ["updated_at=?"]
+    values: list[Any] = [time.time()]
+    if status is not None:
+        fields.append("status=?")
+        values.append(status)
+    if stage is not None:
+        fields.append("stage=?")
+        values.append(stage)
+    if message is not None:
+        fields.append("message=?")
+        values.append(message)
+    if progress is not None:
+        fields.append("progress=?")
+        values.append(max(0, min(100, int(progress))))
+    if run_id is not None:
+        fields.append("run_id=?")
+        values.append(run_id)
+    if error_payload is not None:
+        fields.append("error_json=?")
+        values.append(json.dumps(error_payload, ensure_ascii=False))
+    values.append(job_id)
+    with _connect() as conn:
+        conn.execute(f"UPDATE analysis_jobs SET {', '.join(fields)} WHERE job_id=?", values)
+
+
+def get_analysis_job(job_id: str) -> dict | None:
+    with _connect() as conn:
+        row = conn.execute("SELECT * FROM analysis_jobs WHERE job_id=?", (job_id,)).fetchone()
+    if not row:
+        return None
+    try:
+        source_names = json.loads(row["source_names_json"] or "[]")
+    except Exception:
+        source_names = []
+    try:
+        error_payload = json.loads(row["error_json"] or "{}")
+    except Exception:
+        error_payload = {}
+    return {
+        "job_id": row["job_id"],
+        "kind": row["kind"],
+        "project_id": row["project_id"],
+        "folder_id": row["folder_id"],
+        "status": row["status"],
+        "stage": row["stage"],
+        "message": row["message"],
+        "progress": row["progress"],
+        "run_id": row["run_id"],
+        "source_names": source_names,
+        "error": error_payload,
+        "created_at": row["created_at"],
+        "updated_at": row["updated_at"],
+    }
+
+
+def fail_orphaned_analysis_jobs() -> int:
+    # A process restart destroys in-memory background tasks. Make that state explicit
+    # instead of leaving jobs forever in queued/processing.
+    now = time.time()
+    payload = json.dumps({"message": "Server đã khởi động lại khi tác vụ đang chạy. Vui lòng phân tích lại."}, ensure_ascii=False)
+    with _connect() as conn:
+        cur = conn.execute(
+            """
+            UPDATE analysis_jobs
+            SET status='failed', stage='interrupted',
+                message='Tác vụ bị gián đoạn do server khởi động lại.',
+                error_json=?, updated_at=?
+            WHERE status IN ('queued', 'processing')
+            """,
+            (payload, now),
+        )
+        return int(cur.rowcount)
 
 
 def save_run(
@@ -281,6 +525,30 @@ def list_folder_testcases(project_id: str, folder_id: str, scope: str) -> list[d
         ).fetchall()
     return [_row_to_tc(row) for row in rows]
 
+
+
+def list_project_tree_summary(project_id: str) -> list[dict]:
+    """Fast explorer summary without deserializing every testcase row."""
+    with _connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT scope, screen, folder_id, COUNT(*) AS testcase_count
+            FROM testcases
+            WHERE project_id=?
+            GROUP BY scope, screen, folder_id
+            ORDER BY scope, screen COLLATE NOCASE, folder_id
+            """,
+            (project_id,),
+        ).fetchall()
+    return [
+        {
+            "scope": row["scope"],
+            "screen": row["screen"],
+            "folder_id": row["folder_id"],
+            "count": int(row["testcase_count"] or 0),
+        }
+        for row in rows
+    ]
 
 
 def list_project_testcases(project_id: str, scope: str | None = None) -> list[dict]:
@@ -493,5 +761,7 @@ def delete_testcase(record_id: int) -> bool:
 
 
 init_db()
-# One-time-safe migration for existing V1.3/V1.5 databases.
+# Normalize system-managed testcase IDs at startup.
 renumber_all_testcase_ids()
+# Any queued/processing job belonged to a previous process and cannot still be running.
+fail_orphaned_analysis_jobs()

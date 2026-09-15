@@ -15,9 +15,10 @@ import {
   updateTestcase,
 } from '../api/client'
 
-const TYPES = ['Giao diện', 'Kiểm tra dữ liệu', 'Chức năng', 'Ngoại lệ', 'Popup', 'Luồng']
+const WEB_TYPES = ['Giao diện', 'Kiểm tra dữ liệu', 'Chức năng', 'Ngoại lệ', 'Popup', 'Luồng']
+const API_TYPES = ['Auth', 'Permission', 'Validation', 'Happy Path', 'Business Rule']
 const slug = value => String(value || '').toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '').replace(/đ/g,'d').replace(/[^a-z0-9]+/g, '-')
-const CATEGORY_ORDER = { VALIDATION: 1, REQUEST_VALIDATION: 1, RESPONSE_VALIDATION: 1, UI: 2, ACTION: 3, DATA_GRID: 4, BUSINESS_FLOW: 5, EXCEPTION: 6 }
+const CATEGORY_ORDER = { AUTH: 1, PERMISSION: 2, VALIDATION: 3, HAPPY_PATH: 4, BUSINESS_RULE: 5, UI: 10, ACTION: 11, DATA_GRID: 12, BUSINESS_FLOW: 13, EXCEPTION: 14 }
 const FEATURE_GROUP_ORDER = { PRECONDITION_PERMISSION: 1, GENERAL_UI: 2, FILTER: 3, DATA_GRID: 4, FUNCTION: 5, API: 6 }
 
 const blankAdvanced = {
@@ -62,6 +63,7 @@ export default function TestcasePage() {
   const { projectId = 'website-tmdt' } = params
   const [searchParams] = useSearchParams()
   const scope = params.scope === 'api' || searchParams.get('scope') === 'api' ? 'api' : 'web'
+  const types = scope === 'api' ? API_TYPES : WEB_TYPES
   const folderId = params.folderId || `__scope_${scope}__`
   const screenFilter = searchParams.get('screen') || ''
   const project = getProjectById(projectId)
@@ -211,7 +213,7 @@ export default function TestcasePage() {
     <AppShell wide>
       <div className="testcase-workspace-page">
         <div className="clean-page-head testcase-clean-head">
-          <button className="icon-text-button" onClick={() => navigate(`/project/${projectId}/scope/${scope}`)}>
+          <button className="icon-text-button" onClick={() => navigate(params.folderId ? `/project/${projectId}` : `/project/${projectId}/scope/${scope}`)}>
             <ArrowLeft size={18} /> Quay lại
           </button>
           <div className="clean-title">
@@ -227,7 +229,7 @@ export default function TestcasePage() {
 
         <section className="test-toolbar">
           <label className="search-box large"><Search size={18} /><input value={query} onChange={e => setQuery(e.target.value)} placeholder="Tìm kiếm theo ID, tên testcase..." /></label>
-          <label className="select-icon"><Filter size={17} /><select value={filter} onChange={e => setFilter(e.target.value)}><option value="">Tất cả loại testcase</option>{TYPES.map(t => <option key={t}>{t}</option>)}</select></label>
+          <label className="select-icon"><Filter size={17} /><select value={filter} onChange={e => setFilter(e.target.value)}><option value="">Tất cả loại testcase</option>{types.map(t => <option key={t}>{t}</option>)}</select></label>
           <div className="test-toolbar-actions">
             <button className="btn btn-primary" onClick={() => openEditor(null)}><Plus size={18} /> Thêm testcase</button>
             <a className="btn btn-outline" href={excelUrl}><Download size={17} /> Tải Excel</a>
@@ -316,7 +318,7 @@ export default function TestcasePage() {
           {draft && <div className="modal-body testcase-form">
             <div className="form-grid two">
               <label><span>ID <small>(tự động TC_001 → TC_N)</small></span><input className="input" value={draft.id} readOnly /></label>
-              <label><span>Loại testcase</span><select className="input" value={draft.type} onChange={e => setDraft({...draft,type:e.target.value})}>{TYPES.map(t => <option key={t}>{t}</option>)}</select></label>
+              <label><span>Loại testcase</span><select className="input" value={draft.type} onChange={e => setDraft({...draft,type:e.target.value})}>{types.map(t => <option key={t}>{t}</option>)}</select></label>
             </div>
             <label><span>Name *</span><input className="input" value={draft.name} onChange={e => setDraft({...draft,name:e.target.value})} /></label>
             <div className="form-grid two">

@@ -19,7 +19,50 @@ const WEB_TYPES = ['Giao diện', 'Kiểm tra dữ liệu', 'Chức năng', 'Ngo
 const API_TYPES = ['Auth', 'Permission', 'Validation', 'Happy Path', 'Business Rule']
 const slug = value => String(value || '').toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '').replace(/đ/g,'d').replace(/[^a-z0-9]+/g, '-')
 const CATEGORY_ORDER = { AUTH: 1, PERMISSION: 2, VALIDATION: 3, HAPPY_PATH: 4, BUSINESS_RULE: 5, UI: 10, ACTION: 11, DATA_GRID: 12, BUSINESS_FLOW: 13, EXCEPTION: 14 }
-const FEATURE_GROUP_ORDER = { PRECONDITION_PERMISSION: 1, GENERAL_UI: 2, FILTER: 3, DATA_GRID: 4, FUNCTION: 5, API: 6 }
+const FEATURE_GROUP_ORDER = { UI: 1, VALIDATE: 2, FUNCTION: 3, POPUP: 4, DATA_GRID: 5, EXCEPTION: 6, API: 7 }
+
+const canonicalFeatureGroup = item => {
+  const raw = String(item?.featureGroup || '').toUpperCase()
+  const category = String(item?.category || '').toUpperCase()
+  const popupText = slug(`${item?.featureName || ''} ${item?.name || ''} ${item?.screen || ''}`)
+  if (['UI', 'VALIDATE', 'FUNCTION', 'POPUP', 'DATA_GRID', 'EXCEPTION', 'API'].includes(raw)) return raw
+  if (raw === 'PRECONDITION_PERMISSION' || raw === 'GENERAL_UI') return 'UI'
+  if (raw === 'FILTER') {
+    if (category === 'VALIDATION') return 'VALIDATE'
+    if (category === 'EXCEPTION') return 'EXCEPTION'
+    return 'FUNCTION'
+  }
+  if (raw === 'DATA_GRID') return 'DATA_GRID'
+  if (raw === 'FUNCTION') {
+    if (popupText.includes('popup') || popupText.includes('modal') || popupText.includes('hop-thoai')) return 'POPUP'
+    if (category === 'EXCEPTION') return 'EXCEPTION'
+    if (category === 'VALIDATION') return 'VALIDATE'
+    return 'FUNCTION'
+  }
+  if (category === 'UI') return 'UI'
+  if (category === 'VALIDATION') return 'VALIDATE'
+  if (category === 'DATA_GRID') return 'DATA_GRID'
+  if (category === 'EXCEPTION') return 'EXCEPTION'
+  return 'FUNCTION'
+}
+
+const featureNameRank = item => {
+  const group = canonicalFeatureGroup(item)
+  const raw = String(item?.featureGroup || '').toUpperCase()
+  const feature = slug(item?.featureName || '')
+  if (group === 'UI' && (raw === 'PRECONDITION_PERMISSION' || feature === 'permission')) return 0
+  if (group === 'UI' && (raw === 'GENERAL_UI' || feature === 'giao-dien-chung')) return 1
+  return 2
+}
+
+const canonicalFeatureName = item => {
+  const raw = String(item?.featureGroup || '').toUpperCase()
+  if (raw === 'PRECONDITION_PERMISSION') return 'Permission'
+  if (raw === 'GENERAL_UI') return 'Giao diện chung'
+  return item?.featureName || 'Khác'
+}
+
+const displayTestcaseName = value => String(value || '').replace(/ánh\s+xạ/gi, 'Mapping')
 
 const blankAdvanced = {
   actualResult: '', run1: '', run2: '', run3: '', currentResult: '', note: '', errorCode: '',
@@ -127,9 +170,11 @@ export default function TestcasePage() {
     return items
       .filter(item => (!screenFilter || item.screen === screenFilter) && (!filter || item.type === filter) && (!q || item.id.toLowerCase().includes(q) || item.name.toLowerCase().includes(q)))
       .sort((a, b) => {
-        const fg = (FEATURE_GROUP_ORDER[a.featureGroup] ?? 99) - (FEATURE_GROUP_ORDER[b.featureGroup] ?? 99)
+        const fg = (FEATURE_GROUP_ORDER[canonicalFeatureGroup(a)] ?? 99) - (FEATURE_GROUP_ORDER[canonicalFeatureGroup(b)] ?? 99)
         if (fg) return fg
-        const fn = String(a.featureName || '').localeCompare(String(b.featureName || ''), 'vi')
+        const fr = featureNameRank(a) - featureNameRank(b)
+        if (fr) return fr
+        const fn = canonicalFeatureName(a).localeCompare(canonicalFeatureName(b), 'vi')
         if (fn) return fn
         const cat = (CATEGORY_ORDER[a.category] ?? 99) - (CATEGORY_ORDER[b.category] ?? 99)
         if (cat) return cat
@@ -137,16 +182,24 @@ export default function TestcasePage() {
       })
   }, [items, query, filter, screenFilter])
 
+  const displayIdByRecord = useMemo(() => {
+    const map = new Map()
+    visible.forEach((item, index) => map.set(item.recordId, `TC_${String(index + 1).padStart(3, '0')}`))
+    return map
+  }, [visible])
+
   const groups = useMemo(() => {
     const result = []
     const map = new Map()
     for (const item of visible) {
-      const key = `${item.featureGroup || 'OTHER'}::${item.featureName || 'Khác'}`
+      const featureName = canonicalFeatureName(item)
+      const featureGroup = canonicalFeatureGroup(item)
+      const key = `${featureGroup}::${featureName}`
       if (!map.has(key)) {
         const group = {
           key,
-          featureGroup: item.featureGroup || 'OTHER',
-          featureName: item.featureName || 'Khác',
+          featureGroup,
+          featureName,
           items: [],
         }
         map.set(key, group)
@@ -263,8 +316,8 @@ export default function TestcasePage() {
                     return (
                       <article className={`testcase-card ${open ? 'open' : ''} ${valid ? '' : 'invalid'}`} key={item.recordId}>
                         <button className="testcase-head" onClick={() => setOpenId(open ? null : item.recordId)}>
-                          <span className="tc-id">{item.id}</span>
-                          <b>{item.name}</b>
+                          <span className="tc-id">{displayIdByRecord.get(item.recordId) || item.id}</span>
+                          <b>{displayTestcaseName(item.name)}</b>
                           <span className={`type-chip type-${slug(item.type)}`}>{item.type}</span>
                           <span className={`validation-dot ${valid ? 'ok' : 'bad'}`} title={valid ? 'Hợp lệ' : 'Thiếu dữ liệu'}></span>
                           {open ? <ChevronUp size={18} /> : <ChevronDown size={18} />}

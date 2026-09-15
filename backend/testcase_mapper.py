@@ -12,11 +12,11 @@ ALLOWED_TYPES = {
 }
 
 WEB_REVIEW_CATEGORY_ORDER = {
-    "VALIDATION": 1,
-    "UI": 2,
+    "UI": 1,
+    "VALIDATION": 2,
     "ACTION": 3,
-    "DATA_GRID": 4,
-    "BUSINESS_FLOW": 5,
+    "BUSINESS_FLOW": 4,
+    "DATA_GRID": 5,
     "EXCEPTION": 6,
 }
 
@@ -65,13 +65,66 @@ def _clean(value: Any) -> str:
     return re.sub(r"\s+", " ", str(value or "")).strip()
 
 
+def _display_mapping_term(value: Any) -> str:
+    return re.sub(r"(?i)\bánh\s+xạ\b", "Mapping", str(value or "")).strip()
+
+
+def _humanize_generated_text(value: Any) -> str:
+    """Remove generator/meta wording from tester-facing content without changing business meaning."""
+    text = str(value or "")
+    if not text:
+        return ""
+    text = _display_mapping_term(text)
+    patterns = (
+        r"(?i)\bMục\s+tiêu\s+kiểm\s+thử\s*[:：-]?\s*",
+        r"(?i)\bTest\s+objective\s*[:：-]?\s*",
+        r"(?i)\btheo\s+mục\s+tiêu\s+kiểm\s+thử\b",
+        r"(?i)\b(?:do|được)\s+AI\s+(?:sinh|tạo|đề\s+xuất)\b",
+        r"(?i)\btheo\s+(?:phân\s+tích\s+)?(?:của\s+)?AI\s*[,;:]?\s*",
+        r"(?i)\bAI\s+(?:đề\s+xuất|suy\s+luận|xác\s+định|phân\s+tích|sinh|tạo)\b",
+        r"(?i)\bAI[- ]generated\b",
+        r"(?i)\bgenerated\s+by\s+AI\b",
+        r"(?i)\bthe\s+model\s+(?:suggests|generated|inferred)\b",
+    )
+    for pattern in patterns:
+        text = re.sub(pattern, "", text)
+    text = re.sub(r"\(\s*AI\s*\)|\[\s*AI\s*\]", "", text, flags=re.I)
+    text = re.sub(r"[ \t]+", " ", text)
+    text = re.sub(r"\s+([,.;:])", r"\1", text)
+    text = re.sub(r"([:;,-])\s*\1+", r"\1", text)
+    return text.strip(" \t-–—:;,.")
+
+
+def _web_feature_name(rule: dict) -> str:
+    group = _clean(rule.get("feature_group")).upper()
+    name = _clean(rule.get("feature_name"))
+    if group == "UI":
+        if core._normalize_text(name) in {"permission", "quyen truy cap", "điều kiện truy cập", "dieu kien truy cap"}:
+            return "Permission"
+        return name or "Giao diện chung"
+    if group == "DATA_GRID":
+        norm = core._normalize_text(name)
+        if not norm or norm.startswith(("cot ", "cột ")) or "mapping" in norm or ("anh xa" in norm or "ánh xạ" in norm):
+            return "Data Grid"
+    return name or {
+        "VALIDATE": "Validation",
+        "FUNCTION": "Chức năng",
+        "POPUP": "Popup",
+        "EXCEPTION": "Ngoại lệ",
+    }.get(group, "Khác")
+
+
 def _web_type(rule: dict) -> str:
-    text = " ".join(
-        _clean(rule.get(k))
-        for k in ("target", "rule_name", "test_objective", "test_condition", "expected_result", "feature_name")
-    ).casefold()
-    if any(k in text for k in ("popup", "modal", "hộp thoại", "dialog", "xác nhận")):
+    group = _clean(rule.get("feature_group")).upper()
+    if group == "POPUP":
         return "Popup"
+    if group == "EXCEPTION":
+        return "Ngoại lệ"
+    if group == "VALIDATE":
+        return "Kiểm tra dữ liệu"
+    if group == "UI":
+        return "Giao diện"
+    category = _clean(rule.get("category")).upper()
     return {
         "UI": "Giao diện",
         "VALIDATION": "Kiểm tra dữ liệu",
@@ -79,7 +132,7 @@ def _web_type(rule: dict) -> str:
         "DATA_GRID": "Chức năng",
         "BUSINESS_FLOW": "Luồng",
         "EXCEPTION": "Ngoại lệ",
-    }.get(_clean(rule.get("category")).upper(), "Chức năng")
+    }.get(category, "Chức năng")
 
 
 def _api_type(rule: dict) -> str:
@@ -106,7 +159,7 @@ def _precondition(rule: dict, *, api: bool = False) -> str:
         "vai trò", "role", "trạng thái hiện tại", "đang ở trạng thái", "đã tồn tại",
         "dependency", "phụ thuộc",
     )
-    if feature_group == "PRECONDITION_PERMISSION":
+    if feature_group in {"PRECONDITION_PERMISSION", "UI"} and _web_feature_name(rule) == "Permission":
         return condition
     if category in {"AUTHENTICATION", "AUTHORIZATION"} and api:
         return condition
@@ -132,39 +185,223 @@ def _test_data(rule: dict) -> str:
     return condition if any(m in lowered for m in data_markers) else ""
 
 
+def _ensure_sentence(value: str) -> str:
+    text = _humanize_generated_text(value).strip()
+    if not text:
+        return ""
+    return text if text.endswith((".", "!", "?")) else text + "."
+
+
+def _looks_like_action(text: str) -> bool:
+    norm = core._normalize_search_text(text)
+    verbs = (
+        "nhap ", "chon ", "bo chon", "nhan ", "click ", "xoa ", "tai len", "tim kiem",
+        "mo ", "dong ", "xac nhan", "chuyen trang", "sap xep", "keo ", "chon file",
+    )
+    return any(norm.startswith(v) for v in verbs)
+
+
+def _rule_text(rule: dict) -> str:
+    return core._normalize_search_text(" ".join(
+        _clean(rule.get(k)) for k in
+        ("target", "rule_name", "test_objective", "test_condition", "expected_result", "feature_name")
+    ))
+
+
+def _function_action_name(rule: dict) -> str:
+    text = _rule_text(rule)
+    candidates = (
+        ("dat lai", "Đặt lại"), ("reset", "Đặt lại"),
+        ("tim kiem", "Tìm kiếm"), ("search", "Tìm kiếm"),
+        ("them moi", "Thêm mới"), ("tao moi", "Thêm mới"), ("create", "Thêm mới"),
+        ("phe duyet", "Phê duyệt"), ("approve", "Phê duyệt"),
+        ("tu choi", "Từ chối"), ("reject", "Từ chối"),
+        ("huy", "Hủy"), ("cancel", "Hủy"),
+        ("xac nhan", "Xác nhận"), ("confirm", "Xác nhận"),
+        ("hold", "Hold"),
+        ("tai len", "Tải lên"), ("upload", "Tải lên"),
+        ("tai xuong", "Tải xuống"), ("download", "Tải xuống"),
+        ("xem chi tiet", "Xem chi tiết"), ("chi tiet", "Xem chi tiết"),
+        ("chinh sua", "Chỉnh sửa"), ("edit", "Chỉnh sửa"),
+        ("tao ban sao", "Tạo bản sao"), ("copy", "Tạo bản sao"),
+    )
+    for key, label in candidates:
+        if key in text:
+            return label
+    target = _humanize_generated_text(_clean(rule.get("target")))
+    feature = _humanize_generated_text(_clean(rule.get("feature_name")))
+    return target or feature
+
+
+def _condition_mentions_action(condition: str, action: str) -> bool:
+    c = core._normalize_search_text(condition)
+    a = core._normalize_search_text(action)
+    if not c or not a:
+        return False
+    return a in c and any(v in c for v in ("nhan", "click", "chon", "thuc hien", "bam", "mo", "tai"))
+
+
+def _web_feature_sort_rank(tc: dict) -> int:
+    group = _clean(tc.get("featureGroup")).upper()
+    feature = core._normalize_search_text(tc.get("featureName", ""))
+    if group == "UI" and feature == "permission":
+        return 0
+    if group == "UI" and feature == "giao dien chung":
+        return 1
+    return 2
+
+
 def _steps(rule: dict, screen_name: str, *, api: bool = False) -> list[str]:
-    target = _clean(rule.get("target"))
-    objective = _clean(rule.get("test_objective")) or _clean(rule.get("rule_name"))
-    condition = _clean(rule.get("test_condition"))
+    target = _humanize_generated_text(_clean(rule.get("target")))
+    condition = _humanize_generated_text(_clean(rule.get("test_condition")))
     pre = _precondition(rule, api=api)
-    data = _test_data(rule)
+    data = _humanize_generated_text(_test_data(rule))
+    category = _clean(rule.get("category")).upper()
+    group = _clean(rule.get("feature_group")).upper()
+    feature = _web_feature_name(rule) if not api else ""
+    text = _rule_text(rule)
 
     steps: list[str] = []
     if api:
         if target:
-            steps.append(f"Chuẩn bị đối tượng/request kiểm thử cho {target}.")
-        if objective:
-            steps.append(objective.rstrip(".") + ".")
+            steps.append(f"Chuẩn bị request và dữ liệu cho {target}.")
         if condition and condition not in {pre, data}:
-            steps.append(condition.rstrip(".") + ".")
-        steps.append("Gửi request và quan sát response.")
+            steps.append(_ensure_sentence(condition))
+        steps.append("Gửi request đến endpoint tương ứng.")
+        steps.append("Kiểm tra response và kết quả nghiệp vụ.")
     else:
         if screen_name:
             steps.append(f"Mở màn hình {screen_name}.")
-        if target:
-            steps.append(f"Thao tác với {target} theo mục tiêu kiểm thử.")
-        if objective:
-            steps.append(objective.rstrip(".") + ".")
-        if condition and condition not in {pre, data}:
-            steps.append(condition.rstrip(".") + ".")
-        steps.append("Quan sát kết quả.")
 
-    # Preserve order but avoid exact duplicates.
+        # UI / permission: observe or access the concrete element instead of generic 'check UI'.
+        if group == "UI":
+            if feature == "Permission":
+                if condition and condition != pre and _looks_like_action(condition):
+                    steps.append(_ensure_sentence(condition))
+                steps.append(f"Truy cập màn hình {screen_name}." if screen_name else "Truy cập màn hình.")
+                steps.append("Kiểm tra quyền truy cập và nội dung được phép hiển thị.")
+            elif "placeholder" in text:
+                if target:
+                    steps.append(f"Không nhập dữ liệu vào {target}.")
+                    steps.append(f"Quan sát nội dung gợi ý tại {target}.")
+            elif any(k in text for k in ("mac dinh", "default", "gia tri ban dau", "ban dau")):
+                if target:
+                    steps.append(f"Quan sát {target} ngay khi màn hình được tải.")
+                    steps.append(f"Kiểm tra giá trị mặc định của {target}.")
+            elif target:
+                steps.append(f"Quan sát {target} trên màn hình.")
+                steps.append(f"Đối chiếu nội dung hiển thị của {target} với tài liệu.")
+
+        # Field/control validation: use the concrete condition as the tester action whenever possible.
+        elif group == "VALIDATE" or category == "VALIDATION":
+            if "placeholder" in text and target:
+                steps.append(f"Không nhập dữ liệu vào {target}.")
+                steps.append(f"Quan sát nội dung gợi ý tại {target}.")
+            elif any(k in text for k in ("mac dinh", "default", "gia tri ban dau", "ban dau")) and target:
+                steps.append(f"Quan sát {target} ngay khi màn hình được tải.")
+                steps.append(f"Kiểm tra giá trị mặc định của {target}.")
+            elif condition and condition != pre:
+                steps.append(_ensure_sentence(condition))
+                if target:
+                    steps.append(f"Kiểm tra giá trị/trạng thái hiển thị tại {target}.")
+            elif data and target:
+                steps.append(_ensure_sentence(data if _looks_like_action(data) else f"Nhập {data} vào {target}"))
+                steps.append(f"Kiểm tra giá trị/trạng thái hiển thị tại {target}.")
+            elif target:
+                steps.append(f"Thao tác trực tiếp trên {target} theo điều kiện của testcase.")
+                steps.append(f"Kiểm tra trạng thái của {target}.")
+
+        # Popup is a container: keep the exact source-grounded trigger/interaction if present.
+        elif group == "POPUP":
+            popup_name = feature if feature and feature != "Popup" else (target or "popup")
+            if condition and condition != pre and _looks_like_action(condition):
+                steps.append(_ensure_sentence(condition))
+            else:
+                steps.append(f"Thực hiện thao tác mở {popup_name}.")
+            if category == "VALIDATION" and condition and condition != pre and not _looks_like_action(condition):
+                steps.append(_ensure_sentence(condition))
+            elif category in {"ACTION", "BUSINESS_FLOW"}:
+                action = _function_action_name(rule)
+                if action and action.casefold() not in popup_name.casefold():
+                    steps.append(f"Nhấn {action} trên {popup_name}.")
+            else:
+                steps.append(f"Kiểm tra nội dung và trạng thái hiển thị của {popup_name}.")
+
+        # Data Grid: distinguish semantic Mapping, sort and pagination.
+        elif group == "DATA_GRID" or category == "DATA_GRID":
+            if "mapping" in text:
+                col = target or _humanize_generated_text(_clean(rule.get("rule_name"))).replace("Mapping ", "")
+                steps.append(f"Quan sát {col} trong danh sách.")
+                steps.append(f"Đối chiếu giá trị hiển thị của {col} với dữ liệu bản ghi.")
+            elif "sap xep" in text or "sort" in text:
+                col = target or feature
+                steps.append(f"Nhấn chức năng sắp xếp tại {col}.")
+                steps.append(f"Kiểm tra thứ tự dữ liệu của {col} sau khi sắp xếp.")
+            elif "phan trang" in text or "pagination" in text or "page size" in text:
+                steps.append("Thực hiện thao tác phân trang được mô tả trong tài liệu.")
+                steps.append("Kiểm tra trang hiện tại và dữ liệu danh sách sau khi chuyển trang.")
+            elif target:
+                steps.append(f"Quan sát {target} trong danh sách.")
+                steps.append(f"Kiểm tra cách hiển thị của {target}.")
+
+        # Technical exception: execute only the source-described condition.
+        elif group == "EXCEPTION" or category == "EXCEPTION":
+            if condition and condition != pre:
+                steps.append(_ensure_sentence(condition))
+            elif target:
+                steps.append(f"Thực hiện {target} trong điều kiện lỗi được mô tả trong tài liệu.")
+            steps.append("Kiểm tra thông báo/trạng thái lỗi theo tài liệu.")
+
+        # Business function/action: convert the feature into concrete tester verbs.
+        else:
+            action = _function_action_name(rule)
+            condition_is_action = bool(condition and condition != pre and _looks_like_action(condition))
+            if condition_is_action:
+                steps.append(_ensure_sentence(condition))
+            elif data and target and action == "Tìm kiếm" and _looks_like_action(data):
+                steps.append(_ensure_sentence(data))
+
+            already_triggered = _condition_mentions_action(condition, action) if action else False
+            if action == "Tìm kiếm":
+                if not already_triggered:
+                    steps.append("Nhấn nút Tìm kiếm.")
+                steps.append("Kiểm tra danh sách kết quả trả về.")
+            elif action == "Đặt lại":
+                if not already_triggered:
+                    steps.append("Nhấn nút Đặt lại.")
+                steps.append("Kiểm tra các điều kiện tìm kiếm trở về giá trị mặc định.")
+            elif action == "Thêm mới":
+                if not already_triggered:
+                    steps.append("Nhấn nút Thêm mới.")
+                steps.append("Kiểm tra màn hình thêm mới được mở đúng theo tài liệu.")
+            elif action in {"Phê duyệt", "Từ chối", "Hủy", "Xác nhận", "Hold", "Tải lên", "Tải xuống", "Xem chi tiết", "Chỉnh sửa", "Tạo bản sao"}:
+                if not already_triggered:
+                    if action == "Tải lên":
+                        steps.append("Thực hiện tải tệp lên theo dữ liệu của testcase.")
+                    elif action == "Tải xuống":
+                        steps.append("Nhấn chức năng Tải xuống.")
+                    else:
+                        suffix = " trên bản ghi đã chọn" if action in {"Phê duyệt","Từ chối","Hủy","Hold","Xem chi tiết","Chỉnh sửa","Tạo bản sao"} else ""
+                        steps.append(f"Nhấn {action}{suffix}.")
+                steps.append(f"Kiểm tra kết quả của chức năng {action} theo tài liệu.")
+            elif action:
+                if not already_triggered:
+                    steps.append(f"Thực hiện {action}.")
+                steps.append(f"Kiểm tra kết quả của {action} theo tài liệu.")
+
+    # De-duplicate and remove vague machine-like filler.
+    banned = {
+        "quan sát kết quả", "thiet lap du lieu kiem thu", "thiết lập dữ liệu kiểm thử",
+        "ap dung dieu kien kiem thu", "áp dụng điều kiện kiểm thử", "thuc hien thao tac tuong ung",
+        "thực hiện thao tác tương ứng", "kiem tra theo yeu cau", "kiểm tra theo yêu cầu",
+    }
     result: list[str] = []
     seen = set()
     for step in steps:
+        step = _humanize_generated_text(step)
+        norm = core._normalize_text(step).strip(" .")
         key = step.casefold().strip()
-        if key and key not in seen:
+        if key and norm not in banned and key not in seen:
             seen.add(key)
             result.append(step)
     return result[:5]
@@ -204,16 +441,16 @@ def _api_steps(rule: dict, method: str, endpoint_path: str, endpoint_summary: st
     if um:
         effective_path = um.group(1).strip()
 
-    steps = ["Chuẩn bị request theo PreConditions và Dữ liệu kiểm thử."]
+    steps = ["Chuẩn bị request và dữ liệu cần thiết."]
     if target:
-        steps.append(f"Áp dụng điều kiện kiểm thử cho {target}.")
+        steps.append(f"Thiết lập {target} theo dữ liệu đã chuẩn bị.")
     call_target = " ".join(x for x in (effective_method, effective_path) if x).strip()
     if not call_target:
         call_target = _clean(endpoint_summary) or "API tương ứng"
     steps.append(f"Gửi request {call_target}.")
-    steps.append("Kiểm tra response theo Kết quả mong đợi.")
+    steps.append("Kiểm tra response và các trường kết quả.")
     if _clean(rule.get("business_result")):
-        steps.append("Kiểm tra Business Result/side effect theo Kết quả mong đợi.")
+        steps.append("Kiểm tra kết quả nghiệp vụ và side effect liên quan.")
     return steps[:5]
 
 def validate_testcase(tc: dict) -> dict:
@@ -256,11 +493,11 @@ def _base_case(
 ) -> dict:
     tc = {
         "id": tc_id,
-        "name": name,
-        "preCondition": pre_condition,
-        "steps": steps,
-        "testData": test_data,
-        "expectedResult": expected_result,
+        "name": _humanize_generated_text(name),
+        "preCondition": _humanize_generated_text(pre_condition),
+        "steps": [_humanize_generated_text(step) for step in (steps or []) if _humanize_generated_text(step)],
+        "testData": _humanize_generated_text(test_data),
+        "expectedResult": _humanize_generated_text(expected_result),
         "type": tc_type,
         "sourceRuleId": source_rule_id,
         "sourceRequirement": source_requirement,
@@ -272,6 +509,58 @@ def _base_case(
     }
     return validate_and_attach(tc)
 
+
+
+def order_and_renumber_testcases(testcases: list[dict], scope: str | None = None) -> list[dict]:
+    """Return tester-facing order and assign TC_001..TC_N only after ordering is final."""
+    items = [dict(tc) for tc in (testcases or [])]
+    if not items:
+        return items
+
+    resolved_scope = (scope or "").strip().lower()
+    if not resolved_scope:
+        resolved_scope = "api" if all(_clean(tc.get("featureGroup")).upper() == "API" for tc in items) else "web"
+
+    web_group_order = {
+        "UI": 1,
+        "VALIDATE": 2,
+        "FUNCTION": 3,
+        "POPUP": 4,
+        "DATA_GRID": 5,
+        "EXCEPTION": 6,
+    }
+
+    decorated = list(enumerate(items))
+    if resolved_scope == "api":
+        decorated.sort(key=lambda pair: (
+            API_REVIEW_CATEGORY_ORDER.get(_clean(pair[1].get("category")).upper(), 999),
+            core._normalize_text(pair[1].get("screen", "")),
+            int(pair[1].get("sortOrder") or pair[0]),
+            pair[0],
+        ))
+    else:
+        decorated.sort(key=lambda pair: (
+            web_group_order.get(_clean(pair[1].get("featureGroup")).upper(), 999),
+            _web_feature_sort_rank(pair[1]),
+            core._normalize_text(pair[1].get("featureName", "Khác")),
+            WEB_REVIEW_CATEGORY_ORDER.get(_clean(pair[1].get("category")).upper(), 999),
+            core._normalize_text(pair[1].get("screen", "")),
+            int(pair[1].get("sortOrder") or pair[0]),
+            pair[0],
+        ))
+
+    ordered: list[dict] = []
+    for idx, (_, item) in enumerate(decorated, start=1):
+        item["id"] = f"TC_{idx:03d}"
+        item["sortOrder"] = idx - 1
+        item["name"] = _humanize_generated_text(item.get("name"))
+        item["preCondition"] = _humanize_generated_text(item.get("preCondition"))
+        item["testData"] = _humanize_generated_text(item.get("testData"))
+        item["expectedResult"] = _humanize_generated_text(item.get("expectedResult"))
+        item["steps"] = [_humanize_generated_text(x) for x in (item.get("steps") or []) if _humanize_generated_text(x)]
+        item["validation"] = validate_testcase(item)
+        ordered.append(item)
+    return ordered
 
 def map_web_matrix_to_testcases(matrix: dict) -> list[dict]:
     result: list[dict] = []
@@ -289,7 +578,7 @@ def map_web_matrix_to_testcases(matrix: dict) -> list[dict]:
         for _, rule in indexed:
             source_rule_id = _clean(rule.get("rule_id")) or f"RULE_{len(result)+1:03d}"
             visible_tc_id = f"TC_{len(result)+1:03d}"
-            name = _clean(rule.get("rule_name")) or _clean(rule.get("test_objective")) or visible_tc_id
+            name = _display_mapping_term(_clean(rule.get("rule_name")) or _clean(rule.get("test_objective")) or visible_tc_id)
             tc = _base_case(
                 tc_id=visible_tc_id,
                 name=name,
@@ -301,12 +590,12 @@ def map_web_matrix_to_testcases(matrix: dict) -> list[dict]:
                 source_rule_id=source_rule_id,
                 source_requirement=_clean(rule.get("source_requirement")),
                 feature_group=_clean(rule.get("feature_group")),
-                feature_name=_clean(rule.get("feature_name")) or "Khác",
+                feature_name=_web_feature_name(rule),
                 category=_clean(rule.get("category")).upper(),
                 screen=screen_name,
             )
             result.append(tc)
-    return result
+    return order_and_renumber_testcases(result, "web")
 
 
 def map_api_matrix_to_testcases(matrix: dict) -> list[dict]:
@@ -354,7 +643,7 @@ def map_api_matrix_to_testcases(matrix: dict) -> list[dict]:
                 tc["reconciliationStatus"] = _clean(rule.get("reconciliation_status"))
                 tc["appliedQaRule"] = _clean(rule.get("applied_qa_rule"))
                 result.append(tc)
-    return result
+    return order_and_renumber_testcases(result, "api")
 
 
 def build_tree_text(testcases: list[dict]) -> str:
@@ -365,11 +654,12 @@ def build_tree_text(testcases: list[dict]) -> str:
     current_feature = None
 
     group_title = {
-        "PRECONDITION_PERMISSION": "1. KIỂM TRA TIỀN ĐIỀU KIỆN - PHÂN QUYỀN",
-        "GENERAL_UI": "2. KIỂM TRA GIAO DIỆN CHUNG",
-        "FILTER": "3. KIỂM TRA BỘ LỌC",
-        "DATA_GRID": "4. KIỂM TRA LƯỚI DỮ LIỆU",
-        "FUNCTION": "5. KIỂM TRA CHỨC NĂNG",
+        "UI": "1. UI",
+        "VALIDATE": "2. VALIDATE",
+        "FUNCTION": "3. FUNCTION",
+        "POPUP": "4. POPUP",
+        "DATA_GRID": "5. DATA GRID",
+        "EXCEPTION": "6. NGOẠI LỆ",
         "API": "API TEST CASE",
     }
 

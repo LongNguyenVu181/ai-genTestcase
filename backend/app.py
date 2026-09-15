@@ -30,7 +30,7 @@ FRONTEND_DIST = APP_ROOT / "frontend" / "dist"
 DEFAULT_BASE_URL = "https://ws-2vuxxf5tta2cjplh.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1"
 DEFAULT_MODEL = "qwen-max"
 
-app = FastAPI(title="TestPilot AI API", version="1.9.4")
+app = FastAPI(title="TestPilot AI API", version="1.11.1")
 app.add_middleware(GZipMiddleware, minimum_size=1000)
 app.add_middleware(
     CORSMiddleware,
@@ -71,10 +71,10 @@ class ProjectPayload(BaseModel):
     name: str
     description: str = ""
     type: str = "both"
-    webFolders: list[dict] = []
-    apiFolders: list[dict] = []
-    customFolders: list[dict] = []
-    enabledScopes: list[str] = []
+    webFolders: list[dict] = Field(default_factory=list)
+    apiFolders: list[dict] = Field(default_factory=list)
+    customFolders: list[dict] = Field(default_factory=list)
+    enabledScopes: list[str] = Field(default_factory=list)
     updated: str = "vừa xong"
     createdAt: float | None = None
     updatedAt: float | None = None
@@ -85,7 +85,7 @@ class TestcasePayload(BaseModel):
     name: str
     preCondition: str = ""
     importance: str = ""
-    steps: list[str] = []
+    steps: list[str] = Field(default_factory=list)
     testData: str = ""
     expectedResult: str
     actualResult: str = ""
@@ -239,7 +239,7 @@ def _ensure_manual_run(project_id: str, folder_id: str, scope: str) -> str:
 def health():
     return {
         "ok": True,
-        "version": "1.9.4",
+        "version": "1.11.1",
         "web_pipeline": core.WEB_TEST_DESIGN_VERSION,
         "ai_stages": 1,
         "persistence": "sqlite",
@@ -523,7 +523,22 @@ async def _process_api_analysis_job(
 
         ok, matrix, summary = await asyncio.to_thread(_call)
         if not ok or matrix is None:
-            raise HTTPException(422, detail={"message": "AI phân tích API thất bại", "summary": summary})
+            diagnostics = (summary or {}).get("diagnostics") or []
+            last_diag = diagnostics[-1] if diagnostics else {}
+            reason = str(last_diag.get("reason") or (summary or {}).get("stage") or "UNKNOWN")
+            reason_messages = {
+                "JSON_PARSE_FAIL": "AI trả JSON không hợp lệ sau các bước phục hồi tự động.",
+                "SCHEMA_FAIL": "AI trả dữ liệu không đúng cấu trúc Rule Matrix API.",
+                "MAX_TOKENS": "Kết quả AI vượt giới hạn output sau khi đã tự chia nhỏ.",
+                "API_FAILED": "Kết nối tới model AI thất bại.",
+                "ba_deep": "Không hoàn tất được bước phân tích phần BA liên quan tới API mục tiêu.",
+                "final_schema": "Rule Matrix còn dữ liệu không hợp lệ sau các bước chuẩn hóa an toàn.",
+            }
+            raise HTTPException(422, detail={
+                "message": reason_messages.get(reason, "AI phân tích API thất bại."),
+                "reason": reason,
+                "summary": summary,
+            })
 
         db.update_analysis_job(
             job_id,
@@ -667,6 +682,12 @@ def get_analysis_job(job_id: str):
     return job
 
 
+
+
+def _ordered_testcases(testcases: list[dict], scope: str | None = None) -> list[dict]:
+    return mapper.order_and_renumber_testcases(testcases, scope)
+
+
 @app.get("/api/runs/{run_id}")
 def get_run(run_id: str):
     run = _get_run_or_404(run_id)
@@ -677,7 +698,7 @@ def get_run(run_id: str):
         "project_id": run.get("project_id"),
         "folder_id": run.get("folder_id"),
         # Matrix is intentionally not returned to normal UI.
-        "testcases": db.list_run_testcases(run_id),
+        "testcases": _ordered_testcases(db.list_run_testcases(run_id), run.get("kind")),
         "agent1_summary": run.get("agent1_summary"),
         "source_names": run.get("source_names", []),
     }
@@ -696,7 +717,7 @@ def get_folder_testcases(project_id: str, folder_id: str, scope: str = "web"):
         "project_id": project_id,
         "folder_id": folder_id,
         "scope": scope,
-        "testcases": db.list_folder_testcases(project_id, folder_id, scope),
+        "testcases": _ordered_testcases(db.list_folder_testcases(project_id, folder_id, scope), scope),
     }
 
 
@@ -748,6 +769,7 @@ def get_screen_testcases(project_id: str, scope: str = "web", screen: str = ""):
     testcases = db.list_project_testcases(project_id, scope)
     if target:
         testcases = [tc for tc in testcases if str(tc.get("screen") or "").strip() == target]
+    testcases = _ordered_testcases(testcases, scope)
     return {
         "ok": True,
         "project_id": project_id,
@@ -766,6 +788,7 @@ def download_screen_excel(project_id: str, scope: str = "web", screen: str = "")
     ]
     if not testcases:
         raise HTTPException(409, "Màn hình chưa có testcase")
+    testcases = _ordered_testcases(testcases, scope)
     run = db.get_run(testcases[0].get("runId")) if testcases and testcases[0].get("runId") else None
     run = run or db.get_latest_run_for_project_scope(project_id, scope)
     filename = _source_excel_name(run, target or "TestCases")
@@ -786,6 +809,7 @@ def download_screen_xmind(project_id: str, scope: str = "web", screen: str = "")
     ]
     if not testcases:
         raise HTTPException(409, "Màn hình chưa có testcase")
+    testcases = _ordered_testcases(testcases, scope)
     tree = mapper.build_tree_text(testcases)
     with tempfile.NamedTemporaryFile(suffix=".xmind", delete=False) as tmp:
         path = tmp.name
@@ -839,6 +863,7 @@ def download_folder_excel(project_id: str, folder_id: str, scope: str = "web"):
     testcases = db.list_folder_testcases(project_id, folder_id, scope)
     if not testcases:
         raise HTTPException(409, "Thư mục chưa có testcase")
+    testcases = _ordered_testcases(testcases, scope)
     run = db.get_latest_run_for_folder(project_id, folder_id, scope)
     filename = _source_excel_name(run, folder_id)
     data = excel_export.build_excel(testcases, workbook_title=Path(filename).stem)
@@ -854,6 +879,7 @@ def download_folder_xmind(project_id: str, folder_id: str, scope: str = "web"):
     testcases = db.list_folder_testcases(project_id, folder_id, scope)
     if not testcases:
         raise HTTPException(409, "Thư mục chưa có testcase")
+    testcases = _ordered_testcases(testcases, scope)
     tree = mapper.build_tree_text(testcases)
     with tempfile.NamedTemporaryFile(suffix=".xmind", delete=False) as tmp:
         path = tmp.name
@@ -877,6 +903,7 @@ def download_run_excel(run_id: str):
     testcases = db.list_run_testcases(run_id)
     if not testcases:
         raise HTTPException(409, "Run chưa có testcase")
+    testcases = _ordered_testcases(testcases, run.get("kind"))
     filename = _source_excel_name(run, "TestCases")
     data = excel_export.build_excel(testcases, workbook_title=Path(filename).stem)
     return Response(
@@ -892,6 +919,7 @@ def download_run_xmind(run_id: str):
     testcases = db.list_run_testcases(run_id)
     if not testcases:
         raise HTTPException(409, "Run chưa có testcase")
+    testcases = _ordered_testcases(testcases, run.get("kind"))
     tree = mapper.build_tree_text(testcases)
     with tempfile.NamedTemporaryFile(suffix=".xmind", delete=False) as tmp:
         path = tmp.name

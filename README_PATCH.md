@@ -1,22 +1,16 @@
-# TestPilot AI V1.9.4 Responsive Hotfix
+# TestPilot AI V1.11.1 — Web Human QA Patch
 
-Copy the contents of this patch over the V1.9.3 clean-source root.
+Apply over V1.11.0.
 
-Fixes:
-- Dashboard `Dự án mới` same-route no-op.
-- Visible create-project validation and immediate navigation.
-- Remove redundant/expensive metadata sync on reload.
-- One-time browser-cache migration to SQLite backend.
-- Faster SQLite project list query.
-- GZip + immutable caching for hashed frontend assets.
-- setup/build scripts return to project root.
+Changes:
+- Web presentation template is exactly six sections: UI, VALIDATE, FUNCTION, POPUP, DATA_GRID, EXCEPTION.
+- Permission and general screen UI are both under UI; Permission is ordered first.
+- Legacy groups PRECONDITION_PERMISSION / GENERAL_UI / FILTER are normalized automatically.
+- Popup is a first-class tester section while internal QA category remains intact.
+- Web testcase steps use concrete tester verbs and source-grounded actions; generic phrases such as "Thiết lập dữ liệu cho..." and "Quan sát kết quả" are removed.
+- Search/Reset/Create/Approve/Cancel/Popup/Grid Mapping/Sort/Pagination/Validation have deterministic human-style step rendering.
+- Exact-length N-1/N/N+1 remains three independent testcase records.
+- Tester-facing wording continues to remove AI/meta phrases and keeps `Mapping` instead of `Ánh xạ`.
+- Web Rule Matrix schema version bumped to 3.5 and cache namespace bumped to avoid stale V1.11.0 output.
 
-After copying:
-
-```powershell
-cd "F:\VCB Packet\AI\testpilot-ai-v1.9.3-clean-source\testpilot-ai-v1.9.3-clean-source"
-Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
-.\build-prod.ps1
-cd backend
-py -m uvicorn app:app --host 127.0.0.1 --port 8000
-```
+Backend compile and deterministic mapper smoke tests passed.

@@ -75,7 +75,7 @@ export default function DashboardPage() {
         <section className="card create-project-card" id="new-project-form">
           <div className="section-title">
             <span className="section-icon">1</span>
-            <div><h2>Tạo dự án mới</h2><p>Các folder màn hình sẽ được tạo tự động sau khi AI phân tích tài liệu.</p></div>
+            <div><h2>Tạo dự án mới</h2><p>Các folder màn hình sẽ được tạo tự động sau khi phân tích tài liệu.</p></div>
           </div>
 
           <form onSubmit={submit} noValidate>

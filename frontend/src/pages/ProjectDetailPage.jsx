@@ -149,7 +149,7 @@ export default function ProjectDetailPage() {
 
       <section className="card explorer-root-card">
         <div className="explorer-section-head">
-          <div><Folder size={22} /><h3>Workspace dự án</h3></div>
+          <div><Folder size={22} /><h3>Thư mục dự án</h3></div>
           <div className="explorer-head-actions">
             <span>{enabledScopes.length + customFolders.length} workspace</span>
             <button className="btn btn-primary btn-balanced explorer-new-folder" type="button" onClick={openAddScope}>
@@ -184,7 +184,7 @@ export default function ProjectDetailPage() {
 
       <Modal open={folderModalOpen} title="Bổ sung Web App / API" onClose={() => setFolderModalOpen(false)} width="600px">
         <div className="modal-body new-folder-form">
-          <p className="scope-helper">Chọn loại muốn bổ sung. Nếu loại này chưa có trong dự án, TestPilot sẽ tạo workspace và mở ngay màn tải tài liệu.</p>
+          <p className="scope-helper">Chọn loại muốn bổ sung. Nếu loại này chưa có trong dự án, Hệ thống sẽ tạo workspace và mở ngay màn tải tài liệu.</p>
 
           <div className="scope-choice-grid">
             <button type="button" className={`scope-choice ${folderScope === 'web' ? 'active' : ''}`} onClick={() => setFolderScope('web')}>

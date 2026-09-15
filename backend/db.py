@@ -25,10 +25,13 @@ if not DB_PATH.exists() and LEGACY_DB_PATH.exists() and LEGACY_DB_PATH.resolve()
 
 
 def _connect() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_PATH)
+    # Background analysis writes progress while the UI polls/reads SQLite. A longer
+    # busy timeout prevents transient "database is locked" failures on Windows.
+    conn = sqlite3.connect(DB_PATH, timeout=30.0)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
     conn.execute("PRAGMA journal_mode = WAL")
+    conn.execute("PRAGMA busy_timeout = 30000")
     return conn
 
 

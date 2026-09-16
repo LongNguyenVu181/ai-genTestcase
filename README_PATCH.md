@@ -1,16 +1,36 @@
-# TestPilot AI V1.11.1 — Web Human QA Patch
+# TestPilot AI — Combined Patch 1.11.4 + 1.11.5
 
-Apply over V1.11.0.
+Patch này đã gộp hai nhánh thay đổi:
 
-Changes:
-- Web presentation template is exactly six sections: UI, VALIDATE, FUNCTION, POPUP, DATA_GRID, EXCEPTION.
-- Permission and general screen UI are both under UI; Permission is ordered first.
-- Legacy groups PRECONDITION_PERMISSION / GENERAL_UI / FILTER are normalized automatically.
-- Popup is a first-class tester section while internal QA category remains intact.
-- Web testcase steps use concrete tester verbs and source-grounded actions; generic phrases such as "Thiết lập dữ liệu cho..." and "Quan sát kết quả" are removed.
-- Search/Reset/Create/Approve/Cancel/Popup/Grid Mapping/Sort/Pagination/Validation have deterministic human-style step rendering.
-- Exact-length N-1/N/N+1 remains three independent testcase records.
-- Tester-facing wording continues to remove AI/meta phrases and keeps `Mapping` instead of `Ánh xạ`.
-- Web Rule Matrix schema version bumped to 3.5 and cache namespace bumped to avoid stale V1.11.0 output.
+## Phần từ 1.11.4 — API source-role / multi-document
+- API Spec/Design là nguồn sinh AUTH/PERMISSION/VALIDATION/HAPPY_PATH.
+- BA là nguồn sinh BUSINESS_RULE.
+- BA error code/message có thể enrich testcase kỹ thuật đã có từ API Spec thay vì sinh case trùng.
+- BA không tự tạo API workspace/card mới chỉ vì heading hoặc wording nghiệp vụ khác nhau.
+- Giữ strict API target scope và cross-document reconciliation/dedup.
 
-Backend compile and deterministic mapper smoke tests passed.
+## Phần từ 1.11.5 — Web Discovery -> Inventory -> QA Rules
+- Web BA được đọc theo 2 stage: Discovery trước, QA Design sau.
+- Discovery list screen -> field/control/grid/popup -> logic tương ứng, chưa sinh testcase.
+- Giữ screen ownership qua semantic chunking.
+- DOCX được extract đúng thứ tự paragraph/table; giữ heading và strikethrough marker.
+- XLSX Web được extract theo sheet/row structure.
+- QA testcase chỉ được derive sau khi có canonical inventory.
+- Mapper giữ testcase theo từng screen liên tục thay vì sort global theo category.
+
+## File thay thế
+Copy đè 3 file sau vào project hiện tại:
+
+- `backend/app.py`
+- `backend/pipeline_core.py`
+- `backend/testcase_mapper.py`
+
+Sau đó restart backend và chạy `Phân tích tài liệu mới` để tạo run mới.
+
+## Xác nhận merge
+- Toàn bộ 34 function API trong `pipeline_core.py` có source hash giống bản 1.11.4.
+- `_process_api_analysis_job()` trong `app.py` có source hash giống bản 1.11.4.
+- Web code lấy từ bản 1.11.5.
+- `python -m py_compile` pass cho cả 3 file trong package này.
+
+Version runtime vẫn là `1.11.5`; đây là package hợp nhất, không phải một nhánh logic API mới.

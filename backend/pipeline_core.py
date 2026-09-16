@@ -14,6 +14,7 @@ import copy
 import unicodedata
 import yaml
 from dataclasses import dataclass
+from difflib import SequenceMatcher
 from collections import OrderedDict, Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pypdf import PdfReader
@@ -43,7 +44,7 @@ def _safe_float(value, default: float = 0.0, minimum: float | None = None, maxim
     return result
 
 # ==========================================
-# 0. CẤU HÌNH WEB PIPELINE V3.5 — SENIOR-HYBRID / VALIDATION-EXPANDED / SCALABLE LONG DOCUMENT
+# 0. CẤU HÌNH WEB PIPELINE V3.6 — DISCOVERY -> CANONICAL INVENTORY -> QA RULES
 # ==========================================
 # Agent 1: chia tài liệu nguyên văn thành các semantic chunk nhỏ, có context ở biên.
 AGENT1_CHUNK_TARGET_CHARS = 12000
@@ -54,6 +55,10 @@ AGENT1_MAX_RECURSION_DEPTH = 5
 AGENT1_API_RETRIES = 1
 # Process independent Web chunks in parallel. Set TESTPILOT_WEB_PARALLEL_WORKERS=1 if provider rate-limit is tight.
 AGENT1_PARALLEL_WORKERS = _env_int("TESTPILOT_WEB_PARALLEL_WORKERS", 2)
+WEB_QA_PARALLEL_WORKERS = _env_int("TESTPILOT_WEB_QA_PARALLEL_WORKERS", 2)
+WEB_DISCOVERY_MAX_OUTPUT_TOKENS = 12288
+WEB_QA_MAX_OUTPUT_TOKENS = 24576
+WEB_DISCOVERY_VERSION = "1.0"
 
 # Qwen output budget. Nếu vẫn chạm length, pipeline sẽ tự chia nhỏ và retry.
 QWEN_MAX_OUTPUT_TOKENS = 32768
@@ -62,7 +67,8 @@ QWEN_MAX_OUTPUT_TOKENS = 32768
 API_AGENT1_CHUNK_TARGET_CHARS = 7200
 API_AGENT1_CHUNK_MAX_CHARS = 9000
 API_AGENT1_CONTEXT_CHARS = 900
-# V1.9.3: BA doc is scanned cheaply; PRIMARY/CONTINUATION/DEPENDENCY are routed before deep analysis.
+# V1.11.3: BA doc is scanned cheaply and may enrich ONLY the API selected by API Design.
+# Distinct continuation/sibling APIs are never promoted into separate testcase workspaces.
 API_SCOPE_SCAN_CHUNK_TARGET_CHARS = 5000
 API_SCOPE_SCAN_CHUNK_MAX_CHARS = 6500
 API_SCOPE_SCAN_MAX_TOKENS = 1400
@@ -76,7 +82,7 @@ API_ENDPOINT_HINT_LIMIT = 8
 AI_REQUEST_TIMEOUT_SECONDS = _env_int("TESTPILOT_AI_REQUEST_TIMEOUT_SECONDS", 600, minimum=60)
 
 # Web Rule Matrix schema — single source of truth for prompt + validator + renderer.
-WEB_TEST_DESIGN_VERSION = "3.5"
+WEB_TEST_DESIGN_VERSION = "3.6"
 WEB_RULE_FIELDS = frozenset({
     "rule_id", "target", "category", "feature_group", "feature_name",
     "rule_type", "rule_name", "test_objective", "test_condition",
@@ -117,8 +123,9 @@ WEB_CATEGORY_ORDER = {
 WEB_TC_TITLE_MAX_CHARS = 120
 
 # Cache namespace: bump when deterministic pipeline semantics change.
-WEB_AGENT1_CACHE_NAMESPACE = "web-agent1-v3.5-human-template-r1"
-API_AGENT1_CACHE_NAMESPACE = "api-agent1-v3.8-human-output"
+WEB_AGENT1_CACHE_NAMESPACE = "web-qa-v3.6-from-canonical-inventory-r1"
+WEB_DISCOVERY_CACHE_NAMESPACE = "web-discovery-v1.0-r1"
+API_AGENT1_CACHE_NAMESPACE = "api-agent1-v3.11-source-role-r2"
 
 # ==========================================
 
@@ -553,7 +560,6 @@ def validate_rule_matrix_schema(data, strict: bool = False) -> tuple[bool, str]:
         return False, "Thiếu field 'screens' hoặc 'screens' không phải array"
 
     total_rules = 0
-    rule_ids = set()
 
     for sidx, screen in enumerate(screens):
         if not isinstance(screen, dict):
@@ -611,12 +617,8 @@ def validate_rule_matrix_schema(data, strict: bool = False) -> tuple[bool, str]:
                     if not isinstance(rule.get(field), str):
                         return False, f"Rule {sidx + 1}.{ridx + 1}.{field} phải là string"
 
-                rule_id = str(rule.get("rule_id", "")).strip()
-                if not rule_id:
-                    return False, f"Rule {sidx + 1}.{ridx + 1} rule_id rỗng"
-                if rule_id in rule_ids:
-                    return False, f"Duplicate rule_id: {rule_id}"
-                rule_ids.add(rule_id)
+                # rule_id is bookkeeping only. It is assigned deterministically after
+                # merge and must never block document analysis/test design.
 
     return True, f"Schema OK | Screens={len(screens)} | TestRules={total_rules}"
 
@@ -722,7 +724,7 @@ def _split_exact_length_boundary_rule(rule: dict, n: int) -> list[dict]:
         if value == n:
             item["expected_result"] = f"{target} có độ dài {n} ký tự thỏa ràng buộc độ dài chính xác {n} ký tự."
             item["rule_type"] = "EXPLICIT"
-            item["applied_qa_rule"] = "EXPLICIT FROM SPEC"
+            item["applied_qa_rule"] = "EXPLICIT FROM BA"
             item["generation_reason"] = ""
         else:
             item["expected_result"] = (
@@ -956,8 +958,8 @@ def normalize_web_rule_semantics(data: dict) -> tuple[dict, list[dict]]:
             rule_type = str(rule.get("rule_type", "") or "").upper().strip()
             current = str(rule.get("applied_qa_rule", "") or "").strip()
             if rule_type == "EXPLICIT" and not current:
-                rule["applied_qa_rule"] = "EXPLICIT FROM SPEC"
-                repairs.append({"rule_id": str(rule.get("rule_id", "")), "field": "applied_qa_rule", "value": "EXPLICIT FROM SPEC"})
+                rule["applied_qa_rule"] = "EXPLICIT FROM BA"
+                repairs.append({"rule_id": str(rule.get("rule_id", "")), "field": "applied_qa_rule", "value": "EXPLICIT FROM BA"})
             elif rule_type == "DERIVED" and not current:
                 technique = _infer_web_qa_technique(rule)
                 rule["applied_qa_rule"] = technique
@@ -1033,8 +1035,10 @@ def _api_operation_family(value: str) -> str:
     compact = _compact_search_text(value)
     if not compact:
         return "UNKNOWN"
+    # BA documents often call the same approval endpoint "duyệt", "xác nhận duyệt"
+    # or "xác nhận duyệt giao dịch". Treat these wording variants as ONE operation family.
     if any(x in compact for x in ("xacnhanduyet", "confirmapproval", "confirmapprove")):
-        return "CONFIRM_APPROVE"
+        return "APPROVE"
     if any(x in compact for x in ("tuchoi", "reject", "decline")):
         return "REJECT"
     if any(x in compact for x in ("vanti", "danhsach", "listtransaction", "getlist")):
@@ -1051,10 +1055,12 @@ def _api_operation_family(value: str) -> str:
 
 
 def _gate_scope_match(ba_chunk: dict, primary_target: dict, match: dict) -> tuple[dict, dict | None]:
-    """Deterministic post-router guard for obvious sibling headings.
+    """Deterministic post-router guard for strict single-target API analysis.
 
-    The LLM remains responsible for semantic routing inside ambiguous sections. This guard
-    only overrides cases where the BA section title itself clearly names another operation.
+    API Design/Spec is the only source allowed to create an endpoint workspace. BA chunks
+    may enrich that selected endpoint, but a distinct callable continuation/sibling API must
+    never become a second workspace. The guard also repairs a common wording drift where
+    the same approval endpoint is called "duyệt" vs "xác nhận duyệt" in BA headings.
     """
     guarded = dict(match)
     heading = str(ba_chunk.get("title") or "")
@@ -1066,15 +1072,34 @@ def _gate_scope_match(ba_chunk: dict, primary_target: dict, match: dict) -> tupl
     new_role = original_role
     reason = None
 
-    if target_family == "APPROVE" and heading_family == "CONFIRM_APPROVE":
-        new_role = "CONTINUATION"
-        if not str(guarded.get("related_api_name") or "").strip():
-            guarded["related_api_name"] = heading.strip() or "API Xác nhận duyệt"
-        reason = "heading confirms required approval continuation"
-    elif target_family != "UNKNOWN" and heading_family != "UNKNOWN" and heading_family != target_family:
-        # Known sibling operation. CONTINUATION exception above is the only automatic bridge.
+    primary_method, primary_path = _api_endpoint_key(primary_target)
+    related_method = str(guarded.get("related_method") or "UNMAPPED").upper().strip() or "UNMAPPED"
+    related_path = str(guarded.get("related_endpoint_path") or "UNMAPPED").strip() or "UNMAPPED"
+    explicit_distinct_endpoint = (
+        related_path != "UNMAPPED"
+        and (related_method, related_path) != (primary_method, primary_path)
+    )
+
+    # Known sibling heading -> always out of scope for this run.
+    if target_family != "UNKNOWN" and heading_family != "UNKNOWN" and heading_family != target_family:
         new_role = "OUT_OF_SCOPE"
         reason = f"heading family {heading_family} differs from target {target_family}"
+
+    # CONTINUATION is retained only for backward-compatible parsing. It is never allowed
+    # to create another workspace. If it is clearly just a wording variant of the same
+    # target operation and no distinct endpoint is visible, repair it to PRIMARY; otherwise
+    # discard it as OUT_OF_SCOPE.
+    elif original_role == "CONTINUATION":
+        if (
+            not explicit_distinct_endpoint
+            and target_family != "UNKNOWN"
+            and heading_family == target_family
+        ):
+            new_role = "PRIMARY"
+            reason = "continuation label repaired to same target operation"
+        else:
+            new_role = "OUT_OF_SCOPE"
+            reason = "distinct/ambiguous continuation is outside strict target endpoint"
 
     guarded["scope_role"] = new_role
     if reason and new_role != original_role:
@@ -1104,13 +1129,29 @@ def _is_heading_line(line: str) -> bool:
     if re.match(
         r"^(màn hình|mh\d*\s*:|logic\s+|luồng\s+|quy tắc nghiệp vụ|mô tả màn hình|"
         r"đặc tả|tóm tắt usecase|ma trận phân quyền|các kết nối|sơ đồ luồng|mockup|"
-        r"===\s*source document|api\s+design|api\s+spec|ba\s+business|"
+        r"===\s*(?:source document|sheet)|api\s+design|api\s+spec|ba\s+business|"
         r"get\s+/|post\s+/|put\s+/|patch\s+/|delete\s+/|head\s+/|options\s+/)",
         s,
         flags=re.IGNORECASE,
     ):
         return True
     return False
+
+
+def _is_screen_heading_line(line: str) -> bool:
+    """Detect a real screen heading conservatively; subsection headings are excluded."""
+    raw = re.sub(r"^[#\s]+", "", str(line or "").strip())
+    raw = re.sub(r"^\d+(?:\.\d+)*[.)]?\s*", "", raw).strip()
+    norm = _normalize_search_text(raw)
+    if not norm:
+        return False
+    if norm.startswith(("mo ta man hinh", "logic man hinh", "danh sach man hinh")):
+        return False
+    return bool(
+        re.match(r"(?i)^màn\s+hình\s+\S", raw)
+        or re.match(r"(?i)^screen\s+\S", raw)
+        or re.match(r"(?i)^mh\d*\s*:\s*\S", raw)
+    )
 
 
 def _safe_split_large_block(text: str, max_chars: int) -> list[str]:
@@ -1151,18 +1192,23 @@ def _safe_split_large_block(text: str, max_chars: int) -> list[str]:
 
 
 def _document_to_semantic_blocks(raw_text: str, base_title: str, max_block_chars: int) -> list[dict]:
-    """Split a document into heading/table/paragraph blocks without exceeding caller max size."""
+    """Split into source-order blocks while retaining the nearest real screen ownership hint."""
     lines = raw_text.splitlines()
     blocks = []
     paragraph = []
     current_title = base_title
+    current_screen_hint = ""
+
+    def append_block(title: str, text: str, screen_hint: str):
+        if text.strip():
+            blocks.append({"title": title, "screen_hint": screen_hint, "text": text.strip()})
 
     def flush_paragraph():
         nonlocal paragraph
         if paragraph:
             block_text = "\n".join(paragraph).strip()
             if block_text:
-                blocks.append({"title": current_title, "text": block_text})
+                append_block(current_title, block_text, current_screen_hint)
             paragraph = []
 
     for line in lines:
@@ -1173,14 +1219,17 @@ def _document_to_semantic_blocks(raw_text: str, base_title: str, max_block_chars
 
         if _is_heading_line(line):
             flush_paragraph()
-            current_title = re.sub(r"^[#\s]+", "", stripped).strip() or current_title
-            blocks.append({"title": current_title, "text": line.rstrip()})
+            cleaned_title = re.sub(r"^[#\s]+", "", stripped).strip() or current_title
+            current_title = cleaned_title
+            if _is_screen_heading_line(line):
+                current_screen_hint = cleaned_title
+            append_block(current_title, line.rstrip(), current_screen_hint)
             continue
 
-        # Markdown table: keep each row intact so a requirement row is not cut mid-row.
+        # Markdown table: keep each row intact so a BA requirement row is not cut mid-row.
         if stripped.startswith("|"):
             flush_paragraph()
-            blocks.append({"title": current_title, "text": line.rstrip()})
+            append_block(current_title, line.rstrip(), current_screen_hint)
             continue
 
         paragraph.append(line.rstrip())
@@ -1188,7 +1237,7 @@ def _document_to_semantic_blocks(raw_text: str, base_title: str, max_block_chars
     flush_paragraph()
 
     if not blocks and raw_text.strip():
-        blocks = [{"title": base_title, "text": raw_text.strip()}]
+        blocks = [{"title": base_title, "screen_hint": "", "text": raw_text.strip()}]
 
     expanded = []
     for block in blocks:
@@ -1196,7 +1245,11 @@ def _document_to_semantic_blocks(raw_text: str, base_title: str, max_block_chars
             expanded.append(block)
         else:
             for part in _safe_split_large_block(block["text"], max_block_chars):
-                expanded.append({"title": block["title"], "text": part})
+                expanded.append({
+                    "title": block["title"],
+                    "screen_hint": block.get("screen_hint", ""),
+                    "text": part,
+                })
     return expanded
 
 
@@ -1207,25 +1260,27 @@ def split_document_semantic(
     max_chars: int = AGENT1_CHUNK_MAX_CHARS,
     context_chars: int = AGENT1_CONTEXT_CHARS,
 ) -> list[dict]:
-    """Pack semantic blocks thành chunk động.
+    """Pack source blocks without crossing an explicit screen boundary.
 
-    Mỗi chunk có CURRENT SOURCE riêng + context trước/sau để giữ dependency ở biên.
-    Context chỉ dùng để hiểu, prompt cấm sinh rule chỉ từ context.
+    A screen can contain many BA subsections (description, search logic, grid, popup...). Those
+    subsections retain `screen_hint` so a later chunk still knows which screen owns its fields.
     """
     blocks = _document_to_semantic_blocks(raw_text, base_title, max_chars)
     core_chunks = []
     current_parts = []
     current_len = 0
     current_title = base_title
+    current_screen_hint = ""
 
     def flush_current():
-        nonlocal current_parts, current_len, current_title
+        nonlocal current_parts, current_len, current_title, current_screen_hint
         if not current_parts:
             return
         core = "\n\n".join(current_parts).strip()
         if core:
             core_chunks.append({
                 "title": current_title,
+                "screen_hint": current_screen_hint,
                 "core_text": core,
                 "char_count": len(core),
             })
@@ -1236,24 +1291,36 @@ def split_document_semantic(
         block_text = block["text"].strip()
         if not block_text:
             continue
-        block_len = len(block_text) + (2 if current_parts else 0)
+        block_screen_hint = block.get("screen_hint", "") or ""
+        is_new_screen_heading = _is_screen_heading_line(block_text.splitlines()[0] if block_text.splitlines() else "")
 
+        # Never mix two explicit screen roots in one model chunk.
+        if is_new_screen_heading and current_parts:
+            flush_current()
+            current_title = block.get("title") or base_title
+            current_screen_hint = block_screen_hint
+
+        block_len = len(block_text) + (2 if current_parts else 0)
         if not current_parts:
             current_title = block.get("title") or base_title
+            current_screen_hint = block_screen_hint
             current_parts = [block_text]
             current_len = len(block_text)
             continue
 
         proposed = current_len + block_len
-        # target là điểm flush ưu tiên; max là hard ceiling.
         if proposed > max_chars or (current_len >= target_chars and proposed > target_chars):
+            previous_screen_hint = current_screen_hint
             flush_current()
             current_title = block.get("title") or base_title
+            current_screen_hint = block_screen_hint or previous_screen_hint
             current_parts = [block_text]
             current_len = len(block_text)
         else:
             current_parts.append(block_text)
             current_len = proposed
+            if block_screen_hint:
+                current_screen_hint = block_screen_hint
             if _is_heading_line(block_text.splitlines()[0] if block_text.splitlines() else ""):
                 current_title = block.get("title") or current_title
 
@@ -1266,6 +1333,7 @@ def split_document_semantic(
         chunks.append({
             "chunk_id": f"C{idx + 1:03d}",
             "title": item["title"],
+            "screen_hint": item.get("screen_hint", ""),
             "core_text": item["core_text"],
             "prev_context": prev_context,
             "next_context": next_context,
@@ -1283,6 +1351,9 @@ chunk_id: {chunk.get('chunk_id')}
 source_section_hint: {chunk.get('title')}
 chunk_depth: {chunk.get('depth', 0)}
 
+=== ACTIVE SCREEN HEADING — TRÍCH TỪ NGUỒN, CHỈ DÙNG ĐỂ GÁN OWNERSHIP ===
+{chunk.get('screen_hint', '')}
+
 === PREVIOUS CONTEXT — CHỈ DÙNG ĐỂ HIỂU, KHÔNG SINH RULE CHỈ TỪ ĐOẠN NÀY ===
 {chunk.get('prev_context', '')}
 
@@ -1292,6 +1363,611 @@ chunk_depth: {chunk.get('depth', 0)}
 === NEXT CONTEXT — CHỈ DÙNG ĐỂ HIỂU, KHÔNG SINH RULE CHỈ TỪ ĐOẠN NÀY ===
 {chunk.get('next_context', '')}
 """
+
+
+
+WEB_INVENTORY_REQ_FIELDS = ("property", "requirement", "source_requirement")
+
+
+def _stringify(value) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value.strip()
+    return str(value).strip()
+
+
+def _normalize_inventory_requirement(item) -> dict:
+    if isinstance(item, str):
+        text = item.strip()
+        return {"property": "OTHER", "requirement": text, "source_requirement": text}
+    if not isinstance(item, dict):
+        text = _stringify(item)
+        return {"property": "OTHER", "requirement": text, "source_requirement": text}
+    requirement = _stringify(item.get("requirement") or item.get("behavior") or item.get("description"))
+    source_requirement = _stringify(item.get("source_requirement") or item.get("source") or requirement)
+    return {
+        "property": _stringify(item.get("property") or item.get("kind") or "OTHER").upper() or "OTHER",
+        "requirement": requirement,
+        "source_requirement": source_requirement,
+    }
+
+
+def _normalize_inventory_requirement_list(value) -> list[dict]:
+    if value is None:
+        return []
+    if not isinstance(value, list):
+        value = [value]
+    result = []
+    for item in value:
+        req = _normalize_inventory_requirement(item)
+        if req["requirement"] or req["source_requirement"]:
+            result.append(req)
+    return result
+
+
+def normalize_web_inventory_shape(data: dict) -> dict:
+    """Coerce small model shape deviations without inventing requirements."""
+    if not isinstance(data, dict):
+        return {"web_discovery_version": WEB_DISCOVERY_VERSION, "screens": []}
+    raw_screens = data.get("screens")
+    if not isinstance(raw_screens, list):
+        raw_screens = []
+    screens = []
+    for raw in raw_screens:
+        if not isinstance(raw, dict):
+            continue
+        screen = {
+            "screen_name": _stringify(raw.get("screen_name") or raw.get("name")),
+            "screen_code": _stringify(raw.get("screen_code") or raw.get("code")),
+            "source_evidence": _stringify(raw.get("source_evidence") or raw.get("evidence")),
+            "screen_requirements": _normalize_inventory_requirement_list(raw.get("screen_requirements") or raw.get("requirements")),
+            "fields": [],
+            "controls": [],
+            "grids": [],
+            "popups": [],
+            "logic": [],
+        }
+        for item in raw.get("fields", []) if isinstance(raw.get("fields"), list) else []:
+            if not isinstance(item, dict):
+                continue
+            screen["fields"].append({
+                "field_name": _stringify(item.get("field_name") or item.get("name")),
+                "control_type": _stringify(item.get("control_type") or item.get("type")),
+                "container": _stringify(item.get("container") or "SCREEN") or "SCREEN",
+                "requirements": _normalize_inventory_requirement_list(item.get("requirements") or item.get("rules")),
+            })
+        for item in raw.get("controls", []) if isinstance(raw.get("controls"), list) else []:
+            if not isinstance(item, dict):
+                continue
+            screen["controls"].append({
+                "control_name": _stringify(item.get("control_name") or item.get("name")),
+                "control_type": _stringify(item.get("control_type") or item.get("type")),
+                "container": _stringify(item.get("container") or "SCREEN") or "SCREEN",
+                "requirements": _normalize_inventory_requirement_list(item.get("requirements") or item.get("rules")),
+            })
+        for item in raw.get("grids", []) if isinstance(raw.get("grids"), list) else []:
+            if not isinstance(item, dict):
+                continue
+            columns = []
+            for col in item.get("columns", []) if isinstance(item.get("columns"), list) else []:
+                if isinstance(col, str):
+                    columns.append({"column_name": col.strip(), "mapping": "", "presentation": "", "source_requirement": col.strip()})
+                elif isinstance(col, dict):
+                    columns.append({
+                        "column_name": _stringify(col.get("column_name") or col.get("name")),
+                        "mapping": _stringify(col.get("mapping") or col.get("value")),
+                        "presentation": _stringify(col.get("presentation") or col.get("format")),
+                        "source_requirement": _stringify(col.get("source_requirement") or col.get("source") or col.get("description")),
+                    })
+            screen["grids"].append({
+                "grid_name": _stringify(item.get("grid_name") or item.get("name") or "Data Grid") or "Data Grid",
+                "columns": columns,
+                "requirements": _normalize_inventory_requirement_list(item.get("requirements") or item.get("rules")),
+            })
+        for item in raw.get("popups", []) if isinstance(raw.get("popups"), list) else []:
+            if not isinstance(item, dict):
+                continue
+            screen["popups"].append({
+                "popup_name": _stringify(item.get("popup_name") or item.get("name")),
+                "requirements": _normalize_inventory_requirement_list(item.get("requirements") or item.get("rules")),
+            })
+        for item in raw.get("logic", []) if isinstance(raw.get("logic"), list) else []:
+            if not isinstance(item, dict):
+                continue
+            targets = item.get("targets")
+            if isinstance(targets, str):
+                targets = [t.strip() for t in re.split(r"[,;|]", targets) if t.strip()]
+            elif not isinstance(targets, list):
+                targets = []
+            screen["logic"].append({
+                "logic_name": _stringify(item.get("logic_name") or item.get("name")),
+                "logic_type": _stringify(item.get("logic_type") or item.get("type") or "BUSINESS_FLOW").upper() or "BUSINESS_FLOW",
+                "targets": [_stringify(t) for t in targets if _stringify(t)],
+                "condition": _stringify(item.get("condition")),
+                "behavior": _stringify(item.get("behavior") or item.get("outcome") or item.get("requirement")),
+                "source_requirement": _stringify(item.get("source_requirement") or item.get("source") or item.get("behavior") or item.get("outcome")),
+            })
+        if screen["screen_name"]:
+            screens.append(screen)
+    return {"web_discovery_version": WEB_DISCOVERY_VERSION, "screens": screens}
+
+
+def validate_web_inventory_schema(data: dict) -> tuple[bool, str]:
+    if not isinstance(data, dict):
+        return False, "Inventory root phải là object"
+    screens = data.get("screens")
+    if not isinstance(screens, list):
+        return False, "Inventory thiếu screens array"
+    object_count = 0
+    requirement_count = 0
+    for sidx, screen in enumerate(screens):
+        if not isinstance(screen, dict) or not _stringify(screen.get("screen_name")):
+            return False, f"Inventory screens[{sidx}] thiếu screen_name"
+        for key in ("screen_requirements", "fields", "controls", "grids", "popups", "logic"):
+            if not isinstance(screen.get(key), list):
+                return False, f"Inventory screens[{sidx}].{key} phải là array"
+        requirement_count += len(screen.get("screen_requirements", []))
+        for key in ("fields", "controls", "grids", "popups"):
+            object_count += len(screen.get(key, []))
+            for item in screen.get(key, []):
+                if not isinstance(item, dict):
+                    return False, f"Inventory screens[{sidx}].{key} chứa phần tử không phải object"
+                reqs = item.get("requirements", [])
+                if not isinstance(reqs, list):
+                    return False, f"Inventory screens[{sidx}].{key}.requirements phải là array"
+                requirement_count += len(reqs)
+        for logic in screen.get("logic", []):
+            if not isinstance(logic, dict):
+                return False, f"Inventory screens[{sidx}].logic chứa phần tử không phải object"
+            if not isinstance(logic.get("targets", []), list):
+                return False, f"Inventory screens[{sidx}].logic.targets phải là array"
+            requirement_count += 1
+    return True, f"Inventory OK | Screens={len(screens)} | Objects={object_count} | Requirements={requirement_count}"
+
+
+def _inventory_req_sig(req: dict) -> tuple:
+    return (
+        _normalize_text(req.get("property", "")),
+        _normalize_text(req.get("requirement", "")),
+        _normalize_text(req.get("source_requirement", "")),
+    )
+
+
+def _merge_req_lists(dst: list[dict], src: list[dict]) -> None:
+    seen = {_inventory_req_sig(x) for x in dst}
+    for req in src:
+        sig = _inventory_req_sig(req)
+        if sig not in seen:
+            dst.append(copy.deepcopy(req))
+            seen.add(sig)
+
+
+def _merge_named_inventory_items(dst: list[dict], src: list[dict], name_key: str) -> None:
+    by_key = {(_normalize_text(item.get(name_key, "")), _normalize_text(item.get("container", ""))): item for item in dst}
+    for item in src:
+        key = (_normalize_text(item.get(name_key, "")), _normalize_text(item.get("container", "")))
+        if not key[0]:
+            continue
+        existing = by_key.get(key)
+        if existing is None:
+            dst.append(copy.deepcopy(item))
+            by_key[key] = dst[-1]
+            continue
+        if not _stringify(existing.get("control_type")) and _stringify(item.get("control_type")):
+            existing["control_type"] = item.get("control_type", "")
+        _merge_req_lists(existing.setdefault("requirements", []), item.get("requirements", []))
+
+
+def _merge_grid_items(dst: list[dict], src: list[dict]) -> None:
+    by_key = {_normalize_text(item.get("grid_name", "")): item for item in dst}
+    for item in src:
+        key = _normalize_text(item.get("grid_name", "")) or "data grid"
+        existing = by_key.get(key)
+        if existing is None:
+            dst.append(copy.deepcopy(item))
+            by_key[key] = dst[-1]
+            continue
+        _merge_req_lists(existing.setdefault("requirements", []), item.get("requirements", []))
+        col_seen = {
+            (_normalize_text(c.get("column_name", "")), _normalize_text(c.get("mapping", "")), _normalize_text(c.get("presentation", "")))
+            for c in existing.setdefault("columns", [])
+        }
+        for col in item.get("columns", []):
+            sig = (_normalize_text(col.get("column_name", "")), _normalize_text(col.get("mapping", "")), _normalize_text(col.get("presentation", "")))
+            if sig not in col_seen:
+                existing["columns"].append(copy.deepcopy(col))
+                col_seen.add(sig)
+
+
+def _merge_logic_items(dst: list[dict], src: list[dict]) -> None:
+    def sig(item: dict) -> tuple:
+        return (
+            _normalize_text(item.get("logic_name", "")),
+            _normalize_text(item.get("logic_type", "")),
+            tuple(sorted(_normalize_text(x) for x in item.get("targets", []) if _normalize_text(x))),
+            _normalize_text(item.get("condition", "")),
+            _normalize_text(item.get("behavior", "")),
+        )
+    seen = {sig(x) for x in dst}
+    for item in src:
+        key = sig(item)
+        if key not in seen:
+            dst.append(copy.deepcopy(item))
+            seen.add(key)
+
+
+def merge_web_inventories(inventories: list[dict]) -> tuple[dict, dict]:
+    """Build one canonical screen/component/logic inventory before any QA rule is applied."""
+    merged: OrderedDict[str, dict] = OrderedDict()
+    meta: dict[str, dict] = {}
+    aliases = 0
+    for inv in inventories:
+        normalized = normalize_web_inventory_shape(inv)
+        for screen in normalized.get("screens", []):
+            name = _stringify(screen.get("screen_name"))
+            code = _stringify(screen.get("screen_code"))
+            key = None
+            if code:
+                code_norm = _normalize_text(code)
+                for k, m in meta.items():
+                    if m.get("code_norm") == code_norm:
+                        key = k
+                        break
+                if key is None:
+                    key = f"code::{code_norm}"
+            if key is None:
+                exact = f"name::{_normalize_text(name)}"
+                if exact in merged:
+                    key = exact
+            if key is None:
+                for k, m in meta.items():
+                    if _screen_alias_equivalent(name, m.get("screen_name", "")):
+                        key = k
+                        aliases += 1
+                        break
+            if key is None:
+                key = f"name::{_normalize_text(name)}"
+            if key not in merged:
+                merged[key] = copy.deepcopy(screen)
+                meta[key] = {"screen_name": name, "code_norm": _normalize_text(code)}
+                continue
+            cur = merged[key]
+            cur["screen_name"] = _prefer_human_screen_name(cur.get("screen_name", ""), name)
+            if not cur.get("screen_code") and code:
+                cur["screen_code"] = code
+                meta[key]["code_norm"] = _normalize_text(code)
+            if len(_stringify(screen.get("source_evidence"))) > len(_stringify(cur.get("source_evidence"))):
+                cur["source_evidence"] = screen.get("source_evidence", "")
+            _merge_req_lists(cur.setdefault("screen_requirements", []), screen.get("screen_requirements", []))
+            _merge_named_inventory_items(cur.setdefault("fields", []), screen.get("fields", []), "field_name")
+            _merge_named_inventory_items(cur.setdefault("controls", []), screen.get("controls", []), "control_name")
+            _merge_grid_items(cur.setdefault("grids", []), screen.get("grids", []))
+            _merge_named_inventory_items(cur.setdefault("popups", []), screen.get("popups", []), "popup_name")
+            _merge_logic_items(cur.setdefault("logic", []), screen.get("logic", []))
+    screens = list(merged.values())
+    stats = {
+        "screens": len(screens),
+        "screen_aliases_merged": aliases,
+        "fields": sum(len(s.get("fields", [])) for s in screens),
+        "controls": sum(len(s.get("controls", [])) for s in screens),
+        "grids": sum(len(s.get("grids", [])) for s in screens),
+        "popups": sum(len(s.get("popups", [])) for s in screens),
+        "logic": sum(len(s.get("logic", [])) for s in screens),
+        "requirements": sum(
+            len(s.get("screen_requirements", []))
+            + sum(len(x.get("requirements", [])) for x in s.get("fields", []))
+            + sum(len(x.get("requirements", [])) for x in s.get("controls", []))
+            + sum(len(x.get("requirements", [])) for x in s.get("grids", []))
+            + sum(len(x.get("requirements", [])) for x in s.get("popups", []))
+            + len(s.get("logic", []))
+            for s in screens
+        ),
+    }
+    return {"web_discovery_version": WEB_DISCOVERY_VERSION, "screens": screens}, stats
+
+
+def audit_web_inventory_rule_coverage(inventory: dict, matrix: dict) -> dict:
+    """Deterministic diagnostics: did discovered BA objects survive into tester rules?
+
+    This does not invent missing rules. It flags suspicious omissions so the run diagnostics make
+    silent coverage loss visible. Only objects that actually carry requirements/columns are audited.
+    """
+    output_screens = matrix.get("screens", []) if isinstance(matrix, dict) else []
+    out_by_name = {_normalize_text(s.get("screen_name", "")): s for s in output_screens if isinstance(s, dict)}
+    uncovered: list[dict] = []
+    audited = 0
+    covered = 0
+
+    def has_name(rules: list[dict], name: str) -> bool:
+        n = _normalize_search_text(name)
+        if not n:
+            return True
+        n_tokens = [t for t in n.split() if len(t) >= 2]
+        for rule in rules:
+            text = _normalize_search_text(" ".join(str(rule.get(k, "") or "") for k in (
+                "target", "feature_name", "rule_name", "test_objective", "test_condition",
+                "expected_result", "source_requirement",
+            )))
+            if n in text:
+                return True
+            if n_tokens and len(n_tokens) >= 2 and all(t in text for t in n_tokens):
+                return True
+        return False
+
+    for screen in inventory.get("screens", []) if isinstance(inventory, dict) else []:
+        sname = _stringify(screen.get("screen_name"))
+        out = out_by_name.get(_normalize_text(sname))
+        if out is None:
+            # Conservative alias fallback.
+            for candidate in output_screens:
+                if isinstance(candidate, dict) and _screen_alias_equivalent(sname, candidate.get("screen_name", "")):
+                    out = candidate
+                    break
+        rules = out.get("test_rules", []) if isinstance(out, dict) else []
+        for key, name_key in (("fields", "field_name"), ("controls", "control_name"), ("grids", "grid_name"), ("popups", "popup_name")):
+            for item in screen.get(key, []) if isinstance(screen.get(key), list) else []:
+                if not isinstance(item, dict):
+                    continue
+                meaningful = bool(item.get("requirements")) or (key == "grids" and bool(item.get("columns")))
+                if not meaningful:
+                    continue
+                name = _stringify(item.get(name_key))
+                audited += 1
+                if has_name(rules, name):
+                    covered += 1
+                else:
+                    uncovered.append({"screen": sname, "type": key[:-1] if key.endswith("s") else key, "name": name})
+    return {
+        "audited_objects": audited,
+        "covered_objects": covered,
+        "coverage_ratio": round(covered / audited, 4) if audited else 1.0,
+        "uncovered_objects": uncovered[:50],
+        "uncovered_count": len(uncovered),
+    }
+
+
+def process_web_discovery_chunk_recursive(
+    chunk: dict,
+    api_key: str,
+    base_url: str,
+    model: str,
+    cache: dict | None = None,
+    diagnostics: list | None = None,
+) -> tuple[bool, list[dict]]:
+    diagnostics = diagnostics if diagnostics is not None else []
+    payload = build_agent1_chunk_payload(chunk)
+    key = _cache_key(WEB_DISCOVERY_CACHE_NAMESPACE, model, PROMPT_WEB_DISCOVERY_INVENTORY, payload)
+    if cache is not None and key in cache:
+        diagnostics.append({"chunk_id": chunk.get("chunk_id"), "stage": "DISCOVERY", "status": "CACHE_HIT"})
+        return True, [copy.deepcopy(cache[key])]
+
+    result = None
+    for attempt in range(AGENT1_API_RETRIES + 1):
+        agent_name = f"WEB_DISCOVERY/{chunk.get('chunk_id')}"
+        result = call_qwen_max_agent_detailed(
+            content=payload,
+            api_key=api_key,
+            base_url=base_url,
+            model=model,
+            prompt_template=PROMPT_WEB_DISCOVERY_INVENTORY,
+            max_tokens=WEB_DISCOVERY_MAX_OUTPUT_TOKENS,
+            agent_name=agent_name,
+            enable_thinking=False,
+            response_format=json_object_response_format(),
+        )
+        if result.ok or result.finish_reason == "length":
+            break
+        if attempt < AGENT1_API_RETRIES:
+            time.sleep(2)
+    assert result is not None
+
+    reason = None
+    parse_diag = ""
+    schema_diag = ""
+    parsed = None
+    if result.finish_reason == "length":
+        reason = "MAX_TOKENS"
+    elif not result.ok:
+        diagnostics.append({"chunk_id": chunk.get("chunk_id"), "stage": "DISCOVERY", "status": "API_FAILED", "error": result.error})
+        return False, []
+    else:
+        ok, parsed, parse_diag = extract_json_from_model_response(result.text)
+        if not ok or parsed is None:
+            reason = "JSON_PARSE_FAIL"
+        else:
+            parsed = normalize_web_inventory_shape(parsed)
+            schema_ok, schema_diag = validate_web_inventory_schema(parsed)
+            if not schema_ok:
+                reason = "SCHEMA_FAIL"
+            else:
+                if cache is not None:
+                    cache[key] = copy.deepcopy(parsed)
+                diagnostics.append({
+                    "chunk_id": chunk.get("chunk_id"), "stage": "DISCOVERY", "status": "OK",
+                    "screens": len(parsed.get("screens", [])), "schema": schema_diag,
+                })
+                return True, [parsed]
+
+    depth = int(chunk.get("depth", 0))
+    can_split = depth < AGENT1_MAX_RECURSION_DEPTH and len(chunk.get("core_text", "")) > AGENT1_MIN_RECURSIVE_CHARS
+    diagnostics.append({
+        "chunk_id": chunk.get("chunk_id"), "stage": "DISCOVERY", "status": reason,
+        "depth": depth, "parse": parse_diag, "schema": schema_diag,
+    })
+    if not can_split:
+        return False, []
+    children = _split_chunk_for_retry(chunk)
+    if len(children) <= 1:
+        return False, []
+    log_info(f"[WEB_DISCOVERY/{chunk.get('chunk_id')}] ✂️ split do {reason}: {len(children)} child chunks")
+    matrices = []
+    for child in children:
+        ok, child_results = process_web_discovery_chunk_recursive(child, api_key, base_url, model, cache, diagnostics)
+        if not ok:
+            return False, []
+        matrices.extend(child_results)
+    return True, matrices
+
+
+def _inventory_screen_has_content(screen: dict) -> bool:
+    if not isinstance(screen, dict):
+        return False
+    if screen.get("screen_requirements"):
+        return True
+    if screen.get("logic"):
+        return True
+    for key in ("fields", "controls", "grids", "popups"):
+        for item in screen.get(key, []) if isinstance(screen.get(key), list) else []:
+            if not isinstance(item, dict):
+                continue
+            if item.get("requirements"):
+                return True
+            if key == "grids" and item.get("columns"):
+                return True
+    return False
+
+
+def _screen_inventory_payload(screen: dict) -> str:
+    return json.dumps({
+        "web_discovery_version": WEB_DISCOVERY_VERSION,
+        "screen": screen,
+    }, ensure_ascii=False, indent=2)
+
+
+def _split_screen_inventory_for_qa(screen: dict) -> list[dict]:
+    """Fallback only when one screen's QA output hits model length.
+
+    Keep source-discovered ownership; split by component families rather than source chunks so
+    fields are never reassigned to another screen. Logic is kept as its own work unit.
+    """
+    base = {
+        "screen_name": screen.get("screen_name", ""),
+        "screen_code": screen.get("screen_code", ""),
+        "source_evidence": screen.get("source_evidence", ""),
+        "screen_requirements": [], "fields": [], "controls": [], "grids": [], "popups": [], "logic": [],
+    }
+    parts = []
+    groups = [
+        ("screen_requirements", screen.get("screen_requirements", [])),
+        ("fields", screen.get("fields", [])),
+        ("controls", screen.get("controls", [])),
+        ("grids", screen.get("grids", [])),
+        ("popups", screen.get("popups", [])),
+        ("logic", screen.get("logic", [])),
+    ]
+    # Pack roughly by serialized size, preserving each inventory item intact.
+    current = copy.deepcopy(base)
+    current_chars = len(_screen_inventory_payload(current))
+    target_chars = 14000
+    for key, items in groups:
+        for item in items:
+            item_chars = len(json.dumps(item, ensure_ascii=False)) + 10
+            if current_chars + item_chars > target_chars and any(current[k] for k in ("screen_requirements", "fields", "controls", "grids", "popups", "logic")):
+                parts.append(current)
+                current = copy.deepcopy(base)
+                current_chars = len(_screen_inventory_payload(current))
+            current[key].append(copy.deepcopy(item))
+            current_chars += item_chars
+    if any(current[k] for k in ("screen_requirements", "fields", "controls", "grids", "popups", "logic")):
+        parts.append(current)
+    return parts or [copy.deepcopy(screen)]
+
+
+def process_web_qa_screen_recursive(
+    screen: dict,
+    api_key: str,
+    base_url: str,
+    model: str,
+    cache: dict | None = None,
+    diagnostics: list | None = None,
+    depth: int = 0,
+) -> tuple[bool, list[dict]]:
+    diagnostics = diagnostics if diagnostics is not None else []
+    payload = _screen_inventory_payload(screen)
+    key = _cache_key(WEB_AGENT1_CACHE_NAMESPACE, model, PROMPT_WEB_QA_FROM_INVENTORY, payload)
+    screen_name = _stringify(screen.get("screen_name")) or "Unnamed Screen"
+    if cache is not None and key in cache:
+        diagnostics.append({"screen": screen_name, "stage": "QA", "status": "CACHE_HIT"})
+        return True, [copy.deepcopy(cache[key])]
+
+    result = None
+    for attempt in range(AGENT1_API_RETRIES + 1):
+        result = call_qwen_max_agent_detailed(
+            content=payload,
+            api_key=api_key,
+            base_url=base_url,
+            model=model,
+            prompt_template=PROMPT_WEB_QA_FROM_INVENTORY,
+            max_tokens=WEB_QA_MAX_OUTPUT_TOKENS,
+            agent_name=f"WEB_QA/{screen_name[:36]}",
+            enable_thinking=False,
+            response_format=json_object_response_format(),
+        )
+        if result.ok or result.finish_reason == "length":
+            break
+        if attempt < AGENT1_API_RETRIES:
+            log_info(f"[WEB_QA/{screen_name}] 🔁 Retry API lần {attempt + 2}/{AGENT1_API_RETRIES + 1}")
+            time.sleep(2)
+    assert result is not None
+    reason = None
+    parse_diag = ""
+    schema_diag = ""
+    parsed = None
+    if result.finish_reason == "length":
+        reason = "MAX_TOKENS"
+    elif not result.ok:
+        diagnostics.append({"screen": screen_name, "stage": "QA", "status": "API_FAILED", "error": result.error})
+        return False, []
+    else:
+        ok, parsed, parse_diag = extract_json_from_model_response(result.text)
+        if not ok or parsed is None:
+            reason = "JSON_PARSE_FAIL"
+        else:
+            parsed = normalize_web_rule_shape(parsed)
+            parsed = normalize_web_rule_matrix_enums(parsed)
+            parsed, _ = normalize_web_rule_semantics(parsed)
+            screens = parsed.get("screens", []) if isinstance(parsed, dict) else []
+            if len(screens) > 1:
+                reason = "MULTI_SCREEN_OUTPUT"
+                schema_diag = f"Expected <=1 screen, got {len(screens)}"
+            elif _inventory_screen_has_content(screen) and (
+                len(screens) == 0 or not any(x.get("test_rules") for x in screens if isinstance(x, dict))
+            ):
+                reason = "EMPTY_QA_OUTPUT"
+                schema_diag = "Inventory có requirement nhưng QA stage trả về 0 rule"
+            else:
+                if len(screens) == 1:
+                    screens[0]["screen_name"] = screen_name
+                schema_ok, schema_diag = validate_rule_matrix_schema(parsed, strict=True)
+                if not schema_ok:
+                    reason = "SCHEMA_FAIL"
+                else:
+                    if cache is not None:
+                        cache[key] = copy.deepcopy(parsed)
+                    diagnostics.append({
+                        "screen": screen_name, "stage": "QA", "status": "OK",
+                        "rules": sum(len(x.get("test_rules", [])) for x in screens), "schema": schema_diag,
+                    })
+                    return True, [parsed]
+
+    diagnostics.append({
+        "screen": screen_name, "stage": "QA", "status": reason,
+        "depth": depth, "parse": parse_diag, "schema": schema_diag,
+    })
+    if depth >= 3:
+        return False, []
+    parts = _split_screen_inventory_for_qa(screen)
+    if len(parts) <= 1:
+        return False, []
+    log_info(f"[WEB_QA/{screen_name}] ✂️ split inventory do {reason}: {len(parts)} parts")
+    matrices = []
+    for part in parts:
+        ok, child = process_web_qa_screen_recursive(part, api_key, base_url, model, cache, diagnostics, depth + 1)
+        if not ok:
+            return False, []
+        matrices.extend(child)
+    return True, matrices
 
 
 def _cache_key(prefix: str, model: str, prompt_template: str, payload: str) -> str:
@@ -1329,6 +2005,7 @@ def _split_chunk_for_retry(chunk: dict) -> list[dict]:
             if p:
                 local.append({
                     "title": chunk.get("title", "RetryChunk"),
+                    "screen_hint": chunk.get("screen_hint", ""),
                     "core_text": p,
                     "prev_context": "",
                     "next_context": "",
@@ -1344,6 +2021,8 @@ def _split_chunk_for_retry(chunk: dict) -> list[dict]:
         child = dict(child)
         child["chunk_id"] = f"{parent_id}.{idx + 1}"
         child["depth"] = chunk.get("depth", 0) + 1
+        if not child.get("screen_hint"):
+            child["screen_hint"] = chunk.get("screen_hint", "")
         if idx == 0 and parent_prev:
             child["prev_context"] = (parent_prev + "\n" + child.get("prev_context", ""))[-AGENT1_CONTEXT_CHARS:]
         if idx == len(local) - 1 and parent_next:
@@ -1775,20 +2454,12 @@ def merge_rule_matrices(matrices: list[dict]) -> tuple[dict, dict]:
 
     final_screens = list(screens_map.values())
 
-    used_prefixes = set()
-    for screen_idx, screen in enumerate(final_screens, start=1):
-        fallback = f"SCREEN_{screen_idx:02d}"
-        prefix = _infer_rule_prefix(screen.get("test_rules", []), fallback)
-
-        base_prefix = prefix
-        suffix = 2
-        while prefix in used_prefixes:
-            prefix = f"{base_prefix}_{suffix}"
-            suffix += 1
-        used_prefixes.add(prefix)
-
-        for idx, rule in enumerate(screen.get("test_rules", []), start=1):
-            rule["rule_id"] = f"{prefix}-{idx:03d}"
+    # IDs carry no business meaning. Generate them only after merge/dedup is final.
+    final_rule_index = 0
+    for screen in final_screens:
+        for rule in screen.get("test_rules", []):
+            final_rule_index += 1
+            rule["rule_id"] = f"R_{final_rule_index:04d}"
 
     final = {
         "test_design_version": WEB_TEST_DESIGN_VERSION,
@@ -1812,137 +2483,259 @@ def run_agent1_document_pipeline(
     api_key: str,
     base_url: str,
     model: str,
-    prompt_template: str,
+    prompt_template: str | None = None,
     cache: dict | None = None,
     progress_callback=None,
 ) -> tuple[bool, dict | None, dict]:
-    """Run the scalable Web document-analysis pipeline."""
+    """Web V3.6: BA source -> screen/component/logic inventory -> QA rules.
+
+    The first AI pass is discovery-only and is forbidden from applying QA rules. After all
+    source chunks are merged into one canonical inventory, the second pass generates QA rules
+    screen-by-screen from that inventory. This prevents source chunk boundaries from becoming
+    fake screens and prevents QA derivation before field/logic ownership is known.
+    """
     started = time.time()
     initial_chunks = split_document_semantic(raw_text, base_filename)
     diagnostics: list[dict] = []
-    all_matrices: list[dict] = []
+    inventory_parts: list[dict] = []
+    discovery_workers = min(AGENT1_PARALLEL_WORKERS, max(1, len(initial_chunks)))
 
-    workers = min(AGENT1_PARALLEL_WORKERS, max(1, len(initial_chunks)))
     log_info(
-        f"[AGENT1_PIPELINE] 📚 DocumentChars={len(raw_text):,} | "
-        f"InitialChunks={len(initial_chunks)} | Target≈{AGENT1_CHUNK_TARGET_CHARS:,} | "
-        f"Workers={workers}"
+        f"[WEB_PIPELINE_V3.6] 📚 DocumentChars={len(raw_text):,} | "
+        f"DiscoveryChunks={len(initial_chunks)} | DiscoveryWorkers={discovery_workers}"
     )
+    if progress_callback:
+        progress_callback(0, 100, "Bước 1/2: Đang đọc cấu trúc BA và lập danh sách màn hình / field / logic...")
 
-    # Small documents keep the original sequential path.
-    if workers <= 1 or len(initial_chunks) <= 1:
-        for idx, chunk in enumerate(initial_chunks, start=1):
-            if progress_callback:
-                progress_callback(
-                    idx - 1,
-                    len(initial_chunks),
-                    f"Agent 1 đang xử lý chunk {idx}/{len(initial_chunks)} — {chunk.get('title')} ({chunk.get('char_count', 0):,} chars)"
-                )
+    def _discover(index: int, chunk: dict):
+        local: list[dict] = []
+        ok, results = process_web_discovery_chunk_recursive(
+            chunk=chunk,
+            api_key=api_key,
+            base_url=base_url,
+            model=model,
+            cache=cache,
+            diagnostics=local,
+        )
+        return index, ok, results, local
 
-            ok, matrices = process_agent1_chunk_recursive(
+    if discovery_workers <= 1 or len(initial_chunks) <= 1:
+        for idx, chunk in enumerate(initial_chunks):
+            ok, parts = process_web_discovery_chunk_recursive(
                 chunk=chunk,
                 api_key=api_key,
                 base_url=base_url,
                 model=model,
-                prompt_template=prompt_template,
                 cache=cache,
                 diagnostics=diagnostics,
             )
             if not ok:
-                summary = {
+                return False, None, {
                     "ok": False,
+                    "stage": "web_discovery",
+                    "architecture": "DISCOVERY->CANONICAL_INVENTORY->QA_RULES",
                     "document_chars": len(raw_text),
                     "initial_chunks": len(initial_chunks),
-                    "parallel_workers": workers,
                     "elapsed": round(time.time() - started, 2),
                     "diagnostics": diagnostics,
                 }
-                return False, None, summary
-
-            all_matrices.extend(matrices)
+            inventory_parts.extend(parts)
             if progress_callback:
-                progress_callback(idx, len(initial_chunks), f"Hoàn tất chunk {idx}/{len(initial_chunks)}")
+                progress_callback(int(40 * (idx + 1) / max(1, len(initial_chunks))), 100,
+                                  f"Bước 1/2: Đã đọc {idx + 1}/{len(initial_chunks)} phần tài liệu BA")
     else:
-        # Each worker uses its own diagnostics list so output can be merged
-        # deterministically in original chunk order.
-        def _work(index: int, chunk: dict):
-            local_diagnostics: list[dict] = []
-            ok, matrices = process_agent1_chunk_recursive(
-                chunk=chunk,
+        ordered: dict[int, tuple[bool, list[dict], list[dict]]] = {}
+        completed = 0
+        with ThreadPoolExecutor(max_workers=discovery_workers, thread_name_prefix="web-discovery") as executor:
+            futures = {executor.submit(_discover, idx, chunk): idx for idx, chunk in enumerate(initial_chunks)}
+            for future in as_completed(futures):
+                idx, ok, parts, local = future.result()
+                ordered[idx] = (ok, parts, local)
+                completed += 1
+                if progress_callback:
+                    progress_callback(int(40 * completed / max(1, len(initial_chunks))), 100,
+                                      f"Bước 1/2: Đã đọc {completed}/{len(initial_chunks)} phần tài liệu BA")
+        for idx in range(len(initial_chunks)):
+            ok, parts, local = ordered[idx]
+            diagnostics.extend(local)
+            if not ok:
+                return False, None, {
+                    "ok": False,
+                    "stage": "web_discovery",
+                    "architecture": "DISCOVERY->CANONICAL_INVENTORY->QA_RULES",
+                    "document_chars": len(raw_text),
+                    "initial_chunks": len(initial_chunks),
+                    "elapsed": round(time.time() - started, 2),
+                    "diagnostics": diagnostics,
+                }
+            inventory_parts.extend(parts)
+
+    inventory, inventory_stats = merge_web_inventories(inventory_parts)
+    inventory_ok, inventory_diag = validate_web_inventory_schema(inventory)
+    if not inventory_ok or not inventory.get("screens"):
+        summary = {
+            "ok": False,
+            "stage": "web_inventory",
+            "architecture": "DISCOVERY->CANONICAL_INVENTORY->QA_RULES",
+            "document_chars": len(raw_text),
+            "initial_chunks": len(initial_chunks),
+            "inventory": inventory_stats,
+            "inventory_schema": inventory_diag,
+            "elapsed": round(time.time() - started, 2),
+            "diagnostics": diagnostics,
+        }
+        log_error(f"[WEB_PIPELINE_V3.6] Không xác định được màn hình hợp lệ | {inventory_diag}")
+        return False, None, summary
+
+    inventory_preview = [
+        {
+            "screen_name": _stringify(screen.get("screen_name")),
+            "screen_code": _stringify(screen.get("screen_code")),
+            "fields": [_stringify(x.get("field_name")) for x in screen.get("fields", [])[:100]],
+            "controls": [_stringify(x.get("control_name")) for x in screen.get("controls", [])[:100]],
+            "grids": [_stringify(x.get("grid_name")) for x in screen.get("grids", [])[:30]],
+            "popups": [_stringify(x.get("popup_name")) for x in screen.get("popups", [])[:30]],
+            "logic": [
+                {
+                    "logic_name": _stringify(x.get("logic_name")),
+                    "logic_type": _stringify(x.get("logic_type")),
+                    "targets": list(x.get("targets", []))[:20],
+                }
+                for x in screen.get("logic", [])[:100]
+            ],
+        }
+        for screen in inventory.get("screens", [])[:50]
+    ]
+    screens = inventory.get("screens", [])
+    log_info(
+        f"[WEB_DISCOVERY] ✅ Canonical inventory | Screens={inventory_stats['screens']} | "
+        f"Fields={inventory_stats['fields']} | Controls={inventory_stats['controls']} | "
+        f"Grids={inventory_stats['grids']} | Popups={inventory_stats['popups']} | "
+        f"Logic={inventory_stats['logic']} | Requirements={inventory_stats['requirements']}"
+    )
+    if progress_callback:
+        progress_callback(45, 100,
+                          f"Bước 1/2 hoàn tất: {inventory_stats['screens']} màn hình, "
+                          f"{inventory_stats['fields']} field, {inventory_stats['logic']} logic. Bắt đầu áp dụng QA Rule...")
+
+    qa_workers = min(WEB_QA_PARALLEL_WORKERS, max(1, len(screens)))
+    qa_matrices: list[dict] = []
+
+    def _qa(index: int, screen: dict):
+        local: list[dict] = []
+        ok, results = process_web_qa_screen_recursive(
+            screen=screen,
+            api_key=api_key,
+            base_url=base_url,
+            model=model,
+            cache=cache,
+            diagnostics=local,
+        )
+        return index, ok, results, local
+
+    if qa_workers <= 1 or len(screens) <= 1:
+        for idx, screen in enumerate(screens):
+            name = _stringify(screen.get("screen_name"))
+            if progress_callback:
+                progress_callback(45 + int(50 * idx / max(1, len(screens))), 100,
+                                  f"Bước 2/2: Áp dụng QA Rule cho màn hình {idx + 1}/{len(screens)} — {name}")
+            ok, matrices = process_web_qa_screen_recursive(
+                screen=screen,
                 api_key=api_key,
                 base_url=base_url,
                 model=model,
-                prompt_template=prompt_template,
                 cache=cache,
-                diagnostics=local_diagnostics,
+                diagnostics=diagnostics,
             )
-            return index, ok, matrices, local_diagnostics
-
-        results: dict[int, tuple[bool, list[dict], list[dict]]] = {}
-        completed = 0
-        with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="testpilot-web") as executor:
-            futures = {
-                executor.submit(_work, idx, chunk): idx
-                for idx, chunk in enumerate(initial_chunks)
-            }
-            for future in as_completed(futures):
-                idx, ok, matrices, local_diagnostics = future.result()
-                results[idx] = (ok, matrices, local_diagnostics)
-                completed += 1
-                if progress_callback:
-                    progress_callback(
-                        completed,
-                        len(initial_chunks),
-                        f"Hoàn tất {completed}/{len(initial_chunks)} chunk"
-                    )
-
-        for idx in range(len(initial_chunks)):
-            ok, matrices, local_diagnostics = results[idx]
-            diagnostics.extend(local_diagnostics)
             if not ok:
-                summary = {
+                return False, None, {
                     "ok": False,
+                    "stage": "web_qa_rules",
+                    "architecture": "DISCOVERY->CANONICAL_INVENTORY->QA_RULES",
                     "document_chars": len(raw_text),
                     "initial_chunks": len(initial_chunks),
-                    "parallel_workers": workers,
+                    "inventory": inventory_stats,
+                    "inventory_preview": inventory_preview,
                     "elapsed": round(time.time() - started, 2),
                     "diagnostics": diagnostics,
                 }
-                return False, None, summary
-            all_matrices.extend(matrices)
+            qa_matrices.extend(matrices)
+            if progress_callback:
+                progress_callback(45 + int(50 * (idx + 1) / max(1, len(screens))), 100,
+                                  f"Bước 2/2: Hoàn tất {idx + 1}/{len(screens)} màn hình")
+    else:
+        ordered_qa: dict[int, tuple[bool, list[dict], list[dict]]] = {}
+        completed = 0
+        with ThreadPoolExecutor(max_workers=qa_workers, thread_name_prefix="web-qa") as executor:
+            futures = {executor.submit(_qa, idx, screen): idx for idx, screen in enumerate(screens)}
+            for future in as_completed(futures):
+                idx, ok, results, local = future.result()
+                ordered_qa[idx] = (ok, results, local)
+                completed += 1
+                if progress_callback:
+                    progress_callback(45 + int(50 * completed / max(1, len(screens))), 100,
+                                      f"Bước 2/2: Hoàn tất {completed}/{len(screens)} màn hình")
+        for idx in range(len(screens)):
+            ok, results, local = ordered_qa[idx]
+            diagnostics.extend(local)
+            if not ok:
+                return False, None, {
+                    "ok": False,
+                    "stage": "web_qa_rules",
+                    "architecture": "DISCOVERY->CANONICAL_INVENTORY->QA_RULES",
+                    "document_chars": len(raw_text),
+                    "initial_chunks": len(initial_chunks),
+                    "inventory": inventory_stats,
+                    "inventory_preview": inventory_preview,
+                    "elapsed": round(time.time() - started, 2),
+                    "diagnostics": diagnostics,
+                }
+            qa_matrices.extend(results)
 
-    final_matrix, merge_stats = merge_rule_matrices(all_matrices)
+    final_matrix, merge_stats = merge_rule_matrices(qa_matrices)
     final_matrix = normalize_web_rule_shape(final_matrix)
     final_matrix = normalize_web_rule_matrix_enums(final_matrix)
     final_matrix, final_semantic_repairs = normalize_web_rule_semantics(final_matrix)
     merge_stats["semantic_metadata_repairs"] = len(final_semantic_repairs)
     schema_ok, schema_diag = validate_rule_matrix_schema(final_matrix, strict=True)
+    coverage_audit = audit_web_inventory_rule_coverage(inventory, final_matrix) if schema_ok else {}
     elapsed = time.time() - started
 
     summary = {
         "ok": schema_ok,
+        "stage": "completed" if schema_ok else "final_schema",
+        "architecture": "DISCOVERY->CANONICAL_INVENTORY->QA_RULES",
         "document_chars": len(raw_text),
         "initial_chunks": len(initial_chunks),
-        "parallel_workers": workers,
-        "leaf_matrices": len(all_matrices),
+        "discovery_workers": discovery_workers,
+        "qa_workers": qa_workers,
+        "inventory": inventory_stats,
+        "inventory_schema": inventory_diag,
+        "inventory_preview": inventory_preview,
+        "qa_matrices": len(qa_matrices),
         "elapsed": round(elapsed, 2),
         "merge": merge_stats,
         "schema": schema_diag,
+        "coverage_audit": coverage_audit,
         "diagnostics": diagnostics,
     }
-
     if not schema_ok:
-        log_error(f"[AGENT1_PIPELINE] ❌ Final schema fail | {schema_diag}")
+        log_error(f"[WEB_PIPELINE_V3.6] ❌ Final schema fail | {schema_diag}")
         return False, None, summary
 
+    if coverage_audit.get("uncovered_count"):
+        log_info(
+            f"[WEB_COVERAGE_AUDIT] ⚠️ {coverage_audit['uncovered_count']} object có requirement "
+            f"chưa thấy target rõ trong Rule Matrix | Coverage={coverage_audit.get('coverage_ratio')}"
+        )
+    if progress_callback:
+        progress_callback(100, 100, "Hoàn tất phân tích Web: đã xác định màn hình/field/logic và áp dụng QA Rule.")
     log_info(
-        f"[AGENT1_PIPELINE] ✅ Completed | Time={elapsed:.2f}s | "
+        f"[WEB_PIPELINE_V3.6] ✅ Completed | Time={elapsed:.2f}s | "
         f"Screens={merge_stats['screens']} | FinalRules={merge_stats['final_rules']} | "
-        f"ExactDupRemoved={merge_stats['exact_duplicates_removed']} | Workers={workers}"
+        f"InventoryFields={inventory_stats['fields']} | InventoryLogic={inventory_stats['logic']}"
     )
     return True, final_matrix, summary
-
-
 
 
 
@@ -2751,11 +3544,27 @@ def select_primary_api_targets(design_text: str, targets: list[dict], document_h
             f"{selected[0].get('method')} {selected[0].get('endpoint_path')} | score={top_score:.1f}"
         )
         return selected
-    log_info(
-        f"[API_TARGET_SELECTOR] Design có {len(targets)} endpoint nhưng không đủ tín hiệu chọn 1; "
-        "giữ tất cả để tránh đoán sai."
+
+    # Product contract: one API Design upload represents ONE API under test. If the
+    # document contains sibling/downstream endpoints and lexical scores are ambiguous,
+    # choose the endpoint that appears earliest in the design text instead of creating
+    # multiple testcase folders. Score is used only as a secondary tie-breaker.
+    positions = {}
+    for score, idx, target in scored:
+        path = str(target.get("endpoint_path") or "")
+        pos = (design_text or "").find(path) if path and path != "UNMAPPED" else -1
+        positions[id(target)] = pos if pos >= 0 else 10**12
+    scored_by_position = sorted(
+        scored,
+        key=lambda item: (positions.get(id(item[2]), 10**12), -item[0], item[1]),
     )
-    return targets
+    selected = [copy.deepcopy(scored_by_position[0][2])]
+    log_info(
+        f"[API_TARGET_SELECTOR] ⚠️ Design có {len(targets)} endpoint và điểm gần nhau; "
+        f"strict-single-target chọn endpoint xuất hiện sớm nhất: "
+        f"{selected[0].get('method')} {selected[0].get('endpoint_path')}"
+    )
+    return selected
 
 
 def build_api_scope_router_payload(ba_chunk: dict, targets: list[dict]) -> str:
@@ -2853,11 +3662,11 @@ def route_ba_chunk_to_target_apis(
 ) -> tuple[bool, list[dict], dict]:
     """Cheap scope scan only; no testcase generation.
 
-    V1.9.3 keeps PRIMARY and required CONTINUATION operations, preserves supporting
-    DEPENDENCY context under the primary API, and skips OUT_OF_SCOPE sibling flows.
+    V1.11.3 keeps only PRIMARY/DEPENDENCY context for the selected API and skips
+    every distinct continuation/sibling operation. API Design owns endpoint identity.
     """
     payload = build_api_scope_router_payload(ba_chunk, targets)
-    cache_key = _cache_key("api-scope-router-v1.10.0-gated", model, PROMPT_API_SCOPE_ROUTER, payload)
+    cache_key = _cache_key("api-scope-router-v1.11.3-strict-target", model, PROMPT_API_SCOPE_ROUTER, payload)
     if cache is not None and cache_key in cache:
         result = copy.deepcopy(cache[cache_key])
         return True, result.get("matches", []), {"status": "CACHE_HIT", "chunk_id": ba_chunk.get("chunk_id")}
@@ -2940,6 +3749,7 @@ def build_api_agent1_chunk_payload(
     *,
     source_document: str = "API_SPEC",
     target_endpoint: dict | None = None,
+    spec_case_reference: str = "",
 ) -> str:
     hints = select_api_endpoint_hints(chunk.get("core_text", ""), endpoint_index)
     hint_text = json.dumps(hints, ensure_ascii=False, indent=2) if hints else "[]"
@@ -2949,10 +3759,35 @@ def build_api_agent1_chunk_payload(
         "endpoint_path": target.get("endpoint_path") or target.get("path") or "UNMAPPED",
         "summary": target.get("summary", ""),
     }, ensure_ascii=False, indent=2)
+    target_spec_reference = ""
+    source_document = "BA" if str(source_document).upper() == "BA" else "API_SPEC"
+    if source_document == "BA":
+        # Prefer the testcase inventory already generated from API Spec. This is much safer than
+        # asking BA extraction to rediscover technical cases from raw design prose and materially
+        # reduces duplicate Permission/Validation/Happy-Path scenarios across documents.
+        target_spec_reference = str(spec_case_reference or "").strip()
+        if not target_spec_reference:
+            target_spec_reference = str(target.get("spec_excerpt") or "").strip()[:7000]
+        else:
+            target_spec_reference = target_spec_reference[:14000]
+        source_policy = (
+            "BA POLICY: create standalone BUSINESS_RULE cases only. Do not create standalone AUTH/PERMISSION/VALIDATION/HAPPY_PATH. "
+            "Use SPEC TESTCASE REFERENCE only to attach exact BA error code/message/outcome to an already-existing SPEC technical case. "
+            "For such enrichment, mirror the SPEC category/target/condition instead of inventing a new scenario. "
+            "Unmatched BA technical records are discarded."
+        )
+    else:
+        source_policy = (
+            "API_SPEC POLICY: create standalone AUTH/PERMISSION/VALIDATION/HAPPY_PATH cases only. "
+            "Do not create standalone BUSINESS_RULE cases; BA owns business-rule testcase creation."
+        )
     return f"""=== FORCED ANALYSIS SCOPE — MANDATORY ===
 source_document: {source_document}
 TARGET API:
 {target_text}
+
+SOURCE RESPONSIBILITY — MANDATORY:
+{source_policy}
 
 Rules for this call:
 - Generate rules ONLY for TARGET API / operation shown above.
@@ -2960,6 +3795,10 @@ Rules for this call:
 - source_document of every generated rule MUST be exactly {source_document}.
 - If TARGET has an exact method/path, do not infer another endpoint from nearby BA text.
 - If TARGET endpoint_path is UNMAPPED, NEVER invent a URL. Use TARGET summary to identify the operation and keep method/path UNMAPPED unless the current source explicitly states them.
+- BA text may describe many APIs. A sibling/continuation API is context only and MUST NOT become a testcase endpoint.
+
+=== SPEC TESTCASE REFERENCE — CHỈ DÙNG ĐỂ ĐỐI CHIẾU/ENRICH CASE KỸ THUẬT, KHÔNG TỰ SINH RULE TỪ ĐÂY ===
+{target_spec_reference}
 
 === CHUNK METADATA — KHÔNG PHẢI REQUIREMENT ===
 chunk_id: {chunk.get('chunk_id')}
@@ -3014,7 +3853,6 @@ def validate_api_rule_matrix_schema(data, strict: bool = False) -> tuple[bool, s
 
     total_endpoints = 0
     total_rules = 0
-    seen_ids = set()
     for midx, module in enumerate(modules):
         if not isinstance(module, dict):
             return False, f"api_modules[{midx}] phải là object"
@@ -3060,16 +3898,12 @@ def validate_api_rule_matrix_schema(data, strict: bool = False) -> tuple[bool, s
                     for field in API_RULE_FIELDS:
                         if not isinstance(rule.get(field), str):
                             return False, f"Rule {midx}.{eidx}.{ridx}.{field} phải là string"
-                    rid = rule.get("rule_id", "").strip()
-                    if not rid:
-                        return False, f"Rule {midx}.{eidx}.{ridx}.rule_id rỗng"
-                    if rid in seen_ids:
-                        return False, f"Trùng rule_id: {rid}"
-                    seen_ids.add(rid)
+                    # rule_id is bookkeeping only and is assigned after merge/dedup.
+                    # It must never block semantic analysis because of empty/duplicate model IDs.
                     if not rule.get("source_requirement", "").strip():
-                        return False, f"Rule {rid} thiếu source_requirement"
+                        return False, f"Rule {midx}.{eidx}.{ridx} thiếu source_requirement"
                     if rule_type == "DERIVED" and not rule.get("applied_qa_rule", "").strip():
-                        return False, f"Rule {rid} DERIVED thiếu applied_qa_rule"
+                        return False, f"Rule {midx}.{eidx}.{ridx} DERIVED thiếu applied_qa_rule"
 
     return True, f"API Schema OK | Modules={len(modules)} | Endpoints={total_endpoints} | TestRules={total_rules}"
 
@@ -3190,13 +4024,89 @@ def normalize_api_rule_semantics(data: dict) -> tuple[dict, list[dict]]:
 
 
 def _api_rule_concept_signature(rule: dict) -> tuple:
-    """Logical identity used to reconcile the same rule across multiple documents."""
+    """Stable logical identity for exact reconciliation across Spec/BA/chunks.
+
+    `applied_qa_rule` is deliberately excluded because it is metadata and frequently
+    differs between an API_SPEC extraction and a BA enrichment of the same testcase.
+    """
     return (
         _normalize_text(rule.get("target")),
         _normalize_text(rule.get("category")),
         _normalize_text(rule.get("rule_name")),
         _normalize_text(rule.get("test_condition")),
-        _normalize_text(rule.get("applied_qa_rule")),
+    )
+
+
+def _api_rule_match_text(rule: dict) -> str:
+    return _normalize_search_text(" ".join(
+        str(rule.get(k, "") or "")
+        for k in ("target", "rule_name", "test_condition")
+    ))
+
+
+def _api_rules_semantically_equivalent(a: dict, b: dict) -> bool:
+    """Conservative fuzzy reconciliation for the same testcase worded differently.
+
+    This is only used cross-document (API_SPEC vs BA) and only inside one endpoint.
+    It never merges different QA categories or obvious boundary values.
+    """
+    if str(a.get("source_document", "")).upper() == str(b.get("source_document", "")).upper():
+        return False
+    if _normalize_text(a.get("category")) != _normalize_text(b.get("category")):
+        return False
+
+    at = _normalize_text(a.get("target"))
+    bt = _normalize_text(b.get("target"))
+    if at and bt and at != bt:
+        # Allow minor target wording drift only when one contains the other.
+        if at not in bt and bt not in at:
+            return False
+
+    a_text = _api_rule_match_text(a)
+    b_text = _api_rule_match_text(b)
+    if not a_text or not b_text:
+        return False
+
+    # Never fuzzy-merge cases that carry different explicit numeric boundary values.
+    a_numbers = re.findall(r"(?<![a-z])\d+(?![a-z])", a_text)
+    b_numbers = re.findall(r"(?<![a-z])\d+(?![a-z])", b_text)
+    if a_numbers and b_numbers and a_numbers != b_numbers:
+        return False
+
+    seq = SequenceMatcher(None, a_text, b_text).ratio()
+    a_tokens = {t for t in re.findall(r"[a-z0-9_./-]+", a_text) if len(t) >= 2}
+    b_tokens = {t for t in re.findall(r"[a-z0-9_./-]+", b_text) if len(t) >= 2}
+    union = a_tokens | b_tokens
+    jaccard = (len(a_tokens & b_tokens) / len(union)) if union else 0.0
+
+    a_condition = _normalize_search_text(a.get("test_condition", ""))
+    b_condition = _normalize_search_text(b.get("test_condition", ""))
+
+    # Guard against merging opposite/independent partitions that happen to share most words.
+    neg_markers = (" khong ", " invalid ", " sai ", " thieu ", " missing ", " expired ", " fail ", " timeout ")
+    a_pad = f" {a_condition} "
+    b_pad = f" {b_condition} "
+    if any(x in a_pad for x in neg_markers) != any(x in b_pad for x in neg_markers):
+        return False
+
+    partition_markers = {"null", "empty", "rong", "blank", "whitespace", "missing", "thieu"}
+    a_parts = partition_markers & set(re.findall(r"[a-z0-9_]+", a_condition))
+    b_parts = partition_markers & set(re.findall(r"[a-z0-9_]+", b_condition))
+    if a_parts and b_parts and a_parts != b_parts:
+        return False
+
+    condition_seq = (
+        SequenceMatcher(None, a_condition, b_condition).ratio()
+        if a_condition and b_condition else 0.0
+    )
+
+    # Same target/category plus nearly identical condition is enough for BA enrichment;
+    # otherwise require very strong whole-rule similarity/token overlap.
+    same_target = bool(at and bt and at == bt)
+    return (
+        (same_target and condition_seq >= 0.82)
+        or seq >= 0.84
+        or (len(a_tokens & b_tokens) >= 4 and jaccard >= 0.68)
     )
 
 
@@ -3241,8 +4151,8 @@ def _merge_api_reconciliation_status(a: str, b: str, merged_source: str) -> str:
 def merge_api_rule_matrices(matrices: list[dict]) -> tuple[dict, dict]:
     """Merge by TARGET ENDPOINT first, not by AI-generated module label.
 
-    V1.9.3 intentionally ignores module-name drift between API Spec and BA. The same
-    method+path is one logical API and must reconcile into one endpoint workspace.
+    Endpoint identity comes from API Design. Module-name drift between API Spec and BA is
+    ignored; the same method+path is one logical API and reconciles into one workspace.
     """
     endpoints_map: OrderedDict[tuple, dict] = OrderedDict()
     concept_maps: dict[tuple, dict] = {}
@@ -3283,8 +4193,18 @@ def merge_api_rule_matrices(matrices: list[dict]) -> tuple[dict, dict]:
                     raw_rules += 1
                     rule = copy.deepcopy(incoming)
                     concept = _api_rule_concept_signature(rule)
-                    if concept in concept_map:
-                        existing_idx = concept_map[concept]
+                    existing_idx = concept_map.get(concept)
+
+                    # Cross-document wording often differs slightly even when BA only adds
+                    # an error code/message to a testcase already defined by API Spec.
+                    # Reconcile such cases conservatively instead of creating duplicate cases.
+                    if existing_idx is None:
+                        for candidate_idx, candidate in enumerate(target_ep["test_rules"]):
+                            if _api_rules_semantically_equivalent(candidate, rule):
+                                existing_idx = candidate_idx
+                                break
+
+                    if existing_idx is not None:
                         existing = target_ep["test_rules"][existing_idx]
                         if _api_rules_have_contract_conflict(existing, rule):
                             conflicts += 1
@@ -3310,6 +4230,7 @@ def merge_api_rule_matrices(matrices: list[dict]) -> tuple[dict, dict]:
                         ):
                             if not str(existing.get(fld, "")).strip() and str(rule.get(fld, "")).strip():
                                 existing[fld] = rule.get(fld, "")
+                        concept_map.setdefault(concept, existing_idx)
                         continue
 
                     concept_map[concept] = len(target_ep["test_rules"])
@@ -3318,16 +4239,13 @@ def merge_api_rule_matrices(matrices: list[dict]) -> tuple[dict, dict]:
     final_modules = []
     global_rule_counter = 0
     unmapped_endpoints = 0
-    for e_idx, ep_data in enumerate(endpoints_map.values(), start=1):
+    for ep_data in endpoints_map.values():
         if ep_data.get("method") == "UNMAPPED" or ep_data.get("endpoint_path") == "UNMAPPED":
             unmapped_endpoints += 1
-        method = ep_data.get("method", "API")
-        slug = unicodedata.normalize("NFKD", ep_data.get("endpoint_path", "API")).encode("ascii", "ignore").decode("ascii")
-        slug = re.sub(r"[^A-Za-z0-9]+", "_", slug).strip("_").upper()[-28:] or f"EP{e_idx:02d}"
-        prefix = f"API_{method}_{slug}" if method != "UNMAPPED" else f"API_UNMAPPED_{e_idx:02d}"
-        for local_idx, rule in enumerate(ep_data.get("test_rules", []), start=1):
+        # IDs are bookkeeping only. Assign them after business merge/dedup is final.
+        for rule in ep_data.get("test_rules", []):
             global_rule_counter += 1
-            rule["rule_id"] = f"{prefix}-{local_idx:03d}"
+            rule["rule_id"] = f"R_{global_rule_counter:04d}"
         final_modules.append({
             "module_name": ep_data.pop("module_name", "Target API"),
             "endpoints": [ep_data],
@@ -3345,6 +4263,144 @@ def merge_api_rule_matrices(matrices: list[dict]) -> tuple[dict, dict]:
         "final_rules": global_rule_counter,
     }
     return final, stats
+
+
+
+def build_api_spec_case_reference(
+    matrices: list[dict],
+    target_endpoint: dict | None,
+    *,
+    max_chars: int = 14000,
+) -> str:
+    """Build a compact testcase inventory from the *actual* API_SPEC Agent1 output.
+
+    BA deep-analysis uses this only as reconciliation context. It prevents BA from
+    independently regenerating Permission/Validation/Happy-Path cases just to contribute
+    an error code/message. No rule may be created solely from this reference.
+    """
+    target_endpoint = target_endpoint or {}
+    target_method = str(target_endpoint.get("method", "UNMAPPED")).upper().strip() or "UNMAPPED"
+    target_path = str(target_endpoint.get("endpoint_path") or target_endpoint.get("path") or "UNMAPPED").strip() or "UNMAPPED"
+    technical_categories = {"AUTH", "PERMISSION", "VALIDATION", "HAPPY_PATH"}
+    items: list[dict] = []
+    seen: set[tuple] = set()
+
+    for matrix in matrices:
+        if not isinstance(matrix, dict):
+            continue
+        for module in matrix.get("api_modules", []) if isinstance(matrix.get("api_modules"), list) else []:
+            for ep in module.get("endpoints", []) if isinstance(module.get("endpoints"), list) else []:
+                method = str(ep.get("method", "UNMAPPED")).upper().strip() or "UNMAPPED"
+                path = str(ep.get("endpoint_path", "UNMAPPED")).strip() or "UNMAPPED"
+                if (method, _normalize_text(path)) != (target_method, _normalize_text(target_path)):
+                    continue
+                for rule in ep.get("test_rules", []) if isinstance(ep.get("test_rules"), list) else []:
+                    if not isinstance(rule, dict):
+                        continue
+                    category = str(rule.get("category", "") or "").upper().strip()
+                    if category not in technical_categories:
+                        continue
+                    identity = _api_rule_concept_signature(rule)
+                    if identity in seen:
+                        continue
+                    seen.add(identity)
+                    items.append({
+                        "category": category,
+                        "target": str(rule.get("target", "") or ""),
+                        "rule_name": str(rule.get("rule_name", "") or ""),
+                        "test_condition": str(rule.get("test_condition", "") or ""),
+                        "expected_http_code": str(rule.get("expected_http_code", "") or ""),
+                        "expected_code": str(rule.get("expected_code", "") or ""),
+                        "expected_message": str(rule.get("expected_message", "") or ""),
+                    })
+
+    if not items:
+        return "[]"
+
+    # Keep valid JSON while respecting prompt size. Earlier cases normally represent the
+    # primary contract order from the Spec and are the most useful reconciliation anchors.
+    selected: list[dict] = []
+    for item in items:
+        candidate = selected + [item]
+        encoded = json.dumps(candidate, ensure_ascii=False, separators=(",", ":"))
+        if len(encoded) > max_chars:
+            break
+        selected.append(item)
+
+    return json.dumps(selected, ensure_ascii=False, separators=(",", ":"))
+
+
+def enforce_api_source_responsibility(data: dict) -> tuple[dict, dict]:
+    """Enforce the multi-document source contract after Spec/BA reconciliation.
+
+    Product contract:
+    - API_SPEC owns technical testcase creation: AUTH/PERMISSION/VALIDATION/HAPPY_PATH.
+    - BA owns BUSINESS_RULE testcase creation.
+    - BA technical records are enrichment-only. They survive only when they reconciled with
+      a SPEC testcase (source_document=BOTH) or when a real contract conflict must stay visible.
+    - API_SPEC-only BUSINESS_RULE records are dropped so the Design document cannot duplicate
+      business cases that BA is responsible for.
+
+    This is intentionally applied *after* merge so BA can still enrich exact error code/message
+    on a matching SPEC testcase without creating a second testcase.
+    """
+    if not isinstance(data, dict):
+        return data, {"dropped_total": 0, "kept_total": 0, "drop_reasons": {}}
+
+    technical_categories = {"AUTH", "PERMISSION", "VALIDATION", "HAPPY_PATH"}
+    dropped_total = 0
+    kept_total = 0
+    reasons = Counter()
+
+    for module in data.get("api_modules", []) if isinstance(data.get("api_modules"), list) else []:
+        if not isinstance(module, dict):
+            continue
+        for endpoint in module.get("endpoints", []) if isinstance(module.get("endpoints"), list) else []:
+            if not isinstance(endpoint, dict):
+                continue
+            kept_rules = []
+            for rule in endpoint.get("test_rules", []) if isinstance(endpoint.get("test_rules"), list) else []:
+                if not isinstance(rule, dict):
+                    continue
+                category = str(rule.get("category", "") or "").upper().strip()
+                source = str(rule.get("source_document", "") or "").upper().strip()
+                rec = str(rule.get("reconciliation_status", "") or "").upper().strip()
+
+                keep = True
+                reason = ""
+                if rec == "CONFLICT":
+                    # A documented conflict is review-worthy and must not be hidden merely
+                    # because it crossed the normal source responsibility boundary.
+                    keep = True
+                elif category == "BUSINESS_RULE" and source == "API_SPEC":
+                    keep = False
+                    reason = "API_SPEC_BUSINESS_RULE"
+                elif category in technical_categories and source == "BA":
+                    keep = False
+                    reason = "BA_TECHNICAL_UNMATCHED"
+
+                if keep:
+                    kept_rules.append(rule)
+                    kept_total += 1
+                else:
+                    dropped_total += 1
+                    reasons[reason] += 1
+
+            endpoint["test_rules"] = kept_rules
+
+    # Filtering can create rule-id gaps. IDs are bookkeeping only, so renumber once here.
+    counter = 0
+    for module in data.get("api_modules", []) if isinstance(data.get("api_modules"), list) else []:
+        for endpoint in module.get("endpoints", []) if isinstance(module.get("endpoints"), list) else []:
+            for rule in endpoint.get("test_rules", []) if isinstance(endpoint.get("test_rules"), list) else []:
+                counter += 1
+                rule["rule_id"] = f"R_{counter:04d}"
+
+    return data, {
+        "dropped_total": dropped_total,
+        "kept_total": kept_total,
+        "drop_reasons": dict(reasons),
+    }
 
 
 def _api_split_chunk_for_retry(chunk: dict) -> list[dict]:
@@ -3399,10 +4455,15 @@ def process_api_agent1_chunk_recursive(
     diagnostics: list | None = None,
     source_document: str = "API_SPEC",
     target_endpoint: dict | None = None,
+    spec_case_reference: str = "",
 ) -> tuple[bool, list[dict]]:
     diagnostics = diagnostics if diagnostics is not None else []
     payload = build_api_agent1_chunk_payload(
-        chunk, endpoint_index, source_document=source_document, target_endpoint=target_endpoint
+        chunk,
+        endpoint_index,
+        source_document=source_document,
+        target_endpoint=target_endpoint,
+        spec_case_reference=spec_case_reference,
     )
     key = _cache_key(API_AGENT1_CACHE_NAMESPACE, model, prompt_template, payload)
     if cache is not None and key in cache:
@@ -3519,7 +4580,9 @@ def process_api_agent1_chunk_recursive(
     for child in children:
         ok, mats = process_api_agent1_chunk_recursive(
             child, endpoint_index, api_key, base_url, model, prompt_template, cache, diagnostics,
-            source_document=source_document, target_endpoint=target_endpoint
+            source_document=source_document,
+            target_endpoint=target_endpoint,
+            spec_case_reference=spec_case_reference,
         )
         if not ok:
             return False, []
@@ -3538,11 +4601,11 @@ def run_api_agent1_document_pipeline(
     cache: dict | None = None,
     progress_callback=None,
 ) -> tuple[bool, dict | None, dict]:
-    """V1.9.3 targeted multi-document API pipeline with continuation-aware routing.
+    """V1.11.4 source-role single-target multi-document API pipeline.
 
-    API Design/Spec defines the target API(s). The BA document is scanned only for
-    relevance first; deep QA generation runs only on BA chunks mapped to a target API.
-    This prevents a 30+ page BA document from generating cases for unrelated APIs.
+    API Design/Spec defines exactly one API under test. The BA document is scanned only for
+    relevance; deep QA generation runs only on BA chunks that enrich that same target API.
+    Distinct sibling/continuation APIs are excluded so they cannot create extra folders.
     """
     started = time.time()
     endpoint_index = extract_api_endpoint_index(design_text)
@@ -3550,6 +4613,7 @@ def run_api_agent1_document_pipeline(
     targets = select_primary_api_targets(design_text, targets, document_hint=base_filename)
     diagnostics: list[dict] = []
     matrices: list[dict] = []
+    spec_matrices: list[dict] = []
 
     log_info(
         f"[API_TARGET_PIPELINE] 🎯 TargetAPIs={len(targets)} | "
@@ -3585,10 +4649,18 @@ def run_api_agent1_document_pipeline(
                     "ok": False, "stage": "api_spec", "endpoint_index": len(endpoint_index),
                     "targets": targets, "elapsed": round(time.time()-started,2), "diagnostics": diagnostics,
                 }
+            spec_matrices.extend(mats)
             matrices.extend(mats)
 
+    # Build reconciliation anchors from the real Spec-generated testcase inventory, not
+    # from raw design prose. BA may use these anchors only to enrich matching technical cases.
+    spec_case_references = {
+        _api_endpoint_key(target): build_api_spec_case_reference(spec_matrices, target)
+        for target in targets
+    }
+
     # Stage 2 — cheap BA scope scan. It reads chunks for routing only, no testcase generation.
-    # V1.9.3 classifies each BA chunk as PRIMARY / CONTINUATION / DEPENDENCY / OUT_OF_SCOPE.
+    # PRIMARY/DEPENDENCY enrich the target API; sibling/continuation operations are OUT_OF_SCOPE.
     ba_chunks = split_document_semantic(
         ba_text,
         base_title=f"{base_filename}::BA",
@@ -3598,6 +4670,8 @@ def run_api_agent1_document_pipeline(
     )
     routed_pairs: list[tuple[dict, dict, str]] = []
     scope_diagnostics = []
+    # BA must never create endpoint workspaces. Keep the counter only for diagnostics
+    # in case an older/model response still emits CONTINUATION.
     continuation_targets: OrderedDict[tuple, dict] = OrderedDict()
     scope_role_counts = {"PRIMARY": 0, "CONTINUATION": 0, "DEPENDENCY": 0, "OUT_OF_SCOPE": 0}
     for idx, chunk in enumerate(ba_chunks, start=1):
@@ -3639,19 +4713,13 @@ def run_api_agent1_document_pipeline(
         if role == "PRIMARY":
             routed_pairs.append((chunk, primary_target, role))
         elif role == "DEPENDENCY":
-            # Dependency behavior remains under the parent API as BUSINESS_RULE/expected outcome.
-            # It does not become a new endpoint workspace by itself.
+            # Dependency context may explain a direct outcome of the target API, but remains
+            # inside the target endpoint. It never gets its own endpoint workspace.
             routed_pairs.append((chunk, primary_target, role))
         elif role == "CONTINUATION":
-            cont = _build_continuation_target(primary_target, guarded_match)
-            ckey = (
-                _normalize_text(cont.get("summary", "")),
-                str(cont.get("method", "UNMAPPED")).upper(),
-                _normalize_text(cont.get("endpoint_path", "UNMAPPED")),
-                _api_endpoint_key(primary_target),
-            )
-            continuation_targets.setdefault(ckey, cont)
-            routed_pairs.append((chunk, continuation_targets[ckey], role))
+            # Strict target mode: never create a second endpoint from BA. The gate normally
+            # repairs same-operation wording to PRIMARY and turns the rest OUT_OF_SCOPE.
+            scope_role_counts["OUT_OF_SCOPE"] = scope_role_counts.get("OUT_OF_SCOPE", 0) + 1
         # OUT_OF_SCOPE: intentionally ignored.
 
     completed_scans = 0
@@ -3682,16 +4750,10 @@ def run_api_agent1_document_pipeline(
             for match in matches:
                 _accept_match(chunk, match)
 
-    # Deduplicate same BA chunk/analysis-target/role pair.
-    # Unknown continuation endpoints are separated by BA operation name, never collapsed together.
+    # Deduplicate same BA chunk/target/role pair. BA never creates a second endpoint.
     dedup = OrderedDict()
     for chunk, target, role in routed_pairs:
         target_identity = _api_endpoint_key(target)
-        if target_identity[1] == "UNMAPPED":
-            target_identity = (
-                target_identity[0],
-                "UNMAPPED::" + _normalize_text(target.get("summary", "API tiếp nối")),
-            )
         dedup[(chunk.get("chunk_id"), role) + target_identity] = (chunk, target, role)
     routed_pairs = list(dedup.values())
 
@@ -3724,8 +4786,8 @@ def run_api_agent1_document_pipeline(
     )
 
     # Stage 3 — deep analysis ONLY on selected BA chunks.
-    # PRIMARY + DEPENDENCY are forced into the primary API.
-    # CONTINUATION gets a separate API workspace; unknown method/path stay UNMAPPED rather than invented.
+    # PRIMARY + DEPENDENCY are forced into the API Design target. Distinct continuation/sibling
+    # APIs are already excluded and can never create another workspace.
     for idx, (chunk, target, scope_role) in enumerate(routed_pairs, start=1):
         deep_chunk = dict(chunk)
         deep_chunk["chunk_id"] = f"BA-DEEP-{idx}"
@@ -3737,7 +4799,10 @@ def run_api_agent1_document_pipeline(
             )
         ok, mats = process_api_agent1_chunk_recursive(
             deep_chunk, endpoint_index, api_key, base_url, model, prompt_template,
-            cache, diagnostics, source_document="BA", target_endpoint=target,
+            cache, diagnostics,
+            source_document="BA",
+            target_endpoint=target,
+            spec_case_reference=spec_case_references.get(_api_endpoint_key(target), ""),
         )
         if not ok:
             return False, None, {
@@ -3755,6 +4820,18 @@ def run_api_agent1_document_pipeline(
         progress_callback(85, 100, "Đang đối soát API Spec và BA, loại trùng và giữ conflict...")
     final, merge_stats = merge_api_rule_matrices(matrices)
     final = normalize_api_rule_shape(final)
+    final = normalize_api_rule_matrix_enums(final)
+
+    # Enforce document ownership after reconciliation, not before it. This lets BA enrich
+    # a matching SPEC testcase with exact code/message while preventing BA from creating
+    # a second technical testcase and preventing API Spec from duplicating BA business rules.
+    final, source_policy_stats = enforce_api_source_responsibility(final)
+    merge_stats["source_policy"] = source_policy_stats
+    merge_stats["final_rules"] = sum(
+        len(ep.get("test_rules", []))
+        for module in final.get("api_modules", [])
+        for ep in module.get("endpoints", [])
+    )
 
     # Final semantic metadata recovery. Missing QA-technique metadata must not kill
     # an otherwise valid run after all Spec/BA deep-analysis calls have completed.
@@ -3825,506 +4902,409 @@ def run_api_agent1_document_pipeline(
 # Normalized: grid ownership, traceable TC title, parser-safe multiline steps.
 # ============================================================
 
-PROMPT_AGENT1_EXTRACT_RULE_MATRIX = """
-You are WEB_AGENT1_QA_BRAIN — a Senior QA Test Design Lead for Banking / Enterprise systems.
+PROMPT_WEB_DISCOVERY_INVENTORY = """
+You are WEB_BA_DISCOVERY_AGENT — a structure analyst for Banking / Enterprise Web requirements.
 
-LANGUAGE REQUIREMENT — CRITICAL:
-- ALL generated Rule Matrix textual content MUST be written in VIETNAMESE.
-- Keep technical identifiers exactly as they appear in the source when needed: screen code, field name, API name, endpoint, parameter, status code, enum value, message, etc.
-- JSON keys and enum values MUST remain exactly as defined by the schema below.
-- Do NOT translate business labels, field names, messages, or source values if doing so would alter the original requirement.
-- Tester-facing text MUST sound like a human QA artifact, not model commentary.
-- NEVER write meta phrases such as "Mục tiêu kiểm thử", "theo mục tiêu kiểm thử", "theo AI", "AI đề xuất", "AI suy luận", "AI generated", or "generated by AI" inside rule_name, test_objective, test_condition, expected_result.
-- rule_name must be a concise behavior/scenario title, not an explanation of how it was generated.
+THIS IS DISCOVERY ONLY. DO NOT DESIGN TESTCASES YET.
+You MUST NOT apply QA techniques, derive boundaries, create negative cases, or produce a Rule Matrix.
+Your only job is to reconstruct the BA document into a canonical inventory in this exact order:
+1) identify real screens;
+2) list fields/controls/grids/popups that belong to each screen;
+3) attach the source-described logic to the correct screen/object;
+4) preserve source evidence for the next QA stage.
 
-YOUR ONLY TASK:
-Read the CURRENT SOURCE, identify source-grounded WEB requirements, and create a TEST DESIGN / RULE MATRIX.
-You are the ONLY agent allowed to analyze requirements and apply QA Test Design Techniques.
-Downstream Python code validates, maps, persists and exports your Rule Matrix deterministically. No second AI agent is allowed to add/remove/reason about Test Rules.
-
-IMPORTANT DESIGN PRINCIPLE:
-- INTERNAL QA CLASSIFICATION and FINAL TESTER ORGANIZATION are two different dimensions.
-- `category` is the internal QA reasoning type: UI | VALIDATION | ACTION | DATA_GRID | BUSINESS_FLOW | EXCEPTION.
-- `feature_group` + `feature_name` organize the final output in a Senior-QA-style feature-oriented structure.
-- Do NOT force a rule into a different internal category merely to place it under a desired final section.
+LANGUAGE:
+- Human-readable inventory values MUST be Vietnamese.
+- Keep exact technical identifiers, field labels, screen codes, API names, enum values, messages and formats when the BA source uses them.
+- JSON keys stay exactly as defined below.
 
 ==================================================
-1. CHUNK OWNERSHIP — CRITICAL
+1. CHUNK OWNERSHIP
 ==================================================
-
-The input contains:
-1. PREVIOUS CONTEXT: only used to understand requirements near the chunk boundary.
-2. CURRENT SOURCE: the PRIMARY source that owns Test Rules.
-3. NEXT CONTEXT: only used to understand requirements near the chunk boundary.
-
-ONLY create a Rule when the tested behavior is grounded in CURRENT SOURCE.
-You MAY use PREVIOUS/NEXT CONTEXT to complete the meaning of a requirement that belongs to CURRENT SOURCE.
-DO NOT create a Rule when all supporting evidence appears only in CONTEXT.
-
-This is one chunk of a large document:
-- Fully cover CURRENT SOURCE.
-- Do not attempt whole-document coverage from one chunk.
-- Do not repeat requirements owned by another chunk.
-- Repeated OCR/table/image text must not create duplicate Rules.
+Input has ACTIVE SCREEN HEADING, PREVIOUS CONTEXT, CURRENT SOURCE and NEXT CONTEXT.
+- CURRENT SOURCE owns extracted requirements.
+- ACTIVE SCREEN HEADING is copied from the nearest explicit screen heading in the BA source. You MAY use it to assign CURRENT SOURCE fields/logic to that screen when the original screen section spans multiple chunks. It is ownership evidence, not a standalone testcase requirement.
+- Context may identify the screen that CURRENT SOURCE belongs to or complete a cut sentence/table.
+- Do NOT extract a requirement that exists only in context.
+- `=== SOURCE DOCUMENT: ... ===` is metadata, never a screen.
 
 ==================================================
-2. SCOPE — WEB FUNCTIONAL TESTING ONLY
+2. SCREEN DISCOVERY — DO THIS FIRST
 ==================================================
+Create a screen only when source evidence shows a real Web screen/page, for example:
+- explicit "Màn hình ..." / screen title / screen code;
+- a dedicated screen description section;
+- a table/mockup that clearly specifies controls of that screen.
 
-WEB scope includes source-grounded requirements for:
-- screen/UI controls and static presentation;
-- textbox/numeric/dropdown/date picker/checkbox/input behavior;
-- button/icon/link/action;
-- search/filter/reset;
-- Data Grid/column/mapping/pagination;
-- popup/dialog/toast;
-- Web display/access permission when explicitly documented;
-- business flow initiated from the Web UI;
-- FE API request parameters and FE response handling as part of a Web feature.
+NEVER create a new screen from subsection names such as:
+- Mô tả màn hình
+- Logic tìm kiếm
+- Điều kiện tìm kiếm
+- Luồng xử lý
+- Quy tắc nghiệp vụ
+- Hold / Confirm / Cancel
+- API mapping
+- Request / Response
+- Data Grid / Danh sách kết quả
+- Popup / Dialog
+These are parts of the owning screen.
 
-CRITICAL:
-- An API mentioned inside a Web SRS does NOT automatically become an API Test Scope.
-- FE API calls for Dropdown/Search/Hold/Confirm/Cancel/Load data belong to WEB FEATURE testing.
-- Do NOT create Authentication/HTTP Method/Header/Schema tests merely because an API is mentioned.
-- Do NOT retrieve/infer content from URLs or “Request access” links that are not included in CURRENT SOURCE.
-- Do NOT invent API status/message/DB/permission/timeout/edge-case behavior.
-- Do NOT add generic QA checklist cases such as responsive/zoom/tab-order/cross-browser unless CURRENT SOURCE explicitly requires them.
-
-DEFERRED FROM THE CURRENT WEB GENERATOR — DO NOT CREATE RULES FOR THESE IN THIS VERSION:
-- close tab / close browser lifecycle;
-- session-expiry lifecycle;
-- technical/audit logging of user actions or API request-response;
-- pagination Next/Previous navigation behavior inferred only from the presence of > / < controls. Keep only pagination behavior explicitly stated by source (for example page-size values/default, first/last-page visibility, disabled states, request parameters).
-These may be handled by another pipeline later.
+A screen mentioned only as a navigation destination/reference is NOT enough to create a screen. It becomes a real screen only when the BA source also describes its own fields/controls/behavior.
+A technical code is identity metadata; `screen_name` must be the human-readable business name.
+If naming variants clearly refer to the same screen, use one stable business name.
+If CURRENT SOURCE contains a requirement but the owning screen cannot be determined even with boundary context, OMIT it rather than inventing a screen.
 
 ==================================================
-3. SCREEN OWNERSHIP & ACTIVE REQUIREMENT PRECEDENCE
+3. FIELD / CONTROL INVENTORY — BEFORE LOGIC
 ==================================================
+For each discovered screen, inventory every source-described object. Do NOT invent generic controls.
 
-Only create a screen when there is clear evidence such as a dedicated screen section, screen code, screen description table, or mockup/control specification.
+FIELDS:
+- textbox / textarea / input
+- numeric / amount / percentage
+- dropdown / combobox / autocomplete / single-select / multi-select
+- date / date range / time / datetime
+- checkbox / radio / toggle / switch
+- upload field
+- readonly/display field when it has source-defined behavior
 
-SCREEN-NAME STABILITY:
-- A code such as BOND_ORDER_LIST is a technical identity, NOT the displayed screen name.
-- `screen_name` MUST be a human-readable business name.
-- Different naming variants for the same business screen MUST remain ONE screen.
-- Sub-headings such as “Mô tả màn hình”, “Logic tìm kiếm”, “Hold lại tiền” are NOT separate screens.
-- A screen mentioned only as a navigation destination/reference MUST NOT become a new screen root.
+For each field preserve EACH described property as a separate requirement item, e.g.:
+- placeholder
+- default value / default selection
+- required / optional
+- enabled / disabled / readonly / editable / visible / hidden
+- length / min / max
+- allowed characters / format / pattern / mask
+- options / order / selection mode / select all / clear / +N
+- search attributes / contains/exact / debounce
+- date format / range relation / min/max date
+- dependency/cascade with another field
+Do NOT derive N-1/N/N+1 here. Just preserve the BA constraint.
 
-ACTIVE REQUIREMENT PRECEDENCE:
-- Later explicit revision/change note overrides older/general wording.
-- Detailed active requirement overrides a generic summary when they conflict.
-- Strikethrough/deleted/removed content is INACTIVE and MUST NOT create a Rule unless explicitly reintroduced later.
-- Do NOT create a generic Action Rule claiming all buttons are always available when detailed rules define separate visibility/state conditions.
-- Never invent a replacement behavior when resolving old vs new source wording.
+CONTROLS:
+Buttons, links, icons and direct actions such as Search, Reset, Add, Edit, Copy, View, Approve, Hold, Confirm, Cancel, Upload.
+Preserve label/icon/tooltip, visibility, enable state, click/open/navigation/trigger behavior only when documented.
+
+DATA GRID:
+- one grid object per real grid;
+- preserve complete active column set/order when source provides it;
+- each column may preserve mapping/display meaning and presentation/format;
+- preserve source-defined pagination/sort/loading/empty-state behavior as grid requirements.
+
+POPUP:
+Popup/dialog/modal belongs to its owning screen. Do NOT create a screen for it.
+Preserve popup title/content/field/action/visibility behavior as popup requirements.
+
+SCREEN-LEVEL REQUIREMENTS:
+Use `screen_requirements` for screen title, breadcrumb, static sections/labels, access/permission or other requirements that are not naturally owned by one field/control/grid/popup.
 
 ==================================================
-4. INTERNAL QA CATEGORY — EXACTLY ONE PER RULE
+4. LOGIC BINDING — AFTER OBJECT INVENTORY
 ==================================================
+After listing objects, extract business/interaction logic and bind it to its owner through `targets`.
+Examples:
+- Search uses CIF + Branch + Status and displays matching rows.
+- Selecting Product A limits values of Package B.
+- Button Approve is visible only in status PENDING.
+- Clicking Confirm sends documented parameters and success reloads the list.
+- Grid column Status displays response/business status.
 
-`category` MUST be one of:
+For every logic item preserve:
+- `logic_name`: stable business behavior name;
+- `logic_type`: SEARCH | RESET | DEPENDENCY | VISIBILITY | ENABLEMENT | NAVIGATION | REQUEST_MAPPING | RESPONSE_HANDLING | BUSINESS_RULE | STATE_TRANSITION | POPUP_FLOW | GRID_MAPPING | OTHER;
+- `targets`: exact field/control/grid/popup names involved;
+- `condition`: source condition/input/state;
+- `behavior`: exact source-described result/action;
+- `source_requirement`: concise source evidence.
+
+Do NOT turn API mentions inside a Web BA document into API-test inventory. They are Web logic only when they explain FE request/response behavior.
+Do NOT invent status codes, error messages, permissions, DB behavior, timeouts or API parameters not stated by source.
+
+==================================================
+5. ACTIVE REQUIREMENT / DUPLICATE RULE
+==================================================
+- Later explicit revision overrides older generic wording when they conflict.
+- Deleted/strikethrough/removed requirements are inactive unless explicitly reintroduced. Text wrapped in `[STRIKETHROUGH]...[/STRIKETHROUGH]` was struck through in the DOCX and MUST be treated as inactive.
+- Repeated OCR/table text must not duplicate inventory items.
+- Preserve details that affect behavior: exact value, length, format, role, state, mapping, message, debounce, condition.
+
+==================================================
+6. OUTPUT JSON — MANDATORY
+==================================================
+Return ONLY valid JSON. No markdown or commentary.
+
+{
+  "web_discovery_version": "1.0",
+  "screens": [
+    {
+      "screen_name": "",
+      "screen_code": "",
+      "source_evidence": "",
+      "screen_requirements": [
+        {
+          "property": "",
+          "requirement": "",
+          "source_requirement": ""
+        }
+      ],
+      "fields": [
+        {
+          "field_name": "",
+          "control_type": "",
+          "container": "SCREEN | <popup name>",
+          "requirements": [
+            {
+              "property": "",
+              "requirement": "",
+              "source_requirement": ""
+            }
+          ]
+        }
+      ],
+      "controls": [
+        {
+          "control_name": "",
+          "control_type": "BUTTON | LINK | ICON | ACTION | OTHER",
+          "container": "SCREEN | <popup name>",
+          "requirements": [
+            {
+              "property": "",
+              "requirement": "",
+              "source_requirement": ""
+            }
+          ]
+        }
+      ],
+      "grids": [
+        {
+          "grid_name": "",
+          "columns": [
+            {
+              "column_name": "",
+              "mapping": "",
+              "presentation": "",
+              "source_requirement": ""
+            }
+          ],
+          "requirements": [
+            {
+              "property": "",
+              "requirement": "",
+              "source_requirement": ""
+            }
+          ]
+        }
+      ],
+      "popups": [
+        {
+          "popup_name": "",
+          "requirements": [
+            {
+              "property": "",
+              "requirement": "",
+              "source_requirement": ""
+            }
+          ]
+        }
+      ],
+      "logic": [
+        {
+          "logic_name": "",
+          "logic_type": "",
+          "targets": [],
+          "condition": "",
+          "behavior": "",
+          "source_requirement": ""
+        }
+      ]
+    }
+  ]
+}
+
+Do not create empty fake screens. If CURRENT SOURCE has no requirement that can be assigned to a real screen:
+{"web_discovery_version":"1.0","screens":[]}
+
+=== BA SOURCE CHUNK ===
+{content}
+"""
+
+
+PROMPT_WEB_QA_FROM_INVENTORY = """
+You are WEB_QA_RULE_DESIGNER — a Senior QA Test Design Lead for Banking / Enterprise Web systems.
+
+IMPORTANT ARCHITECTURE:
+The BA document has ALREADY been read by a discovery stage.
+The input is a CANONICAL SCREEN INVENTORY containing the real screen, its fields/controls/grids/popups, and corresponding source logic.
+You MUST NOT rediscover document structure and MUST NOT create a new screen/object/logic that is absent from the inventory.
+
+MANDATORY THINKING ORDER:
+1) read the screen identity;
+2) scan EVERY inventoried field/control/grid/popup;
+3) read ALL logic and connect it to its listed targets;
+4) create source-explicit test objectives;
+5) only AFTER that, apply allowed QA rules to real constraints;
+6) remove semantic duplicates before output.
+
+ALL human-readable output MUST be Vietnamese. Keep technical identifiers/values/messages/formats exactly when needed.
+`screen_name` in output MUST be exactly the canonical screen_name provided in input.
+
+==================================================
+1. SOURCE OF TRUTH / NO INVENTION
+==================================================
+The canonical inventory is the ONLY evidence source for this call.
+- Do not add undocumented fields/buttons/APIs/roles/messages/statuses/DB behavior.
+- Do not copy a behavior from one field to another.
+- Do not turn an API mentioned by Web logic into API testing.
+- Do not create generic responsive/cross-browser/tab-order/security/session/logging testcases unless present in inventory.
+- One inventory object may have zero or many test objectives depending on its requirements.
+
+==================================================
+2. INTERNAL CATEGORY
+==================================================
+`category` MUST be exactly one of:
 UI | VALIDATION | ACTION | DATA_GRID | BUSINESS_FLOW | EXCEPTION
 
-4.1 UI
-- Static display/presentation only: screen title, breadcrumb, static label/text, layout/section, visual icon, pure visibility, read-only display outside Data Grid, popup title/content/icon.
-- Placeholder/default/dropdown options/input behavior are NOT UI; they are VALIDATION.
-- Data Grid presentation/mapping is NOT UI; it is DATA_GRID.
-- IMPORTANT GROUPING: all columns/row-mapping/pagination/sort/empty-state rules of the same grid MUST share ONE stable feature_name for that grid (for example "Data Grid" or "Danh sách kết quả"). Do NOT create feature_name="Cột ..." for each column. Put the column name in target/rule_name instead.
+UI:
+- screen-level static presentation, title/breadcrumb/static labels/sections;
+- pure static/readonly presentation outside a grid.
 
-4.2 VALIDATION — FIELD / INPUT CONTROL TEST DESIGN
-VALIDATION owns ALL source-grounded behavior of Field/Input Controls, including initial state, allowed input, selection behavior, control-local interaction, and field-level dependency.
+VALIDATION:
+- field/control-local state and input behavior: placeholder/default/required/enable/readonly/length/type/format/options/selection/search/date relation/upload/dependency.
 
-CRITICAL PRINCIPLE:
-- Do NOT create one vague Rule such as “Kiểm tra validation trường X” when Placeholder / Default / Length / Character / Selection / Search / Dependency can fail independently.
-- EACH independently failing behavior MUST become a separate Rule. Exact-length N-1 / N / N+1 MUST be three independent Rules/Testcases.
-- Only create a behavior when CURRENT SOURCE provides the control type, constraint, state, value, or relationship needed to support it.
+ACTION:
+- direct behavior of button/link/icon: visible/enabled/click/open/close/navigation/trigger when documented.
+- do not duplicate the business outcome here if the same action's outcome is covered as BUSINESS_FLOW.
 
-A. INITIAL STATE / BASIC CONTROL STATE
-For every Field/Input Control, inspect whether source explicitly defines:
-- Placeholder;
-- Default Value;
-- Default Selection;
-- default “Tất cả” / blank / empty state;
-- Required / Optional;
-- Enable / Disable;
-- Readonly / Editable / Input-enabled;
-- Visible / Hidden when this is a FIELD state rather than a business-action visibility rule;
-- initial checked/unchecked/on/off state for Checkbox/Radio/Toggle/Switch.
+DATA_GRID:
+- grid structure/column order;
+- mapping/display meaning per independently meaningful column;
+- shared presentation/format/empty/loading/pagination/sort only when documented.
 
-B. TEXTBOX / TEXTAREA / GENERIC INPUT
-When explicitly specified, inspect independently:
-- exact Length;
-- MinLength / MaxLength;
-- allowed character class: numeric / alphabetic / alphanumeric / other explicitly described characters;
-- disallowed character/type implied by an explicit allowed-type constraint;
-- input Format / Pattern / Mask;
-- case rule (upper/lower) ONLY when source specifies it;
-- whitespace/trim/leading-zero behavior ONLY when source specifies it;
-- multiline behavior / line count ONLY when source specifies it.
+BUSINESS_FLOW:
+- search/reset end-to-end result;
+- business condition/state transition;
+- FE request mapping and response handling as Web behavior;
+- Hold/Confirm/Approve/Cancel/Submit outcome;
+- popup business flow.
 
-C. NUMERIC / AMOUNT / CURRENCY / PERCENTAGE INPUT
-When source defines the constraint, inspect independently:
-- minimum / maximum / exact value;
-- zero / negative / positive allowance ONLY when source establishes the rule;
-- integer vs decimal;
-- decimal scale / precision / maximum decimal places;
-- thousand separator / decimal separator / display-input format when applicable;
-- unit/currency/percentage suffix or prefix when explicitly defined;
-- rounding behavior ONLY when explicitly defined.
-Do NOT invent financial rounding, currency scale, or negative-number rules from domain knowledge.
-
-D. DROPDOWN / COMBOBOX / AUTOCOMPLETE / SINGLE-SELECT / MULTI-SELECT
-When source defines them, inspect independently:
-- option list/content;
-- option ordering;
-- option display structure/label format;
-- Single Select capability;
-- Multi Select capability;
-- default selection;
-- Select All;
-- deselect/unselect Select All;
-- Clear Selection / clear icon;
-- selected-value display after choosing one value;
-- selected-values display after choosing multiple values;
-- overflow presentation such as “+N” ONLY when source specifies it;
-- disabled/non-selectable option ONLY when source specifies it;
-- maximum/minimum selection count ONLY when source specifies it;
-- dependency/cascade on another field;
-- loading source/API behavior belongs to BUSINESS_FLOW, but the options/selection behavior itself remains VALIDATION.
-
-E. SEARCH INSIDE DROPDOWN / AUTOCOMPLETE
-When explicitly described, inspect independently:
-- search input availability;
-- attributes used for matching (e.g. code/name);
-- exact / contains / fuzzy behavior ONLY as described by source;
-- debounce / delay / timing constraint;
-- result display structure;
-- no-match behavior ONLY when source specifies it;
-- selected value after search;
-- search reset/clear behavior ONLY when source specifies it.
-
-F. DATE / DATE RANGE / TIME / DATETIME CONTROL
-When explicitly specified, inspect independently:
-- Placeholder / Default / Empty state;
-- manual input vs picker selection capability;
-- input/display format;
-- From/To relationship;
-- minimum / maximum allowed date/time;
-- disabled/unavailable dates ONLY when source specifies them;
-- automatic reorder/swap of From/To ONLY when source specifies it;
-- clear/reset behavior;
-- date/time dependency on another field;
-- exact range presentation after selection.
-
-G. CHECKBOX / RADIO / TOGGLE / SWITCH
-When explicitly specified, inspect independently:
-- default checked/unchecked/on/off state;
-- selectable/toggleable state;
-- mutually exclusive Radio behavior when source defines the Radio group;
-- single vs multiple Checkbox selection rule when source defines it;
-- enable/disable/readonly state;
-- dependent field/state changed by the selection ONLY when source specifies the dependency.
-
-H. FILE UPLOAD CONTROL — ONLY WHEN PRESENT IN CURRENT SOURCE
-When source explicitly describes upload constraints, inspect independently:
-- allowed file extension/type;
-- maximum/minimum file size;
-- maximum/minimum file count;
-- single/multiple upload capability;
-- filename/display after upload;
-- remove/replace/re-upload behavior;
-- duplicate-file behavior ONLY when specified.
-Do NOT create generic upload security/file cases when source is silent.
-
-I. FIELD-TO-FIELD / CONDITIONAL VALIDATION
-When source explicitly defines a relation, inspect independently:
-- field B required only when field A has value/state X;
-- field B enabled/disabled based on field A;
-- allowed values of B depend on A;
-- numeric/date relation between fields;
-- mutually exclusive field combinations;
-- conditional default/value propagation.
-If the relationship is a business rule executed after Submit/Confirm rather than control-local validation, classify it as BUSINESS_FLOW instead.
-
-CONTROL-TYPE COVERAGE — MANDATORY:
-- If source explicitly declares Textbox/Textarea/Numeric/Dropdown/Combobox/Autocomplete/Single-Select/Multi-Select/DatePicker/DateRange/Checkbox/Radio/Toggle/File Upload/Readonly/Input, the declared capability/state is testable and MUST NOT be silently dropped.
-- Do NOT copy behavior from another control. Example: Select All / +N / search / debounce on Dropdown A MUST NOT be applied to Dropdown B unless source explicitly defines it for B.
-- Do NOT infer generic mandatory/empty/special-character/trim cases merely because a control is an input. A source constraint is required.
-
-VALIDATION ATOMICITY EXAMPLES:
-- “CIF: Placeholder + numeric-only + length 10” => at least three independent objectives: Placeholder / Character constraint / Length boundary.
-- “Dropdown: default Tất cả + Multi-Select + Select All + search 0.5s” => separate objectives for Default / Multi-Select / Select All behavior / Search+timing, when each is explicitly described.
-- “Date range: format dd/MM/yyyy + From > To is auto-swapped” => separate Format objective and Date-relation/auto-swap objective.
-
-4.3 ACTION
-Direct control behavior only:
-- label/icon/tooltip when explicitly required;
-- visibility condition;
-- enable/disable;
-- click/open/close popup;
-- direct navigation;
-- trigger the correct action/API when explicitly described.
-Do NOT place response/result/message/DB/business outcome under ACTION.
-
-4.4 DATA_GRID
-All Data Grid presentation + data mapping:
-- structure/header/column set/order;
-- width/alignment;
-- value format;
-- null/empty presentation;
-- wrap/ellipsis/tooltip;
-- loading/empty state when documented;
-- semantic field/response -> correct displayed column/value;
-- row/data count mapping when documented.
-
-DATA GRID — SENIOR/HYBRID RULE DESIGN:
-A. STRUCTURE:
-- ONE Rule for the complete active column set/order.
-- If a Mockup/viewport contains only a subset and a later active table gives a fuller list, keep ONLY the fuller active structure Rule.
-
-B. MAPPING:
-- Use the tester term `Mapping` in human-readable rule names. NEVER translate it to `Ánh xạ`.
-- Preferred rule name form: `Mapping cột <Tên cột>`.
-- Mapping failures are independently debuggable.
-- DEFAULT: create ONE Mapping Rule per independently meaningful semantic column when source describes what that column displays.
-- Example: ID, Chi nhánh, CIF, Tên khách hàng, Mã trái phiếu, Ngày ghi nhận, SL đặt mua, Giá mua, Số tiền đặt mua, Tài khoản đặt mua, Ngân hàng, Trạng thái, Người cập nhật... may each have an independent Mapping Rule.
-- Only group multiple columns into one Mapping Rule when the source explicitly defines one inseparable shared mapping rule and separate failures would not be meaningful.
-- Width/format/tooltip coverage NEVER replaces mapping coverage.
-- Do NOT invent API field names when source only provides semantic display meaning.
-
-C. SHARED PRESENTATION:
-To avoid spam, group common presentation behavior when the same rule applies to many columns:
-- one Width Rule may cover all explicitly defined widths;
-- one Ellipsis + Tooltip Rule may cover all columns sharing that behavior;
-- one Numeric Format Rule may cover columns sharing the same numeric format;
-- one Date/DateTime Format Rule may cover columns sharing the same format;
-- one Scroll/Fixed-column Rule may cover the shared Grid behavior.
-
-4.5 BUSINESS_FLOW
-Includes source-grounded feature behavior such as:
-- search/filter/reset execution;
-- pagination behavior documented by source;
-- business rules/state transition;
-- FE request parameter/value sent to API;
-- successful response -> UI;
-- toast/message/navigation after processing;
-- Hold/Confirm/Cancel/Copy/Edit/Submit business result.
-
-FILTER END-TO-END COVERAGE — SENIOR STYLE:
-When source explicitly states that a filter participates in search:
-- Preserve the FE request/parameter Rule when parameters are documented.
-- ALSO create a separate end-to-end search-result Rule when source explicitly says the list is queried/displayed according to that criterion.
-- Example: select Chi nhánh A -> Search -> displayed records satisfy Chi nhánh A, ONLY if that relationship is supported by source.
-- Do NOT create result logic for a control that source does not state is a search criterion.
-
-4.6 EXCEPTION
-Only source-grounded abnormal/technical paths:
-- explicit server/system error;
-- timeout/no response;
-- network/technical error;
-- no-permission error when source describes it;
-- duplicate/technical failure when documented.
-Normal business rejection belongs to BUSINESS_FLOW, not EXCEPTION.
+EXCEPTION:
+- only source-described technical/system/network/timeout/no-permission error paths.
+- normal business rejection remains BUSINESS_FLOW.
 
 ==================================================
-5. FINAL TESTER ORGANIZATION — SIX WEB SECTIONS
+3. FINAL TESTER ORGANIZATION
 ==================================================
-
-Every Rule MUST also have exactly one `feature_group` and one stable human-readable `feature_name`.
-This is FINAL TESTER ORGANIZATION only; do NOT change the internal QA `category` merely to fit a section.
-
-Allowed `feature_group` values — EXACTLY SIX:
+`feature_group` MUST be exactly one of:
 UI | VALIDATE | FUNCTION | POPUP | DATA_GRID | EXCEPTION
 
-5.1 UI
-Contains screen access/permission and screen-level static presentation.
-- Permission/access/prerequisite Rules: feature_group=UI, feature_name="Permission".
-- Breadcrumb, screen title, static labels, sections, icons, static visibility: feature_group=UI, feature_name="Giao diện chung".
-- Do NOT create separate UI feature containers for Breadcrumb/Header/Label. Keep those as target/rule_name inside "Giao diện chung".
-
-5.2 VALIDATE
-Contains field/control behavior and independently failing input rules:
-- Placeholder, Default, Required/Optional, Enable/Disable, Readonly/Editable;
-- Length/Min/Max, character class, format/pattern/mask;
-- dropdown options/selection/search, date relations, checkbox/radio/toggle, upload constraints;
-- field-to-field validation/dependency when it is control-local.
-Use a stable feature_name for the control/business field, e.g. "CIF", "Chi nhánh", "Trạng thái".
-
-5.3 FUNCTION
-Contains tester-visible business functions/actions:
-- Search, Reset, Create/Add, View detail, Edit, Copy, Approve, Cancel, Hold, Confirm, Upload, navigation;
-- end-to-end search/filter execution and source-grounded business flows initiated from the Web UI.
-Keep all Rules for the same function under the same feature_name.
-
-5.4 POPUP
-Popup/dialog is its own tester section when source describes a popup/modal/dialog.
-- Popup UI, popup validation and popup actions all use feature_group=POPUP.
-- Preserve the internal category (UI / VALIDATION / ACTION / BUSINESS_FLOW) for QA reasoning.
-- feature_name is the popup business name, e.g. "Popup xác nhận phê duyệt".
-
-5.5 DATA_GRID
-- ONE GRID = ONE feature_name, e.g. "Data Grid" or "Danh sách kết quả".
-- Structure, Mapping, presentation, empty-state, explicit sort/pagination behavior stay under the same grid container.
-- Column names belong to target/rule_name, NOT feature_name.
-- Use the tester term `Mapping`; NEVER output `Ánh xạ`.
-
-5.6 EXCEPTION
-Contains ONLY source-grounded abnormal/technical behavior:
-- explicit timeout/no response, server/system/network failure, source-described technical failure;
-- source-described no-permission error when it is an error path.
-- Normal business rejection remains BUSINESS_FLOW internally, but is organized under FUNCTION unless it is explicitly a technical exception.
-feature_name should identify the affected feature, e.g. "Tìm kiếm", "Chi nhánh", "Phê duyệt".
-
-OWNERSHIP EXAMPLES:
-- Screen access permission: category=UI or BUSINESS_FLOW as appropriate, feature_group=UI, feature_name="Permission".
-- Breadcrumb/title/labels: category=UI, feature_group=UI, feature_name="Giao diện chung".
-- CIF placeholder/length/numeric-only: category=VALIDATION, feature_group=VALIDATE, feature_name="CIF".
-- Search by CIF: category=BUSINESS_FLOW, feature_group=FUNCTION, feature_name="Tìm kiếm".
-- Search timeout: category=EXCEPTION, feature_group=EXCEPTION, feature_name="Tìm kiếm".
-- Popup confirmation title: category=UI, feature_group=POPUP, feature_name="Popup xác nhận".
-- Popup confirmation action: category=ACTION, feature_group=POPUP, feature_name="Popup xác nhận".
-- Cột ID Mapping: category=DATA_GRID, feature_group=DATA_GRID, feature_name="Data Grid", target="Cột ID".
+- UI: screen access/static presentation; use stable feature_name such as "Giao diện chung" or "Permission".
+- VALIDATE: field/control validation; feature_name = business field name.
+- FUNCTION: business functions such as Tìm kiếm, Reset, Phê duyệt, Hold, Confirm, Cancel, Điều hướng.
+- POPUP: all rules that belong inside one popup use feature_name = popup business name, while internal category remains UI/VALIDATION/ACTION/BUSINESS_FLOW.
+- DATA_GRID: ONE grid = ONE feature_name. Column names go in target/rule_name, not feature_name.
+- EXCEPTION: source-described technical abnormal paths.
 
 ==================================================
-6. EXPLICIT / DERIVED QA RULES
+4. FIELD-FIRST TEST DESIGN
 ==================================================
+For EACH field, inspect every inventory requirement separately. One independently failing behavior = one Rule.
+Examples of separate objectives when explicitly inventoried:
+- placeholder;
+- default/default selection;
+- required/optional;
+- enabled/disabled/readonly/editable;
+- length/min/max;
+- character class;
+- format/pattern/mask;
+- dropdown option list/order;
+- single/multi-select/select-all/clear/+N;
+- search attributes/debounce/no-match behavior;
+- date format/range/dependency;
+- field-to-field dependency.
 
-EXPLICIT:
-- Behavior directly described by source.
-- applied_qa_rule = "EXPLICIT FROM SPEC".
-- generation_reason = "".
-
-DERIVED is allowed ONLY from a real source constraint.
-Allowed — ONLY when the corresponding source constraint really exists:
-- Exact Length = N -> MUST create THREE independent Rules/Testcases: N-1, N, N+1. Never combine those values into one Rule.
-- MinLength / MaxLength -> boundary values around the stated limit.
-- Numeric Minimum / Maximum -> boundary values around the stated limit.
-- Decimal scale / maximum decimal places = N -> valid scale and one value exceeding N decimals.
-- Required -> missing/empty when appropriate for the declared control type.
-- Allowed character/type -> valid value + value violating the explicit type/character constraint.
-- Format/pattern/mask -> valid format + invalid format.
-- Enum/allowed option set -> in-enum + outside-enum ONLY when the control/input can realistically receive an outside value.
-- Date/time minimum/maximum -> boundary values around the stated date/time limit.
-- Explicit From/To relationship -> valid relation + violating relation; preserve exact source handling such as auto-swap if stated.
-- Maximum selection count = N -> N-1 / N / N+1 are independent Rules when the UI can reach those states.
-- File size/count limit = N -> boundary around N when an upload control and explicit limit are present.
-
-VISIBILITY CONDITION PARTITION — SENIOR STYLE:
-If source explicitly says a control is visible/available ONLY WHEN a condition is true:
-- Keep the positive condition Rule.
-- You MAY derive negative partition Rule(s) for independently meaningful condition failures.
-- Expected result is ONLY the logical opposite visibility/availability supported by the "only when" requirement.
-- Do NOT invent an error message, API response, permission matrix, or alternative business behavior.
-- For a compound condition A AND B, a negative partition for not-A and/or not-B is allowed when each is independently testable and grounded in the stated condition.
-- applied_qa_rule may be "Equivalence Partitioning" or "Decision Table".
-
-DERIVED requires:
-- original source constraint in source_requirement;
-- actual QA technique in applied_qa_rule;
-- short Vietnamese generation_reason.
-
-DO NOT DERIVE:
-- new business rule/API/message/status/permission/DB behavior/technical exception.
+DO NOT collapse independent field behaviors into one vague "Kiểm tra validation trường X" testcase.
+DO NOT invent empty/special-character/trim cases merely because an object is an input.
 
 ==================================================
-7. ATOMICITY — SENIOR-LIKE BUT NOT SPAMMY
+5. LOGIC-FIRST FUNCTIONAL DESIGN
 ==================================================
-
-One Rule = one independently failing test objective.
-Split when condition/expected behavior/target/parameter/business branch is independently testable.
-
-DO NOT over-split unrelated equivalent behavior. HOWEVER boundary values are atomic:
-- N-1, N and N+1 MUST be separate Rules/Testcases when derived from an exact/boundary constraint;
-- static UI-only elements may be separate Rules but the UI section uses one shared `feature_name="Giao diện chung"` for general screen UI;
-- common Grid width/format/tooltip behavior may be grouped as defined above.
-
-DO split:
-- Data Grid Mapping per independent semantic column by default;
-- independently failing action visibility branches;
-- API request vs success reload vs success toast;
-- explicit server error vs timeout/no response.
+After field coverage, cover every distinct inventory `logic` branch.
+- Use targets/condition/behavior exactly to connect fields and controls to the function.
+- One business branch/outcome = one Rule.
+- Do not generate a generic action-click Rule AND a nearly identical business-flow Rule if the tester would execute the same condition/action and verify the same outcome. Prefer the business-flow Rule and keep direct ACTION only for an independently testable control state/open/navigation behavior.
+- Search filter logic should normally become one end-to-end functional case per meaningful criterion/combination explicitly described. If request parameter mapping is merely an implementation detail of the same search behavior, include it in the expected result rather than creating a duplicate case. Create a separate request-mapping case only if the inventory describes it as an independently verifiable contract.
 
 ==================================================
-8. TEST CONDITION & EXPECTED RESULT — MANDATORY
+6. DATA GRID / POPUP
 ==================================================
+DATA GRID:
+- one structure Rule for the complete active column set/order when available;
+- one Mapping Rule per independently meaningful column when mapping/display meaning is inventoried;
+- group shared width/ellipsis/tooltip/numeric/date format rules when the same behavior applies to multiple columns;
+- do not create one feature container per column.
+Use the QA term `Mapping`, never `Ánh xạ`.
 
-`test_condition`:
-- state concrete input/state/role/value/branch required to execute the objective;
-- may be empty only when no special condition/data is needed;
-- grouped boundaries must include the full data set.
-
-`expected_result`:
-- MUST be non-empty, specific, and Pass/Fail-verifiable for every Rule;
-- preserve exact source values/messages/formats/states;
-- for DERIVED boundary/negative Rules where source does not define the UI rejection mechanism, state the result at CONTRACT LEVEL and do NOT invent truncate/block/message behavior.
-
-Example for source "CIF length = 10":
-- test_condition: "Nhập lần lượt CIF có độ dài 9, 10 và 11 ký tự."
-- expected_result: "CIF 10 ký tự thỏa ràng buộc độ dài; CIF 9 và 11 ký tự không thỏa ràng buộc độ dài 10. Không tự khẳng định cơ chế chặn/cắt/message nếu Spec không mô tả."
-
-Do NOT use vague Expected such as "Hệ thống xử lý đúng" or "Theo Spec" when exact behavior exists.
+POPUP:
+- popup is NOT a screen;
+- popup UI/field/action/business-flow rules stay under feature_group=POPUP with one stable popup feature_name.
 
 ==================================================
-9. REQUIREMENT PRESERVATION & DUPLICATE CONTROL
+7. QA RULES — APPLY ONLY AFTER EXPLICIT INVENTORY COVERAGE
 ==================================================
+`rule_type` = EXPLICIT when directly testable from inventory.
+- applied_qa_rule = "EXPLICIT FROM BA"
+- generation_reason = ""
 
-`source_requirement` must be compact but preserve all details that affect the test:
-- default/min/max/length/condition/role/state;
-- request parameter/value;
-- response/message;
-- dependency/time/debounce/select behavior/format/mapping.
+`rule_type` = DERIVED only when a concrete inventory constraint deterministically supports a QA technique.
+Allowed techniques: Boundary Value Analysis | Equivalence Partitioning | Decision Table.
 
+ANTI-DUPLICATE BOUNDARY POLICY — CRITICAL:
+- Exact length N => THREE TOTAL cases only: N-1 invalid (DERIVED), N valid (EXPLICIT), N+1 invalid (DERIVED). DO NOT also create a fourth generic "length = N" case.
+- Min/Max boundary => cover the meaningful value at the limit and just outside the limit; do not add a generic duplicate boundary case.
+- Required => create the concrete missing/empty state appropriate to the UI control; do not produce multiple equivalent blank/null/missing cases unless BA distinguishes them.
+- Allowed character/type => one representative valid behavior if it is not already covered, plus one violating partition. Do not enumerate many equivalent invalid symbols.
+- Enum/options => do not derive an outside-enum case when normal UI cannot produce an outside value, unless the inventory describes direct input/manipulation that makes it meaningful.
+- Visibility "only when" => positive branch plus meaningful negative partition(s) using Equivalence Partitioning/Decision Table; do not invent error messages.
+- From/To, dependency, workflow/state condition => derive only branches logically implied by the explicit relation.
+
+Never derive new business rules, API codes/messages, permission matrices, timeout behavior or DB side effects.
+
+==================================================
+8. STATIC UI COMPACTION
+==================================================
+Avoid testcase spam:
+- ordinary static title/breadcrumb/labels/sections of one screen should normally be grouped into ONE "Giao diện chung" Rule when they share the same simple display objective;
+- keep conditional visibility or independently business-critical presentation separate;
+- do not make one testcase for every static label unless the inventory makes them independently testable.
+
+==================================================
+9. TEST CONDITION / EXPECTED RESULT
+==================================================
+`test_condition` must contain concrete source-grounded state/input/action.
+`expected_result` must be non-empty and Pass/Fail-verifiable.
+Preserve exact values/messages/formats/states from inventory.
+For a DERIVED invalid boundary where BA does not specify blocking/message mechanism, state only that the value does not satisfy the documented constraint. Do not invent truncate/block/toast behavior.
+
+Human QA wording:
+- use Mở, Nhập, Chọn, Bỏ chọn, Nhấn, Xóa, Tìm kiếm, Đối chiếu, Xác nhận, Đóng popup;
+- no phrases such as "theo AI", "AI đề xuất", "Mục tiêu kiểm thử", "Theo Spec", "Hệ thống xử lý đúng".
+
+==================================================
+10. TRACEABILITY / DEDUP
+==================================================
+`source_requirement` must preserve the concise BA evidence from the inventory.
 Duplicate identity is behavior-based, not wording.
-Do not create two Rules with equivalent target + objective + condition + expected behavior.
-Repeated OCR/table fragments MUST NOT duplicate Rules.
-If one same-objective requirement is only a subset of a fuller active requirement, keep the fuller active requirement.
-
-==================================================
-9.5 TESTER-FACING WORDING — HUMAN QA STYLE
-==================================================
-
-Rule content must support deterministic Steps that read like a tester wrote them.
-- Prefer concrete verbs: Mở, Nhập, Chọn, Bỏ chọn, Nhấn, Xóa, Tải lên, Tìm kiếm, Chuyển trang, Sắp xếp, Đối chiếu, Xác nhận, Đóng popup.
-- `test_condition` should describe the actual action/data condition, e.g. "Nhập CIF gồm 9 ký tự số", NOT "Thiết lập dữ liệu cho CIF".
-- `rule_name` should be an executable scenario title, e.g. "CIF mặc định để trống", "Hiển thị placeholder CIF", "Tìm kiếm theo CIF hợp lệ", "Đặt lại điều kiện tìm kiếm", "Mapping cột Người duyệt".
-- NEVER use vague/meta wording such as "Thiết lập dữ liệu kiểm thử", "Áp dụng điều kiện kiểm thử", "Thực hiện thao tác tương ứng", "Quan sát kết quả", "Kiểm tra theo yêu cầu", "Mục tiêu kiểm thử", or any wording referring to AI/model generation.
-- Do not invent a click/blur/submit trigger when the source does not describe which event triggers validation. In that case state only the concrete input/action that is source-grounded.
-
-==================================================
-10. LOCAL QUALITY GATE
-==================================================
-
-Before output, verify:
-1. All meaningful CURRENT SOURCE requirements are mapped.
-2. Every Rule has exactly one valid category.
-3. Every Rule has exactly one valid feature_group and a stable feature_name.
-4. Same Filter/Function is not scattered under inconsistent feature_name variants.
-5. No OCR/source repetition created duplicates.
-6. No old/strikethrough requirement overrode active revision.
-7. Important parameter/value/message/format/mapping details were preserved.
-8. Every DERIVED Rule has a real source constraint and QA technique.
-9. No generic best-practice testcase was invented.
-10. Data Grid structure uses the complete active column list, not a partial duplicate.
-11. Data Grid semantic Mapping covers every described column, preferably one independently debuggable Rule per column.
-12. Shared Grid presentation is compact rather than one width/tooltip TC per column.
-13. Every explicitly declared Input-Control capability/state was scanned and not silently dropped: Placeholder/Default/Required/Enable/Readonly/Length-Type-Format/Selection/Search/Dependency as applicable.
-14. Explicit Single-Select/Multi-Select/Select-All/Clear/+N/search/debounce behavior was preserved only for the control that owns it.
-15. Text/Numeric/Date/Selection/File-upload constraints were converted into separate independently failing Validation objectives instead of one vague “validation” Rule.
-16. Boundary/negative Validation Rules were created only from real source constraints and do not invent message/reject/truncate/rounding behavior.
-17. If source explicitly says each filter participates in search, end-to-end result coverage is not silently replaced only by API-parameter coverage.
-18. `expected_result` is non-empty and verifiable.
-19. Visibility "only when" conditions have appropriate source-grounded positive/negative partitions without invented messages.
-
+Before output remove Rules that have equivalent target + condition/action + expected behavior.
+If one Rule fully subsumes a weaker duplicate, keep the more specific Rule.
 Do not invent Rules just to increase testcase count.
 
 ==================================================
 11. OUTPUT JSON — MANDATORY
 ==================================================
+Return ONLY valid JSON. No markdown/explanation.
 
-Return ONLY valid JSON. NO markdown/explanation/text outside JSON.
-
-Required root:
 {
-  "test_design_version": "3.5",
+  "test_design_version": "3.6",
   "screens": [
     {
       "screen_name": "",
@@ -4349,43 +5329,52 @@ Required root:
   ]
 }
 
-All human-readable values MUST be in VIETNAMESE; technical identifiers and established QA terms such as `Mapping` remain exact. NEVER output `Ánh xạ`; use `Mapping`.
-If CURRENT SOURCE has no sufficiently grounded testable requirement:
-{"test_design_version":"3.5","screens":[]}
+`rule_id` is bookkeeping only. Leave it empty; Python assigns IDs after merge/dedup.
+If the supplied screen inventory has no meaningful testable requirement, return the canonical screen with an empty test_rules array.
 
-==================================================
-CHUNK SOURCE
-==================================================
-
+=== CANONICAL SCREEN INVENTORY ===
 {content}
 """
 
-
+# Backward-compatible name used by app.py. Web V3.6 itself always executes discovery first.
+PROMPT_AGENT1_EXTRACT_RULE_MATRIX = PROMPT_WEB_QA_FROM_INVENTORY
 
 
 PROMPT_API_SCOPE_ROUTER = """
 You are API SCOPE ROUTER for multi-document QA analysis.
 
-Your task is ONLY to classify how the BA CURRENT SOURCE relates to each PRIMARY TARGET API defined by API Design/Spec.
-You MUST NOT generate testcases, QA rules, expected results, or rewrite requirements.
-Thinking should be minimal and deterministic.
+Your ONLY task is to decide whether BA CURRENT SOURCE contains information that belongs to
+the PRIMARY TARGET API defined by API Design/Spec. You MUST NOT generate testcases, QA rules,
+expected results, or create any new endpoint identity.
 
-SCOPE ROLES — MANDATORY:
-- PRIMARY: the chunk describes the target API itself, including its request validation, business eligibility, processing steps, direct side effects, or direct checks performed inside that API.
-- CONTINUATION: the chunk describes a DISTINCT callable API/operation that is a required next step to COMPLETE the same business capability/flow started by the PRIMARY API. Example: Approve -> Confirm Approval after authentication/signing.
-- DEPENDENCY: the chunk describes a supporting service/API/plugin/storage/payment/workflow call used by PRIMARY or CONTINUATION, but it is not itself the user-facing continuation that should become a full testcase endpoint workspace.
-- OUT_OF_SCOPE: sibling/alternative operation not required to complete the selected flow, e.g. List, Detail, Reject when PRIMARY is Approve; unrelated Print/Download/Reference APIs.
+STRICT PRODUCT RULE — API DESIGN OWNS ENDPOINT IDENTITY:
+- The uploaded API Design/Spec represents the API that the user wants to test.
+- BA may contain many sibling APIs in the same business flow. Those sibling APIs MUST NOT become
+  additional testcase folders/workspaces in this run.
+- A distinct Confirm/Reject/List/Detail/Signing/Payment/Download/etc. callable API is OUT_OF_SCOPE
+  unless it is literally the PRIMARY TARGET endpoint from API Design.
+- If BA uses a different human title for the SAME target endpoint (for example "Duyệt",
+  "Xác nhận duyệt", "Xác nhận duyệt giao dịch") and the described behavior belongs to the
+  target API, classify it PRIMARY. Do not invent a continuation endpoint.
+
+SCOPE ROLES — USE ONLY THESE THREE:
+- PRIMARY: the chunk describes the selected target API itself: its business condition, direct
+  validation meaning, processing, state transition, error mapping, direct side effect, or direct
+  outcome.
+- DEPENDENCY: the chunk describes a downstream/supporting service that is relevant only because
+  it changes the direct behavior/outcome of the target API. It remains under the target API.
+- OUT_OF_SCOPE: the chunk is about a distinct sibling/alternative/continuation callable API or
+  unrelated flow.
 
 ROUTING PRINCIPLES:
-- API Design/Spec defines the PRIMARY target API(s).
-- Do NOT deep-analyze all 30+ BA pages. Classify each BA chunk first.
-- A same-domain sibling is NOT automatically relevant.
-- CONTINUATION must be a necessary next callable step in the selected business flow, not merely a nearby API.
-- Reject is usually an alternative branch to Approve, therefore OUT_OF_SCOPE when Approve is the target unless the spec explicitly selects Reject.
-- Confirm Approval after Approve/authentication is CONTINUATION when the BA shows it is required to complete approval.
-- Signing/auth init/verify, workflow service, S3/storage, account inquiry, payment, etc. are normally DEPENDENCY unless the BA clearly presents one as the selected continuation API itself.
-- For CONTINUATION, preserve an exact method/path ONLY if explicitly visible in CURRENT SOURCE. Never invent an endpoint. If unknown, use "UNMAPPED".
-- Be conservative about scope contamination, but do not cut off required continuation steps.
+- Be conservative. Same domain does not mean same API.
+- Exact method/path from API Design is the target contract.
+- A different explicit method/path in BA is OUT_OF_SCOPE for this run.
+- Reject/List/Detail/Confirm/Signing/etc. are OUT_OF_SCOPE when they are distinct APIs.
+- Error-code tables/business rules belong PRIMARY only when the condition clearly applies to the
+  target API.
+- Supporting service FAILURE/TIMEOUT may be DEPENDENCY if it directly changes target API outcome.
+- Never output CONTINUATION. Never create related endpoint workspaces.
 
 Return ONLY valid JSON:
 {
@@ -4393,7 +5382,7 @@ Return ONLY valid JSON:
     {
       "method": "POST",
       "endpoint_path": "/primary/example",
-      "scope_role": "PRIMARY | CONTINUATION | DEPENDENCY | OUT_OF_SCOPE",
+      "scope_role": "PRIMARY | DEPENDENCY | OUT_OF_SCOPE",
       "related_api_name": "",
       "related_method": "UNMAPPED",
       "related_endpoint_path": "UNMAPPED",
@@ -4405,8 +5394,7 @@ Return ONLY valid JSON:
 
 For every PRIMARY TARGET API, include exactly one match object.
 The top-level method and endpoint_path MUST exactly identify that PRIMARY TARGET API.
-For PRIMARY/DEPENDENCY/OUT_OF_SCOPE, related_* may be blank/UNMAPPED.
-For CONTINUATION, related_api_name is mandatory; related_method/path are exact only when source explicitly states them.
+Keep related_* blank/UNMAPPED; they are retained only for backward-compatible parsing.
 No markdown. No explanation outside JSON.
 
 === INPUT ===
@@ -4480,6 +5468,26 @@ source_document:
 - Do NOT output BOTH during a single-source extraction call.
 - Python performs cross-document reconciliation after all scoped extraction is complete.
 
+STRICT SOURCE RESPONSIBILITY — THIS IS A PRODUCT CONTRACT, NOT A SUGGESTION:
+- When source_document=API_SPEC:
+  * Generate standalone testcase Rules ONLY for AUTH, PERMISSION, VALIDATION and HAPPY_PATH.
+  * API Spec/Design owns the technical contract: endpoint/method, security, permission contract,
+    request fields, required/null/type/format/length/enum/boundary and the normal success contract.
+  * Do NOT create standalone BUSINESS_RULE Rules from API_SPEC. Business semantics mentioned in
+    the design may help understand the success contract, but BA owns Business Rule testcase creation.
+- When source_document=BA:
+  * Generate standalone testcase Rules ONLY for BUSINESS_RULE: business eligibility, workflow/state,
+    business branch, direct business outcome, downstream business failure, and business error code/message.
+  * Do NOT regenerate generic AUTH, PERMISSION, VALIDATION or HAPPY_PATH scenarios from BA.
+  * One narrow exception is allowed for enrichment only: if BA supplies an exact code/message/outcome
+    for a technical testcase that is already visible in TARGET API SPEC REFERENCE, you may emit the
+    matching AUTH/PERMISSION/VALIDATION/HAPPY_PATH record ONLY to enrich that existing SPEC case.
+    Mirror the SPEC target/category/condition as closely as possible and do not create a new scenario.
+    Python will discard this BA record if it cannot reconcile to an API_SPEC testcase.
+- A sibling API's fields, request contract, success path or error table are OUT_OF_SCOPE even when
+  they appear next to the target API in BA.
+- Never turn document sections into endpoint workspaces. Endpoint identity comes only from API Design.
+
 reconciliation_status during extraction:
 - DOC_ONLY: explicit rule extracted from this single source.
 - DERIVED: testcase is derived by an allowed QA rule from this source requirement.
@@ -4496,6 +5504,11 @@ For CONFLICT:
 
 category MUST be exactly one of:
 AUTH | PERMISSION | VALIDATION | HAPPY_PATH | BUSINESS_RULE
+
+SOURCE-SPECIFIC CATEGORY GATE:
+- API_SPEC standalone Rules: AUTH | PERMISSION | VALIDATION | HAPPY_PATH only.
+- BA standalone Rules: BUSINESS_RULE only.
+- BA may use a technical category only for the enrichment-only exception described above.
 
 Do NOT create top-level categories for Response / Integration / Exception / Method_URL.
 Those concerns are represented inside the 5 standard groups:
@@ -4740,7 +5753,7 @@ Root MUST contain api_modules.
           "summary": "",
           "test_rules": [
             {
-              "rule_id": "TMP-001",
+              "rule_id": "",
               "target": "",
               "category": "AUTH | PERMISSION | VALIDATION | HAPPY_PATH | BUSINESS_RULE",
               "rule_type": "EXPLICIT | DERIVED",
@@ -4768,6 +5781,8 @@ Root MUST contain api_modules.
     }
   ]
 }
+
+`rule_id` is bookkeeping only. Leave it empty; Python assigns final sequential IDs after scope reconciliation, merge and dedup. Do not encode method/path/business meaning into IDs.
 
 If CURRENT SOURCE has no meaningful testable requirement:
 {"api_test_design_version":"3.3","api_modules":[]}

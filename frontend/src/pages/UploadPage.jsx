@@ -163,8 +163,8 @@ export default function UploadPage() {
             <div className="api-target-note">
               <FileJson2 size={20} />
               <div>
-                <b>API Design là phạm vi mục tiêu</b>
-                <span>AI sẽ nhận diện endpoint từ API Design, sau đó chỉ chọn các phần liên quan trong tài liệu BA để phân tích sâu. Các API khác trong BA sẽ không tự sinh testcase.</span>
+                <b>API Design quyết định endpoint · BA bổ sung nghiệp vụ</b>
+                <span>API Spec sinh phần kỹ thuật (Auth nếu có, Permission, Validation, Happy Path). BA bổ sung Business Rule và mã lỗi/message; dữ liệu BA chỉ enrich case kỹ thuật đã có, không tự tạo case trùng hoặc endpoint mới.</span>
               </div>
             </div>
             <div className="api-upload-grid">

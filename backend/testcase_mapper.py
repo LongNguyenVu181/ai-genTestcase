@@ -314,15 +314,16 @@ def _steps(rule: dict, screen_name: str, *, api: bool = False) -> list[str]:
         # Popup is a container: keep the exact source-grounded trigger/interaction if present.
         elif group == "POPUP":
             popup_name = feature if feature and feature != "Popup" else (target or "popup")
-            if condition and condition != pre and _looks_like_action(condition):
+            # Do not invent a popup-opening trigger. Use the source-grounded condition when the
+            # Rule Matrix has one; otherwise only observe the popup at the described flow state.
+            if condition and condition != pre:
                 steps.append(_ensure_sentence(condition))
             else:
-                steps.append(f"Thực hiện thao tác mở {popup_name}.")
-            if category == "VALIDATION" and condition and condition != pre and not _looks_like_action(condition):
-                steps.append(_ensure_sentence(condition))
-            elif category in {"ACTION", "BUSINESS_FLOW"}:
+                steps.append(f"Quan sát {popup_name} khi popup xuất hiện theo luồng được mô tả.")
+            if category in {"ACTION", "BUSINESS_FLOW"}:
                 action = _function_action_name(rule)
-                if action and action.casefold() not in popup_name.casefold():
+                already_triggered = _condition_mentions_action(condition, action) if action else False
+                if action and not already_triggered and action.casefold() not in popup_name.casefold():
                     steps.append(f"Nhấn {action} trên {popup_name}.")
             else:
                 steps.append(f"Kiểm tra nội dung và trạng thái hiển thị của {popup_name}.")
@@ -539,12 +540,20 @@ def order_and_renumber_testcases(testcases: list[dict], scope: str | None = None
             pair[0],
         ))
     else:
+        # Keep every screen contiguous. Group-first global sorting caused folder/XMind output
+        # to repeat the same screen root (Screen A UI -> Screen B UI -> Screen A VALIDATE...).
+        # Preserve first-seen document/matrix screen order, then Senior-QA sections inside it.
+        screen_rank: dict[str, int] = {}
+        for original_index, item in decorated:
+            screen_key = core._normalize_text(item.get("screen", ""))
+            if screen_key not in screen_rank:
+                screen_rank[screen_key] = len(screen_rank)
         decorated.sort(key=lambda pair: (
+            screen_rank.get(core._normalize_text(pair[1].get("screen", "")), 999),
             web_group_order.get(_clean(pair[1].get("featureGroup")).upper(), 999),
             _web_feature_sort_rank(pair[1]),
             core._normalize_text(pair[1].get("featureName", "Khác")),
             WEB_REVIEW_CATEGORY_ORDER.get(_clean(pair[1].get("category")).upper(), 999),
-            core._normalize_text(pair[1].get("screen", "")),
             int(pair[1].get("sortOrder") or pair[0]),
             pair[0],
         ))

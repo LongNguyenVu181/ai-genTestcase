@@ -30,7 +30,7 @@ FRONTEND_DIST = APP_ROOT / "frontend" / "dist"
 DEFAULT_BASE_URL = "https://ws-2vuxxf5tta2cjplh.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1"
 DEFAULT_MODEL = "qwen-max"
 
-app = FastAPI(title="TestPilot AI API", version="1.11.1")
+app = FastAPI(title="TestPilot AI API", version="1.11.5")
 app.add_middleware(GZipMiddleware, minimum_size=1000)
 app.add_middleware(
     CORSMiddleware,
@@ -139,20 +139,84 @@ class MemoryUpload:
 
 
 def _extract_docx(data: bytes) -> str:
+    """Extract DOCX in document order and preserve heading/table structure.
+
+    The previous implementation emitted all paragraphs first and all tables afterward. In BA
+    documents that destroys ownership (screen heading -> field table -> logic table), which is
+    exactly the structure the Web discovery stage needs.
+    """
     try:
         from docx import Document
+        from docx.text.paragraph import Paragraph
+        from docx.table import Table
     except ImportError as exc:
         raise HTTPException(500, "Thiếu python-docx. Chạy pip install -r requirements.txt") from exc
+
     doc = Document(io.BytesIO(data))
     parts: list[str] = []
-    for p in doc.paragraphs:
-        if p.text.strip():
-            parts.append(p.text)
-    for table in doc.tables:
-        for row in table.rows:
-            cells = [c.text.strip() for c in row.cells]
-            if any(cells):
-                parts.append(" | ".join(cells))
+
+    def clean(text: str) -> str:
+        return str(text or "").replace("\r\n", "\n").replace("\r", "\n").strip()
+
+    def paragraph_text(paragraph: Paragraph) -> str:
+        # Preserve strikethrough because BA revisions often keep old requirements in the file.
+        # The discovery prompt treats [STRIKETHROUGH] content as inactive.
+        if not paragraph.runs:
+            return clean(paragraph.text)
+        pieces: list[str] = []
+        for run in paragraph.runs:
+            text = str(run.text or "")
+            if not text:
+                continue
+            if bool(run.font.strike) or bool(run.font.double_strike):
+                pieces.append(f"[STRIKETHROUGH]{text}[/STRIKETHROUGH]")
+            else:
+                pieces.append(text)
+        return clean("".join(pieces))
+
+    def cell_text(cell) -> str:
+        values = [paragraph_text(p) for p in cell.paragraphs]
+        return clean("\n".join(x for x in values if x))
+
+    def emit_table(table: Table) -> None:
+        for row_idx, row in enumerate(table.rows, start=1):
+            cells = [cell_text(c).replace("|", "\\|") for c in row.cells]
+            if not any(cells):
+                continue
+            while cells and cells[-1] == "":
+                cells.pop()
+            # Markdown-style row keeps each BA table row atomic for semantic chunking.
+            parts.append(f"| TROW {row_idx} | " + " | ".join(cells) + " |")
+
+    # python-docx >=1.1 exposes iter_inner_content and preserves Paragraph/Table order.
+    iterator = getattr(doc, "iter_inner_content", None)
+    if callable(iterator):
+        blocks = iterator()
+    else:
+        # Compatibility fallback using document body XML order.
+        from docx.oxml.text.paragraph import CT_P
+        from docx.oxml.table import CT_Tbl
+        blocks = []
+        for child in doc.element.body.iterchildren():
+            if isinstance(child, CT_P):
+                blocks.append(Paragraph(child, doc))
+            elif isinstance(child, CT_Tbl):
+                blocks.append(Table(child, doc))
+
+    for block in blocks:
+        if isinstance(block, Paragraph):
+            text = paragraph_text(block)
+            if not text:
+                continue
+            style_name = clean(getattr(getattr(block, "style", None), "name", ""))
+            m = re.match(r"(?i)^heading\s*(\d+)$", style_name)
+            if m:
+                level = max(1, min(6, int(m.group(1))))
+                parts.append("#" * level + " " + text)
+            else:
+                parts.append(text)
+        elif isinstance(block, Table):
+            emit_table(block)
     return "\n".join(parts)
 
 
@@ -182,12 +246,50 @@ def _extract_doc(data: bytes) -> str:
             pass
 
 
+def _extract_xlsx(data: bytes) -> str:
+    """Extract BA-style Excel with sheet/row boundaries and table semantics."""
+    try:
+        from openpyxl import load_workbook
+    except ImportError as exc:
+        raise HTTPException(500, "Thiếu openpyxl. Chạy pip install -r requirements.txt") from exc
+    try:
+        wb = load_workbook(io.BytesIO(data), read_only=True, data_only=False)
+    except Exception as exc:
+        raise HTTPException(400, "Không đọc được file XLSX.") from exc
+
+    heading_re = re.compile(
+        r"(?i)^(?:\d+(?:\.\d+)*[.)]?\s+)?(?:màn hình|screen|mô tả màn hình|logic|luồng|quy tắc nghiệp vụ|mockup|đặc tả)\b"
+    )
+    parts: list[str] = []
+    for ws in wb.worksheets:
+        parts.append(f"=== SHEET: {ws.title} ===")
+        for row_number, row in enumerate(ws.iter_rows(), start=1):
+            raw_values: list[str] = []
+            for cell in row:
+                value = cell.value
+                text = "" if value is None else str(value).replace("\r\n", "\n").replace("\r", "\n").strip()
+                raw_values.append(text)
+            if not any(raw_values):
+                continue
+            while raw_values and raw_values[-1] == "":
+                raw_values.pop()
+            non_empty = [x for x in raw_values if x]
+            if len(non_empty) == 1 and heading_re.match(non_empty[0]):
+                parts.append(f"# {non_empty[0]} [ROW {row_number}]")
+                continue
+            cells = [x.replace("|", "\\|") for x in raw_values]
+            parts.append(f"| ROW {row_number} | " + " | ".join(cells) + " |")
+    return "\n".join(parts)
+
+
 def extract_upload_text(filename: str, data: bytes) -> str:
     lower = filename.lower()
     if lower.endswith(".docx"):
         return _extract_docx(data)
     if lower.endswith(".doc"):
         return _extract_doc(data)
+    if lower.endswith(".xlsx"):
+        return _extract_xlsx(data)
     return core.extract_text_from_file(MemoryUpload(filename, data))
 
 
@@ -239,9 +341,10 @@ def _ensure_manual_run(project_id: str, folder_id: str, scope: str) -> str:
 def health():
     return {
         "ok": True,
-        "version": "1.11.1",
+        "version": "1.11.5",
         "web_pipeline": core.WEB_TEST_DESIGN_VERSION,
-        "ai_stages": 1,
+        "ai_stages": 2,
+        "web_architecture": "DISCOVERY->CANONICAL_INVENTORY->QA_RULES",
         "persistence": "sqlite",
         "analysis_mode": "async_job_polling",
         "database": str(db.DB_PATH),
@@ -381,9 +484,22 @@ async def _process_web_analysis_job(
         db.update_analysis_job(
             job_id,
             stage="analyzing",
-            message="AI đang phân tích yêu cầu và xây dựng Rule Matrix...",
+            message="Bước 1/2: AI đang xác định màn hình, field/control và logic BA...",
             progress=20,
         )
+
+        def _progress(current, total, message):
+            try:
+                ratio = float(current) / max(1.0, float(total)) if total else 0.0
+            except Exception:
+                ratio = 0.0
+            db.update_analysis_job(
+                job_id,
+                status="processing",
+                stage="analyzing",
+                message=message,
+                progress=max(20, min(80, 20 + int(60 * ratio))),
+            )
 
         def _call():
             return core.run_agent1_document_pipeline(
@@ -394,11 +510,23 @@ async def _process_web_analysis_job(
                 model=model,
                 prompt_template=core.PROMPT_AGENT1_EXTRACT_RULE_MATRIX,
                 cache=WEB_AGENT1_CACHE,
+                progress_callback=_progress,
             )
 
         ok, matrix, summary = await asyncio.to_thread(_call)
         if not ok or matrix is None:
-            raise HTTPException(422, detail={"message": "AI phân tích Web thất bại", "summary": summary})
+            stage = str((summary or {}).get("stage") or "unknown")
+            stage_messages = {
+                "web_discovery": "Không hoàn tất bước đọc BA và xác định màn hình/field/logic.",
+                "web_inventory": "Không lập được inventory màn hình hợp lệ từ tài liệu BA.",
+                "web_qa_rules": "Đã đọc được cấu trúc BA nhưng không hoàn tất bước áp dụng QA Rule cho một màn hình.",
+                "final_schema": "Rule Matrix Web cuối cùng không đạt schema sau khi chuẩn hóa.",
+            }
+            raise HTTPException(422, detail={
+                "message": stage_messages.get(stage, "AI phân tích Web thất bại."),
+                "stage": stage,
+                "summary": summary,
+            })
 
         db.update_analysis_job(
             job_id,

@@ -14,6 +14,10 @@ const RUNS_KEY = 'testpilot.local.runs.v1'
 const TESTCASES_KEY = 'testpilot.local.testcases.v1'
 const COUNTER_KEY = 'testpilot.local.record-counter.v1'
 const JOBS_UPDATED_EVENT = 'testpilot:workspace-updated'
+const MODEL_TRACE_KEY = 'testpilot.local.model-trace.v1'
+const MAX_TRACE_TEXT_LENGTH = 300_000
+
+export const MODEL_TRACE_EVENT = 'testpilot:model-trace'
 
 export const DEFAULT_CONFIG = {
   provider: 'Qwen',
@@ -37,8 +41,68 @@ const now = () => Date.now()
 const uid = () => globalThis.crypto?.randomUUID?.() || `${now()}-${Math.random().toString(36).slice(2)}`
 const publish = () => window.dispatchEvent(new CustomEvent(JOBS_UPDATED_EVENT))
 const normalizeBaseUrl = value => String(value || '').trim().replace(/\/+$/, '')
+let lastModelTrace = null
 
-const readStreamedModelContent = async response => {
+const clipTraceText = value => {
+  const text = String(value || '')
+  if (text.length <= MAX_TRACE_TEXT_LENGTH) return { text, truncated: false }
+  return {
+    text: `${text.slice(0, MAX_TRACE_TEXT_LENGTH)}\n\n… [Trace chỉ giữ ${MAX_TRACE_TEXT_LENGTH.toLocaleString('vi-VN')} ký tự đầu]`,
+    truncated: true,
+  }
+}
+
+const publishModelTrace = () => window.dispatchEvent(new CustomEvent(MODEL_TRACE_EVENT))
+
+const saveModelTrace = trace => {
+  lastModelTrace = trace
+  try {
+    write(MODEL_TRACE_KEY, trace)
+  } catch {
+    // Trace is diagnostic only; a full browser session must not stop analysis.
+  }
+  publishModelTrace()
+}
+
+const updateModelTrace = (id, patch) => {
+  const current = lastModelTrace || read(MODEL_TRACE_KEY, null)
+  if (!current || current.id !== id) return
+  saveModelTrace({ ...current, ...patch })
+}
+
+const beginModelTrace = ({ config, prompt, title }) => {
+  const input = clipTraceText(prompt)
+  const trace = {
+    id: uid(),
+    title: title || 'Gọi model',
+    status: 'streaming',
+    startedAt: now(),
+    finishedAt: null,
+    model: String(config?.model || ''),
+    baseUrl: normalizeBaseUrl(config?.baseUrl),
+    input: input.text,
+    inputTruncated: input.truncated,
+    output: '',
+    outputTruncated: false,
+    error: '',
+  }
+  saveModelTrace(trace)
+  return trace.id
+}
+
+export const getModelTrace = () => clone(lastModelTrace || read(MODEL_TRACE_KEY, null))
+
+export const clearModelTrace = () => {
+  lastModelTrace = null
+  try {
+    sessionStorage.removeItem(MODEL_TRACE_KEY)
+  } catch {
+    // Storage may be disabled by the browser.
+  }
+  publishModelTrace()
+}
+
+const readStreamedModelContent = async (response, onChunk) => {
   if (!response.body) throw new Error('AI không trả stream nội dung.')
   const reader = response.body.getReader()
   const decoder = new TextDecoder()
@@ -54,7 +118,10 @@ const readStreamedModelContent = async response => {
       const chunk = JSON.parse(data)
       const choice = chunk?.choices?.[0]
       if (chunk?.error?.message) throw new Error(chunk.error.message)
-      if (choice?.delta?.content) content += choice.delta.content
+      if (choice?.delta?.content) {
+        content += choice.delta.content
+        onChunk?.(choice.delta.content)
+      }
     } catch (error) {
       if (error instanceof SyntaxError) return
       throw error
@@ -96,33 +163,57 @@ export const maskKey = raw => {
   return `${prefix}••••••••••${clean.slice(-4)}`
 }
 
-const requestModel = async ({ config, prompt }) => {
-  let response
+const requestModel = async ({ config, prompt, title }) => {
+  const traceId = beginModelTrace({ config, prompt, title })
+  let lastTraceSaveAt = 0
+  let tracedOutput = ''
   try {
-    response = await fetch('/api/model', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        baseUrl: normalizeBaseUrl(config.baseUrl),
-        apiKey: config.apiKey.trim(),
-        model: config.model.trim(),
-        prompt,
-        stream: true,
-      }),
+    let response
+    try {
+      response = await fetch('/api/model', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          baseUrl: normalizeBaseUrl(config.baseUrl),
+          apiKey: config.apiKey.trim(),
+          model: config.model.trim(),
+          prompt,
+          stream: true,
+        }),
+      })
+    } catch (error) {
+      throw new Error(`Không gọi được AI proxy của Site: ${error.message}`)
+    }
+    if (!response.ok) {
+      const data = await response.json().catch(() => ({}))
+      throw new Error(data?.error?.message || data?.message || `AI trả HTTP ${response.status}`)
+    }
+    const content = await readStreamedModelContent(response, chunk => {
+      tracedOutput += chunk
+      if (now() - lastTraceSaveAt < 300) return
+      const output = clipTraceText(tracedOutput)
+      updateModelTrace(traceId, { output: output.text, outputTruncated: output.truncated })
+      lastTraceSaveAt = now()
     })
+    const output = clipTraceText(content)
+    updateModelTrace(traceId, {
+      status: 'completed', finishedAt: now(), output: output.text, outputTruncated: output.truncated,
+    })
+    return content
   } catch (error) {
-    throw new Error(`Không gọi được AI proxy của Site: ${error.message}`)
+    const output = clipTraceText(tracedOutput)
+    updateModelTrace(traceId, {
+      status: 'failed', finishedAt: now(), output: output.text, outputTruncated: output.truncated,
+      error: error.message || 'Gọi model thất bại.',
+    })
+    throw error
   }
-  if (!response.ok) {
-    const data = await response.json().catch(() => ({}))
-    throw new Error(data?.error?.message || data?.message || `AI trả HTTP ${response.status}`)
-  }
-  return readStreamedModelContent(response)
 }
 
 export const testAiConfig = async config => {
   const text = await requestModel({
     config,
+    title: 'Kiểm tra kết nối model',
     prompt: 'Trả lời JSON hợp lệ duy nhất: {"result":"OK"}.',
   })
   return { ok: true, model: config.model, base_url: config.baseUrl, result: text }
@@ -254,7 +345,11 @@ const beginAnalysis = ({ scope, files, config, projectId, folderId }) => {
       const texts = await Promise.all(files.map(async file => `=== SOURCE: ${file.name} ===\n${await extractFileText(file)}`))
       if (!texts.some(text => clean(text))) throw new Error('Không trích xuất được nội dung tài liệu.')
       updateJob(jobId, { stage: 'analyzing', progress: 35, message: 'AI đang phân tích yêu cầu và tạo Rule Matrix...' })
-      const raw = await requestModel({ config, prompt: buildPrompt({ scope, sources: texts.join('\n\n') }) })
+      const raw = await requestModel({
+        config,
+        title: scope === 'api' ? 'Phân tích tài liệu API' : 'Phân tích tài liệu Web',
+        prompt: buildPrompt({ scope, sources: texts.join('\n\n') }),
+      })
       const matrix = parseModelJson(raw)
       const rules = Array.isArray(matrix?.rules) ? matrix.rules : []
       if (!rules.length) throw new Error('AI không tạo được rule testcase hợp lệ.')

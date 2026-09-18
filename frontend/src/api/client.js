@@ -38,6 +38,42 @@ const uid = () => globalThis.crypto?.randomUUID?.() || `${now()}-${Math.random()
 const publish = () => window.dispatchEvent(new CustomEvent(JOBS_UPDATED_EVENT))
 const normalizeBaseUrl = value => String(value || '').trim().replace(/\/+$/, '')
 
+const readStreamedModelContent = async response => {
+  if (!response.body) throw new Error('AI không trả stream nội dung.')
+  const reader = response.body.getReader()
+  const decoder = new TextDecoder()
+  let buffer = ''
+  let content = ''
+
+  const consumeLine = line => {
+    const value = line.trim()
+    if (!value.startsWith('data:')) return
+    const data = value.slice(5).trim()
+    if (!data || data === '[DONE]') return
+    try {
+      const chunk = JSON.parse(data)
+      const choice = chunk?.choices?.[0]
+      if (chunk?.error?.message) throw new Error(chunk.error.message)
+      if (choice?.delta?.content) content += choice.delta.content
+    } catch (error) {
+      if (error instanceof SyntaxError) return
+      throw error
+    }
+  }
+
+  while (true) {
+    const { value, done } = await reader.read()
+    buffer += decoder.decode(value || new Uint8Array(), { stream: !done })
+    const lines = buffer.split(/\r?\n/)
+    buffer = lines.pop() || ''
+    lines.forEach(consumeLine)
+    if (done) break
+  }
+  if (buffer) consumeLine(buffer)
+  if (!content.trim()) throw new Error('AI không trả nội dung phân tích.')
+  return content
+}
+
 export const loadAiConfig = () => {
   try {
     return { ...DEFAULT_CONFIG, ...read(CONFIG_KEY, {}), apiKey: sessionStorage.getItem(SECRET_KEY) || '' }
@@ -71,16 +107,17 @@ const requestModel = async ({ config, prompt }) => {
         apiKey: config.apiKey.trim(),
         model: config.model.trim(),
         prompt,
+        stream: true,
       }),
     })
   } catch (error) {
     throw new Error(`Không gọi được AI proxy của Site: ${error.message}`)
   }
-  const data = await response.json().catch(() => ({}))
-  if (!response.ok) throw new Error(data?.error?.message || data?.message || `AI trả HTTP ${response.status}`)
-  const text = data?.choices?.[0]?.message?.content
-  if (!text) throw new Error('AI không trả nội dung phân tích.')
-  return text
+  if (!response.ok) {
+    const data = await response.json().catch(() => ({}))
+    throw new Error(data?.error?.message || data?.message || `AI trả HTTP ${response.status}`)
+  }
+  return readStreamedModelContent(response)
 }
 
 export const testAiConfig = async config => {

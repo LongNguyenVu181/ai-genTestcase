@@ -21,6 +21,7 @@ export default {
       const apiKey = String(payload.apiKey || '').trim()
       const model = String(payload.model || '').trim()
       const prompt = String(payload.prompt || '')
+      const stream = payload.stream === true
       if (!apiKey || !model || !prompt) {
         return new Response(JSON.stringify({ message: 'Thiếu API key, model hoặc nội dung yêu cầu.' }), { status: 400, headers: { 'Content-Type': 'application/json' } })
       }
@@ -31,6 +32,7 @@ export default {
           model,
           messages: [{ role: 'user', content: prompt }],
           temperature: 0.1,
+          stream,
         }),
       })
       return new Response(upstream.body, {

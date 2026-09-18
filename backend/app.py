@@ -357,9 +357,9 @@ def health():
         "web_pipeline": core.WEB_TEST_DESIGN_VERSION,
         "ai_stages": 2,
         "web_architecture": "DISCOVERY->CANONICAL_INVENTORY->QA_RULES",
-        "persistence": "session-scoped in-memory sqlite",
+        "persistence": "session-scoped process-memory store (no SQL)",
         "analysis_mode": "async_job_polling",
-        "database": str(db.DB_PATH),
+        "storage": str(db.DB_PATH),
         "models": ["qwen-max", "qwen3.8-max", "qwen-plus"],
     }
 

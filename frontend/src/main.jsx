@@ -24,6 +24,11 @@ const clearTransientSession = () => {
 
 clearTransientSession()
 
+// A reload starts a clean workspace.  Notify the backend while the current
+// document is still alive as well, so the old session workspace is released
+// instead of waiting for the next app bootstrap to do it.
+window.addEventListener('pagehide', clearTransientSession, { once: true })
+
 ReactDOM.createRoot(document.getElementById('root')).render(
   <React.StrictMode>
     <BrowserRouter>

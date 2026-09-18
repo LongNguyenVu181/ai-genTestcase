@@ -26,7 +26,7 @@ TestPilot AI
 
 ## Current behavior
 
-- Web and API testcase generation with session-scoped in-memory SQLite data.
+- Web and API testcase generation with a session-scoped process-memory store (no SQL database).
 - API Spec determines the target API. BA/Service documents are scanned to retain only PRIMARY, CONTINUATION, and relevant DEPENDENCY sections.
 - API testcase taxonomy: Auth, Permission, Validation, Happy Path, Business Rule.
 - Project metadata, analysis jobs, runs, and testcases exist only for the active browser session.

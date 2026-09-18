@@ -94,7 +94,8 @@ export default function UploadPage() {
     const existingJob = sessionStorage.getItem(jobStorageKey)
     if (existingJob) pollJob(existingJob)
     return () => { pollTokenRef.current += 1 }
-    // Resume exactly the job for this project/scope after refresh.
+    // A job can be resumed while navigating within the same page session. Session
+    // data is cleared at application startup, so refresh never resumes it.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [jobStorageKey])
 

@@ -65,7 +65,7 @@ export default function ApiKeysPage() {
       </section>
 
       <section className="card api-table-card config-form-card">
-        <div className="section-title compact"><ShieldCheck size={25} /><div><h2>Cấu hình kết nối Qwen</h2><p>API key không ghi vào source code. Trong bản local này key chỉ giữ trong session của tab trình duyệt.</p></div></div>
+        <div className="section-title compact"><ShieldCheck size={25} /><div><h2>Cấu hình kết nối Qwen</h2><p>API key không ghi vào source code hoặc database. Key chỉ dùng trong phiên hiện tại và bị xóa khi refresh trang.</p></div></div>
         <div className="config-grid">
           <label><span className="field-label">Nhà cung cấp</span><input className="input" value="Qwen / DashScope" disabled /></label>
           <label><span className="field-label">Model</span><input className="input" value={selected.label} disabled /></label>

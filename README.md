@@ -26,11 +26,11 @@ TestPilot AI
 
 ## Current behavior
 
-- Web and API testcase generation with SQLite persistence.
+- Web and API testcase generation with session-scoped in-memory SQLite data.
 - API Spec determines the target API. BA/Service documents are scanned to retain only PRIMARY, CONTINUATION, and relevant DEPENDENCY sections.
 - API testcase taxonomy: Auth, Permission, Validation, Happy Path, Business Rule.
-- Project metadata is stored by the backend; the local browser cache is only a client-side cache.
-- Default database location: `%USERPROFILE%\.testpilot-ai\testpilot.db`.
+- Project metadata, analysis jobs, runs, and testcases exist only for the active browser session.
+  Refreshing the page clears the browser session and its matching in-memory backend data.
 - AI API keys are not persisted in the database.
 
 ## First setup
@@ -51,6 +51,13 @@ py -m uvicorn app:app --host 127.0.0.1 --port 8000
 
 Open `http://127.0.0.1:8000`.
 
+## Deploy on Render
+
+The repository includes a Docker definition and `render.yaml` for a single Render
+web service. Create a Blueprint from this GitHub repository and deploy the
+`ai-gentestcase` service. It builds React and FastAPI together and does not require
+a persistent disk because all app data is session-scoped.
+
 ## Development
 
 ```powershell
@@ -64,4 +71,3 @@ Frontend dev server: `http://localhost:5173`
 
 - `TESTPILOT_WEB_PARALLEL_WORKERS` — Web chunk worker count.
 - `TESTPILOT_API_SCOPE_WORKERS` — API BA scope-scan worker count.
-- `TESTPILOT_DB_PATH` — optional explicit SQLite path.

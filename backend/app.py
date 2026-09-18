@@ -47,6 +47,18 @@ app.add_middleware(
 
 
 @app.middleware("http")
+async def use_transient_browser_session(request, call_next):
+    # API calls include the browser-generated ID in a header. Download links cannot
+    # carry custom headers, so they pass the same ID as a query parameter.
+    session_id = request.headers.get("X-TestPilot-Session") or request.query_params.get("session_id")
+    token = db.activate_session(session_id)
+    try:
+        return await call_next(request)
+    finally:
+        db.reset_session(token)
+
+
+@app.middleware("http")
 async def add_frontend_cache_headers(request, call_next):
     response = await call_next(request)
     path = request.url.path
@@ -345,11 +357,17 @@ def health():
         "web_pipeline": core.WEB_TEST_DESIGN_VERSION,
         "ai_stages": 2,
         "web_architecture": "DISCOVERY->CANONICAL_INVENTORY->QA_RULES",
-        "persistence": "sqlite",
+        "persistence": "session-scoped in-memory sqlite",
         "analysis_mode": "async_job_polling",
         "database": str(db.DB_PATH),
         "models": ["qwen-max", "qwen3.8-max", "qwen-plus"],
     }
+
+
+@app.post("/api/session/end")
+def end_browser_session(session_id: str = ""):
+    db.discard_session(session_id)
+    return {"ok": True}
 
 
 @app.get("/api/projects")

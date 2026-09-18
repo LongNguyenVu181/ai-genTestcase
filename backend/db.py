@@ -2,35 +2,75 @@
 from __future__ import annotations
 
 import json
-import os
+import hashlib
 import sqlite3
 import time
-import shutil
-from pathlib import Path
+from contextvars import Token, ContextVar
+from threading import RLock
 from typing import Any
 
-BACKEND_DIR = Path(__file__).resolve().parent
-# V1.9.2: keep data OUTSIDE versioned source folders so rebuilding/upgrading the app
-# does not make projects/testcases appear to disappear. Override with TESTPILOT_DB_PATH if needed.
-DEFAULT_DATA_DIR = Path(os.getenv("TESTPILOT_DATA_DIR", str(Path.home() / ".testpilot-ai")))
-DEFAULT_DB_PATH = DEFAULT_DATA_DIR / "testpilot.db"
-DB_PATH = Path(os.getenv("TESTPILOT_DB_PATH", str(DEFAULT_DB_PATH))).expanduser()
-DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-LEGACY_DB_PATH = BACKEND_DIR / "data" / "testpilot.db"
-if not DB_PATH.exists() and LEGACY_DB_PATH.exists() and LEGACY_DB_PATH.resolve() != DB_PATH.resolve():
-    try:
-        shutil.copy2(LEGACY_DB_PATH, DB_PATH)
-    except Exception:
-        pass
+# Data is scoped to one browser session and lives only in process memory. An
+# anchor connection keeps a shared in-memory SQLite database alive while that
+# session is open; it is explicitly discarded when the browser refreshes.
+DB_PATH = "session-scoped in-memory SQLite"
+_DEFAULT_SESSION_ID = "anonymous"
+_active_session_id: ContextVar[str] = ContextVar("testpilot_session_id", default=_DEFAULT_SESSION_ID)
+_database_anchors: dict[str, sqlite3.Connection] = {}
+_database_generations: dict[str, int] = {}
+_database_lock = RLock()
+
+
+def _normalize_session_id(value: str | None) -> str:
+    session_id = str(value or "").strip()
+    return session_id[:128] if session_id else _DEFAULT_SESSION_ID
+
+
+def _database_uri(session_id: str) -> str:
+    digest = hashlib.sha256(session_id.encode("utf-8")).hexdigest()
+    generation = _database_generations.get(session_id, 0)
+    return f"file:testpilot-session-{digest}-{generation}?mode=memory&cache=shared"
+
+
+def activate_session(session_id: str | None) -> Token:
+    """Use a browser session's transient database for the current request."""
+    token = _active_session_id.set(_normalize_session_id(session_id))
+    init_db()
+    return token
+
+
+def reset_session(token: Token) -> None:
+    _active_session_id.reset(token)
+
+
+def discard_session(session_id: str | None) -> None:
+    """Permanently remove all in-memory data belonging to a browser session."""
+    normalized = _normalize_session_id(session_id)
+    if normalized == _DEFAULT_SESSION_ID:
+        return
+    with _database_lock:
+        anchor = _database_anchors.pop(normalized, None)
+        # sqlite3 connection objects can outlive their context manager. Bumping the
+        # URI generation guarantees a discarded session can never reconnect to an
+        # older shared in-memory database that is waiting for garbage collection.
+        _database_generations[normalized] = _database_generations.get(normalized, 0) + 1
+    if anchor:
+        anchor.close()
 
 
 def _connect() -> sqlite3.Connection:
-    # Background analysis writes progress while the UI polls/reads SQLite. A longer
-    # busy timeout prevents transient "database is locked" failures on Windows.
-    conn = sqlite3.connect(DB_PATH, timeout=30.0)
+    session_id = _active_session_id.get()
+    uri = _database_uri(session_id)
+    # A shared-memory database disappears as soon as its final connection closes.
+    # Keep one anchor for the session so normal request connections can be short-lived.
+    with _database_lock:
+        if session_id not in _database_anchors:
+            anchor = sqlite3.connect(uri, uri=True, timeout=30.0, check_same_thread=False)
+            anchor.execute("PRAGMA foreign_keys = ON")
+            _database_anchors[session_id] = anchor
+    conn = sqlite3.connect(uri, uri=True, timeout=30.0)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
-    conn.execute("PRAGMA journal_mode = WAL")
+    conn.execute("PRAGMA journal_mode = MEMORY")
     conn.execute("PRAGMA busy_timeout = 30000")
     return conn
 

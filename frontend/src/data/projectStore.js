@@ -1,7 +1,6 @@
-import { listProjectMetadata, saveProjectMetadata, syncProjectMetadata } from '../api/client'
+import { listProjectMetadata, saveProjectMetadata } from '../api/client'
 
 const STORAGE_KEY = 'testpilot.projects.v1'
-const MIGRATION_KEY = 'testpilot.projects.backend-migrated.v1'
 export const PROJECTS_UPDATED_EVENT = 'testpilot:projects-updated'
 
 const tones = ['blue', 'green', 'orange', 'purple']
@@ -24,7 +23,7 @@ let memoryProjects = null
 
 const safeRead = () => {
   try {
-    const raw = localStorage.getItem(STORAGE_KEY)
+    const raw = sessionStorage.getItem(STORAGE_KEY)
     if (!raw) return null
     const parsed = JSON.parse(raw)
     return Array.isArray(parsed) ? parsed : null
@@ -58,7 +57,7 @@ const emitUpdated = () => window.dispatchEvent(new CustomEvent(PROJECTS_UPDATED_
 const writeProjects = (projects, { emit = true } = {}) => {
   const normalized = projects.map(normalizeProject)
   memoryProjects = normalized
-  localStorage.setItem(STORAGE_KEY, JSON.stringify(normalized))
+  sessionStorage.setItem(STORAGE_KEY, JSON.stringify(normalized))
   if (emit) emitUpdated()
   return normalized
 }
@@ -94,16 +93,6 @@ export const startProjectSync = ({ force = false } = {}) => {
         if (!current || Number(project.updatedAt || 0) >= Number(current.updatedAt || 0)) merged.set(project.id, project)
       }
       const projects = writeProjects([...merged.values()].sort((a, b) => Number(b.updatedAt) - Number(a.updatedAt)))
-
-      // Migration only: older builds stored projects only in localStorage. Push only local-only
-      // projects once, instead of POSTing the whole project list on every page load/reload.
-      const migrated = localStorage.getItem(MIGRATION_KEY) === '1'
-      if (!migrated && local.length) {
-        const remoteIds = new Set(remote.map(project => project.id))
-        const localOnly = local.filter(project => !remoteIds.has(project.id))
-        if (localOnly.length) await syncProjectMetadata(localOnly).catch(() => null)
-        localStorage.setItem(MIGRATION_KEY, '1')
-      }
 
       lastSyncAt = Date.now()
       return projects
@@ -189,4 +178,3 @@ export const addProjectFolder = (projectId, scope, folderName) => {
   persistProject(project)
   return folder
 }
-

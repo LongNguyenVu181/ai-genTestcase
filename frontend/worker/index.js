@@ -24,7 +24,6 @@ export default {
       if (!apiKey || !model || !prompt) {
         return new Response(JSON.stringify({ message: 'Thiếu API key, model hoặc nội dung yêu cầu.' }), { status: 400, headers: { 'Content-Type': 'application/json' } })
       }
-      const maxTokens = Math.min(16384, Math.max(64, Number(payload.maxTokens) || 8192))
       const upstream = await fetch(`${providerUrl.toString().replace(/\/+$/, '')}/chat/completions`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${apiKey}` },
@@ -32,7 +31,6 @@ export default {
           model,
           messages: [{ role: 'user', content: prompt }],
           temperature: 0.1,
-          max_tokens: maxTokens,
         }),
       })
       return new Response(upstream.body, {

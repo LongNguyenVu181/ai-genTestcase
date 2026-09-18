@@ -60,7 +60,7 @@ export const maskKey = raw => {
   return `${prefix}••••••••••${clean.slice(-4)}`
 }
 
-const requestModel = async ({ config, prompt, maxTokens = 8192 }) => {
+const requestModel = async ({ config, prompt }) => {
   let response
   try {
     response = await fetch('/api/model', {
@@ -71,7 +71,6 @@ const requestModel = async ({ config, prompt, maxTokens = 8192 }) => {
         apiKey: config.apiKey.trim(),
         model: config.model.trim(),
         prompt,
-        maxTokens,
       }),
     })
   } catch (error) {
@@ -88,7 +87,6 @@ export const testAiConfig = async config => {
   const text = await requestModel({
     config,
     prompt: 'Trả lời JSON hợp lệ duy nhất: {"result":"OK"}.',
-    maxTokens: 64,
   })
   return { ok: true, model: config.model, base_url: config.baseUrl, result: text }
 }
@@ -219,7 +217,7 @@ const beginAnalysis = ({ scope, files, config, projectId, folderId }) => {
       const texts = await Promise.all(files.map(async file => `=== SOURCE: ${file.name} ===\n${await extractFileText(file)}`))
       if (!texts.some(text => clean(text))) throw new Error('Không trích xuất được nội dung tài liệu.')
       updateJob(jobId, { stage: 'analyzing', progress: 35, message: 'AI đang phân tích yêu cầu và tạo Rule Matrix...' })
-      const raw = await requestModel({ config, prompt: buildPrompt({ scope, sources: texts.join('\n\n') }), maxTokens: 16384 })
+      const raw = await requestModel({ config, prompt: buildPrompt({ scope, sources: texts.join('\n\n') }) })
       const matrix = parseModelJson(raw)
       const rules = Array.isArray(matrix?.rules) ? matrix.rules : []
       if (!rules.length) throw new Error('AI không tạo được rule testcase hợp lệ.')

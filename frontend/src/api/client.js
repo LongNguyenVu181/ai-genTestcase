@@ -61,22 +61,21 @@ export const maskKey = raw => {
 }
 
 const requestModel = async ({ config, prompt, maxTokens = 8192 }) => {
-  const endpoint = `${normalizeBaseUrl(config.baseUrl)}/chat/completions`
   let response
   try {
-    response = await fetch(endpoint, {
+    response = await fetch('/api/model', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${config.apiKey.trim()}` },
+      headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
+        baseUrl: normalizeBaseUrl(config.baseUrl),
+        apiKey: config.apiKey.trim(),
         model: config.model.trim(),
-        messages: [{ role: 'user', content: prompt }],
-        temperature: 0.1,
-        max_tokens: maxTokens,
-        response_format: { type: 'json_object' },
+        prompt,
+        maxTokens,
       }),
     })
   } catch (error) {
-    throw new Error(`Không gọi được AI từ trình duyệt. Provider phải cho phép CORS: ${error.message}`)
+    throw new Error(`Không gọi được AI proxy của Site: ${error.message}`)
   }
   const data = await response.json().catch(() => ({}))
   if (!response.ok) throw new Error(data?.error?.message || data?.message || `AI trả HTTP ${response.status}`)

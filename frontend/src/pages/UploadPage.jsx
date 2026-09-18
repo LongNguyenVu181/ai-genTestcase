@@ -111,7 +111,7 @@ export default function UploadPage() {
     if (!hasFiles || !ensureConfig()) return
     setError('')
     setPhase('analyzing')
-    setJobStatus({ status: 'queued', stage: 'uploading', progress: 0, message: 'Đang tải tài liệu lên server...' })
+    setJobStatus({ status: 'queued', stage: 'uploading', progress: 0, message: 'Đang chuẩn bị tài liệu trong trình duyệt...' })
     try {
       const result = scope === 'api'
         ? await analyzeApi({ designFile, baFile, config, projectId, folderId })
@@ -218,7 +218,7 @@ export default function UploadPage() {
           <span className="spinner"></span>
           <div className="analysis-toast-content">
             <b>{jobStatus?.message || 'Đang phân tích tài liệu...'}</b>
-            <small>{Math.max(0, Number(jobStatus?.progress || 0))}% · AI chạy nền, bạn có thể giữ hoặc tải lại trang.</small>
+            <small>{Math.max(0, Number(jobStatus?.progress || 0))}% · Không tải lại trang khi AI đang phân tích.</small>
             <div className="analysis-progress"><span style={{ width: `${Math.max(3, Number(jobStatus?.progress || 0))}%` }} /></div>
           </div>
         </div>

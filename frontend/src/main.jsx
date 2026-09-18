@@ -4,16 +4,10 @@ import { BrowserRouter } from 'react-router-dom'
 import App from './App'
 import './styles.css'
 
-const SESSION_ID_KEY = 'testpilot.browser-session.v1'
-
-// The application is entirely session-scoped. Notify the backend first so its
-// matching in-memory database is discarded, then remove browser session data.
+// The application is entirely browser-session-scoped. A refresh starts with an
+// empty workspace, including AI keys, files, projects, runs and testcases.
 const clearTransientSession = () => {
   try {
-    const previousSessionId = sessionStorage.getItem(SESSION_ID_KEY)
-    if (previousSessionId && navigator.sendBeacon) {
-      navigator.sendBeacon(`/api/session/end?session_id=${encodeURIComponent(previousSessionId)}`)
-    }
     for (const key of Object.keys(sessionStorage)) {
       if (key.startsWith('testpilot.')) sessionStorage.removeItem(key)
     }
@@ -24,9 +18,7 @@ const clearTransientSession = () => {
 
 clearTransientSession()
 
-// A reload starts a clean workspace.  Notify the backend while the current
-// document is still alive as well, so the old session workspace is released
-// instead of waiting for the next app bootstrap to do it.
+// Clear immediately before navigation/reload as well as at next bootstrap.
 window.addEventListener('pagehide', clearTransientSession, { once: true })
 
 ReactDOM.createRoot(document.getElementById('root')).render(

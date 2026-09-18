@@ -7,11 +7,10 @@ import { getProjectById } from '../data/projectStore'
 import {
   createTestcase,
   deleteTestcase,
-  folderDownloadUrl,
+  downloadTestcaseExport,
   getFolderTestcases,
   getRun,
   getScreenTestcases,
-  screenDownloadUrl,
   updateTestcase,
 } from '../api/client'
 
@@ -90,16 +89,6 @@ const makeDraft = (items, item) => item
       ...blankAdvanced,
     }
 
-const downloadBlob = (name, type, content) => {
-  const blob = new Blob([content], { type })
-  const url = URL.createObjectURL(blob)
-  const a = document.createElement('a')
-  a.href = url
-  a.download = name
-  a.click()
-  URL.revokeObjectURL(url)
-}
-
 export default function TestcasePage() {
   const navigate = useNavigate()
   const params = useParams()
@@ -156,7 +145,7 @@ export default function TestcasePage() {
       setItems(next)
       setOpenId(prev => prev || next[0]?.recordId || null)
     } catch (e) {
-      setLoadError(e.message || 'Không tải được testcase từ backend.')
+      setLoadError(e.message || 'Không tải được testcase trong phiên làm việc.')
       setItems([])
     } finally {
       setLoading(false)
@@ -255,12 +244,13 @@ export default function TestcasePage() {
     }
   }
 
-  const excelUrl = screenFilter
-    ? screenDownloadUrl({ projectId, scope, screen: screenFilter, type: 'excel' })
-    : folderDownloadUrl({ projectId, folderId, scope, type: 'excel' })
-  const xmindUrl = screenFilter
-    ? screenDownloadUrl({ projectId, scope, screen: screenFilter, type: 'xmind' })
-    : folderDownloadUrl({ projectId, folderId, scope, type: 'xmind' })
+  const exportCases = async type => {
+    try {
+      await downloadTestcaseExport({ projectId, folderId: screenFilter ? undefined : folderId, scope, screen: screenFilter, type })
+    } catch (error) {
+      alert(error.message || 'Không thể xuất testcase.')
+    }
+  }
 
   return (
     <AppShell wide>
@@ -285,8 +275,8 @@ export default function TestcasePage() {
           <label className="select-icon"><Filter size={17} /><select value={filter} onChange={e => setFilter(e.target.value)}><option value="">Tất cả loại testcase</option>{types.map(t => <option key={t}>{t}</option>)}</select></label>
           <div className="test-toolbar-actions">
             <button className="btn btn-primary" onClick={() => openEditor(null)}><Plus size={18} /> Thêm testcase</button>
-            <a className="btn btn-outline" href={excelUrl}><Download size={17} /> Tải Excel</a>
-            <a className="btn btn-outline" href={xmindUrl}><Download size={17} /> Tải XMind</a>
+            <button className="btn btn-outline" onClick={() => exportCases('excel')}><Download size={17} /> Tải Excel</button>
+            <button className="btn btn-outline" onClick={() => exportCases('xmind')}><Download size={17} /> Tải XMind</button>
           </div>
         </section>
 
